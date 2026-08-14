@@ -11,6 +11,26 @@ const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
 
 describe("Agent Team recovery", () => {
+  test("keeps an empty session supervisor idle without creating a lease or reporting an error", async () => {
+    const root = await mkdtemp(join(tmpdir(), "tnb-team-"));
+    roots.push(root);
+    const manager = new TeamManager(join(root, "missing", "team.json"));
+    await manager.initialize();
+    const errors: string[] = [];
+    const supervisor = new TeamSupervisor(
+      manager,
+      () => [],
+      (error) => errors.push(error.message),
+      { recoveryPollIntervalMs: 5 },
+    );
+
+    supervisor.start();
+    await Bun.sleep(15);
+    await supervisor.close();
+
+    expect(errors).toEqual([]);
+  });
+
   test("grants one durable supervisor lease and permits takeover after release", async () => {
     const root = await mkdtemp(join(tmpdir(), "tnb-team-"));
     roots.push(root);

@@ -196,6 +196,7 @@ export class TeamSupervisor {
   }
 
   private async ensureLease(): Promise<boolean> {
+    if (!this.teams.current()) return false;
     if (this.leaseHeld) return true;
     this.leaseHeld = await this.teams.acquireLease(this.leaseOwnerId, this.leaseTtlMs);
     if (this.leaseHeld) this.scheduleLeaseHeartbeat();
