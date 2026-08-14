@@ -1,0 +1,17 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "^(write|edit|notebook_edit)$",
+        "sequential": true,
+        "hooks": [
+          {
+            "type": "command",
+            "name": "local-sast-after-edit",
+            "command": "tnb security-scan --hook"
+          }
+        ]
+      }
+    ]
+  }
+}

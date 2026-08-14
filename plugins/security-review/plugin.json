@@ -1,0 +1,40 @@
+{
+  "name": "security-review",
+  "manifestVersion": 2,
+  "version": "1.1.0",
+  "apiVersion": "tnb.plugin/v1",
+  "description": "Local SAST checks on edits plus a focused security review skill for high-risk changes.",
+  "compatibility": {
+    "hosts": ["tnb"],
+    "minTnbVersion": "0.0.0",
+    "testedTnbVersions": ["0.1.0"]
+  },
+  "lifecycle": {
+    "activation": "manual",
+    "start": "lazy",
+    "reload": "runtime",
+    "state": "workspace",
+    "events": ["PostToolUse"]
+  },
+  "documentation": {
+    "overview": "Adds a post-edit local SAST hook, exposes the builtin security_scan tool, and ships a reusable review skill.",
+    "whenToUse": "Enable for sandbox, permission, shell, secrets, or trust-boundary work where every edit should be re-scanned locally.",
+    "lifecycle": "The plugin stays inactive until explicitly enabled. Once enabled, hooks reload at runtime and fire after write/edit/notebook_edit tool use.",
+    "contributionNotes": [
+      "Contributes builtin:security_scan through the manifest rather than custom code.",
+      "Ships a focused security-review skill under plugins/security-review/skills/."
+    ],
+    "examples": [
+      "tnb /plugins enable security-review",
+      "Use the security-review skill after changing permissions, sandboxing, or shell execution paths."
+    ],
+    "resources": [
+      "./docs/overview.md",
+      "./docs/manifest-example.md"
+    ]
+  },
+  "contributes": {
+    "hooks": "./hooks.json",
+    "tools": ["builtin:security_scan"]
+  }
+}
