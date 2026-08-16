@@ -2,7 +2,10 @@ import { describe, expect, test } from "bun:test";
 
 import {
   applyInputKey,
+  collapsePastedText,
   createInputBuffer,
+  expandPastedText,
+  normalizeTerminalInput,
   searchInputHistory,
 } from "../../src/ui/input-buffer";
 import { applyInkInput, restoreInputHistory } from "../../src/ui/app";
@@ -26,6 +29,55 @@ describe("TUI input buffer", () => {
     expect(buffer.value).toBe("first");
     buffer = applyInputKey(buffer, { name: "down" });
     expect(buffer.value).toBe("second");
+  });
+
+  test("preserves a non-empty draft while browsing history", () => {
+    let buffer = createInputBuffer("unfinished draft", ["first", "second"]);
+    buffer = { ...buffer, cursor: 4 };
+    buffer = applyInputKey(buffer, { name: "up" });
+    expect(buffer).toMatchObject({ value: "second", cursor: 0, historyIndex: 1 });
+    buffer = applyInputKey(buffer, { name: "up" });
+    expect(buffer.value).toBe("first");
+    buffer = applyInputKey(buffer, { name: "down" });
+    buffer = applyInputKey(buffer, { name: "down" });
+    expect(buffer).toMatchObject({ value: "unfinished draft", cursor: 4, historyIndex: 2 });
+    expect(buffer.historyDraft).toBeUndefined();
+  });
+
+  test("leaves history browsing when a recalled prompt is edited", () => {
+    let buffer = applyInputKey(createInputBuffer("", ["first", "second"]), { name: "up" });
+    buffer = applyInputKey(buffer, { name: "text", text: " changed" });
+    expect(buffer).toMatchObject({ value: " changedsecond", historyIndex: 2 });
+    expect(buffer.historyDraft).toBeUndefined();
+  });
+
+  test("normalizes terminal paste input before inserting it", () => {
+    expect(normalizeTerminalInput("\u001B[31mred\u001B[0m\rnext\tvalue")).toBe("red\nnext    value");
+    expect(normalizeTerminalInput("typed\r")).toBe("typed");
+    expect(normalizeTerminalInput("\\\r")).toBe("\\\n");
+  });
+
+  test("collapses a large paste for display and expands it for submission", () => {
+    const content = Array.from({ length: 8 }, (_, index) => `line ${index}`).join("\n");
+    const collapsed = collapsePastedText(createInputBuffer("prefix "), content);
+    expect(collapsed.text).toBe("[Pasted text #1 +8 lines]");
+    expect(expandPastedText(collapsed.text, collapsed.buffer.pastedContents)).toBe(content);
+
+    let buffer = applyInputKey(createInputBuffer("prefix "), { name: "text", text: content });
+    expect(buffer.value).toBe("prefix [Pasted text #1 +8 lines]");
+    buffer = applyInputKey(buffer, { name: "enter" });
+    expect(buffer.submitted).toBe(`prefix ${content}`);
+  });
+
+  test("restores collapsed paste contents with a history draft", () => {
+    const content = "a\nb\nc";
+    let buffer = applyInputKey(createInputBuffer("", ["older"]), { name: "text", text: content });
+    const draftValue = buffer.value;
+    buffer = applyInputKey(buffer, { name: "up" });
+    expect(buffer.value).toBe("older");
+    buffer = applyInputKey(buffer, { name: "down" });
+    expect(buffer.value).toBe(draftValue);
+    expect(applyInputKey(buffer, { name: "enter" }).submitted).toBe(content);
   });
 
   test("moves across visual input lines before using prompt history", () => {
