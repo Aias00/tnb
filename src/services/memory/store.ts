@@ -1,10 +1,10 @@
-import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, normalize, resolve, sep } from "node:path";
+import { isAbsolute, join, normalize, resolve, sep } from "node:path";
 
 import { projectSessionDirectory } from "../session/storage";
+import { setUserSetting } from "../settings/write";
 
 const MAX_INDEX_LINES = 200;
 const MAX_INDEX_BYTES = 25_000;
@@ -58,7 +58,7 @@ export class AutoMemoryStore {
   }
 
   async setEnabled(enabled: boolean): Promise<void> {
-    await writeUserSetting(this.#configDir, "autoMemoryEnabled", enabled);
+    await setUserSetting(this.#configDir, "autoMemoryEnabled", enabled);
     this.enabled = enabled;
     if (enabled) await this.reload();
   }
@@ -110,25 +110,6 @@ function validateMemoryDirectory(value: string): string {
   } catch {
     return path;
   }
-}
-
-async function writeUserSetting(configDir: string, key: string, value: unknown): Promise<void> {
-  const path = join(configDir, "settings.json");
-  let settings: Record<string, unknown> = {};
-  try {
-    const parsed: unknown = JSON.parse(await readFile(path, "utf8"));
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      throw new Error(`Settings must be an object: ${path}`);
-    }
-    settings = parsed as Record<string, unknown>;
-  } catch (error) {
-    if (!isMissing(error)) throw error;
-  }
-  settings[key] = value;
-  await mkdir(dirname(path), { recursive: true });
-  const temporary = `${path}.${randomUUID()}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(settings, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  await rename(temporary, path);
 }
 
 function truthy(value: string | undefined): boolean {

@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { appendFile, mkdtemp, rm, utimes } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
 import { SessionStore } from "../../src/services/session/storage";
 import type { ConversationMessage } from "../../src/core/message";
@@ -33,6 +34,47 @@ describe("JSONL session storage", () => {
     expect(store.filePath).toEndWith("session-1.jsonl");
   });
 
+  test("serializes concurrent appends to the same session file", async () => {
+    const configDir = await temporaryDirectory();
+    const cwd = await temporaryDirectory();
+    const first = new SessionStore({ configDir, cwd, sessionId: "shared" });
+    const second = new SessionStore({ configDir, cwd, sessionId: "shared" });
+    const additions = Array.from({ length: 20 }, (_, index) => ({
+      role: "user" as const,
+      content: [{ type: "text" as const, text: `message-${index}` }],
+    }));
+
+    await Promise.all(additions.map((message, index) => (index % 2 ? first : second).append([message])));
+
+    expect(await first.read()).toEqual(additions);
+  });
+
+  test("serializes session appends across separate Bun processes", async () => {
+    const configDir = await temporaryDirectory();
+    const cwd = await temporaryDirectory();
+    const storageUrl = pathToFileURL(resolve(import.meta.dir, "../../src/services/session/storage.ts")).href;
+    const spawnWriter = (prefix: string) => {
+      const source = [
+        `import { SessionStore } from ${JSON.stringify(storageUrl)};`,
+        `const store = new SessionStore({ configDir: ${JSON.stringify(configDir)}, cwd: ${JSON.stringify(cwd)}, sessionId: "shared-process" });`,
+        `for (let index = 0; index < 20; index += 1) await store.append([{ role: "user", content: [{ type: "text", text: ${JSON.stringify(prefix)} + index + ":" + "x".repeat(20_000) }] }]);`,
+      ].join("\n");
+      return Bun.spawn([process.execPath, "--eval", source], { stdout: "pipe", stderr: "pipe" });
+    };
+    const writers = [spawnWriter("a-"), spawnWriter("b-")];
+    const exits = await Promise.all(writers.map((writer) => writer.exited));
+    const errors = await Promise.all(writers.map((writer) => new Response(writer.stderr).text()));
+
+    expect(exits).toEqual([0, 0]);
+    expect(errors).toEqual(["", ""]);
+    const restored = await new SessionStore({ configDir, cwd, sessionId: "shared-process" }).read();
+    const labels = restored.map((message) => message.content[0]).map((block) => block?.type === "text" ? block.text.slice(0, block.text.indexOf(":")) : "");
+    expect(labels.sort()).toEqual([
+      ...Array.from({ length: 20 }, (_, index) => `a-${index}`),
+      ...Array.from({ length: 20 }, (_, index) => `b-${index}`),
+    ].sort());
+  });
+
   test("deletes one exact session transcript", async () => {
     const configDir = await temporaryDirectory();
     const cwd = await temporaryDirectory();
@@ -53,14 +95,16 @@ describe("JSONL session storage", () => {
     expect(await store.read()).toEqual(messages);
   });
 
-  test("rejects a malformed complete JSONL record", async () => {
+  test("recovers valid records after a malformed complete JSONL record", async () => {
     const configDir = await temporaryDirectory();
     const cwd = await temporaryDirectory();
     const store = new SessionStore({ configDir, cwd, sessionId: "session-1" });
     await store.append(messages);
     await appendFile(store.filePath, "not-json\n");
+    const later: ConversationMessage = { role: "user", content: [{ type: "text", text: "after corruption" }] };
+    await store.append([later]);
 
-    await expect(store.read()).rejects.toThrow("Invalid session record at line 3");
+    expect(await store.read()).toEqual([...messages, later]);
   });
 
   test("finds the most recently modified session for continue", async () => {

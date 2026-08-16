@@ -203,6 +203,24 @@ describe("shell permissions", () => {
     });
   });
 
+  test("fails closed on upstream parser differential and expansion cases", () => {
+    const cases = [
+      "cat\u00a0/etc/passwd",
+      "cat\\ /etc/passwd",
+      "=cat /etc/passwd",
+      "echo $((1#$(id)))",
+      "cat <<EOF\n$(id)\nEOF",
+      'command "do :"',
+      "coproc cat /etc/passwd",
+    ];
+
+    for (const command of cases) {
+      const analysis = analyzeShellCommand(command, { cwd: "/workspace", family: "posix" });
+      expect(analysis.isReadOnly).toBe(false);
+      expect(analysis.isSafeAutoApproved).toBe(false);
+    }
+  });
+
   test("analyzes command and env wrappers instead of trusting the wrapper", () => {
     expect(analyzeShellCommand("command git status", { family: "posix" }).isReadOnly).toBe(true);
     expect(analyzeShellCommand("command rm notes.txt", { family: "posix" }).isReadOnly).toBe(false);

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { isMcpLogLevel, type McpLogLevel } from "./logging";
+import { withFileLock } from "../../utils/lockfile";
 
 export type McpStdioServerConfig = {
   type?: "stdio";
@@ -134,13 +135,15 @@ export async function updateMcpConfig(
   path: string,
   update: (servers: Record<string, McpServerConfig>) => void,
 ): Promise<McpConfig> {
-  const config = await loadRawMcpConfig(path);
-  update(config.mcpServers);
-  await mkdir(dirname(path), { recursive: true });
-  const temporary = `${path}.${randomUUID()}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  await rename(temporary, path);
-  return config;
+  return withFileLock(path, async () => {
+    const config = await loadRawMcpConfig(path);
+    update(config.mcpServers);
+    await mkdir(dirname(path), { recursive: true });
+    const temporary = `${path}.${randomUUID()}.tmp`;
+    await writeFile(temporary, `${JSON.stringify(config, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+    await rename(temporary, path);
+    return config;
+  });
 }
 
 export function validateMcpServerConfig(

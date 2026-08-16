@@ -75,4 +75,27 @@ describe("scheduled prompts", () => {
     ])).toContain("monitor event");
     await shell.close();
   });
+
+  test("merges concurrent durable jobs and preserves deletion across stale writers", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "tnb-schedule-concurrent-"));
+    directories.push(directory);
+    const path = join(directory, "scheduled_tasks.json");
+    const first = new ScheduleManager(path);
+    const second = new ScheduleManager(path);
+    await Promise.all([first.initialize(), second.initialize()]);
+
+    const [one, two] = await Promise.all([
+      first.create({ cron: "1 * * * *", prompt: "first", durable: true }),
+      second.create({ cron: "2 * * * *", prompt: "second", durable: true }),
+    ]);
+    const restored = new ScheduleManager(path);
+    await restored.initialize();
+    expect(new Set(restored.list().map(({ id }) => id))).toEqual(new Set([one.id, two.id]));
+
+    expect(await first.remove(one.id)).toBe(true);
+    await second.close();
+    const afterDelete = new ScheduleManager(path);
+    await afterDelete.initialize();
+    expect(afterDelete.list().map(({ id }) => id)).toEqual([two.id]);
+  });
 });

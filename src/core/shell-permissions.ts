@@ -1,4 +1,6 @@
 import { basename, relative, resolve } from "node:path";
+import { parseForSecurityFromAst, type SimpleCommand } from "../utils/bash/ast";
+import { parseCommandRawSync } from "../utils/bash/parser";
 
 export type ShellFamily = "posix" | "powershell";
 
@@ -195,16 +197,22 @@ export function analyzeShellCommand(
   }
 
   const scan = scanShellCommand(normalizedCommand, family);
-  const segments = scan.segments
-    .map((segment) => analyzeShellSegment(segment, family, options.cwd))
-    .filter((segment) => segment.command.length > 0);
+  const astCommands = family === "posix" ? parsePosixCommands(normalizedCommand) : undefined;
+  const segments = astCommands
+    ? astCommands.map((command) => analyzeAstCommand(command, options.cwd))
+    : scan.segments
+        .map((segment) => analyzeShellSegment(segment, family, options.cwd))
+        .filter((segment) => segment.command.length > 0);
+  const syntaxTrusted = family !== "posix" || astCommands !== undefined;
   const isReadOnly = !scan.invalid
+    && syntaxTrusted
     && !scan.hasRedirection
     && !scan.hasBackgrounding
     && !scan.hasCommandSubstitution
     && segments.length > 0
     && segments.every((segment) => segment.isReadOnly);
   const isSafeAutoApproved = !scan.invalid
+    && syntaxTrusted
     && !scan.hasRedirection
     && !scan.hasBackgrounding
     && !scan.hasCommandSubstitution
@@ -222,6 +230,26 @@ export function analyzeShellCommand(
     hasCommandSubstitution: scan.hasCommandSubstitution,
     isReadOnly,
     isSafeAutoApproved,
+  };
+}
+
+function parsePosixCommands(command: string): SimpleCommand[] | undefined {
+  const root = parseCommandRawSync(command);
+  if (root === null) return undefined;
+  const result = parseForSecurityFromAst(command, root);
+  return result.kind === "simple" ? result.commands : undefined;
+}
+
+function analyzeAstCommand(command: SimpleCommand, cwd?: string): ShellSegmentAnalysis {
+  const executable = normalizeExecutable(command.argv[0], "posix");
+  const args = command.argv.slice(1);
+  return {
+    command: command.text,
+    ...(executable ? { executable } : {}),
+    args,
+    isReadOnly: executable !== undefined && isReadOnlyExecutable(executable, args, "posix"),
+    isSafeAutoApproved: executable !== undefined && cwd !== undefined
+      && isSafeAutoApprovedExecutable(executable, args, "posix", cwd),
   };
 }
 

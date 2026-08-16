@@ -92,7 +92,7 @@ async function* streamOpenAI(
         started: boolean;
         pendingJson: string[];
       }>();
-      for await (const value of parseSseJson(response)) {
+      for await (const value of parseSseJson(response, { signal })) {
         const chunk = value as OpenAIChunk;
         if (chunk.usage) {
           const cached = chunk.usage.prompt_tokens_details?.cached_tokens ?? 0;

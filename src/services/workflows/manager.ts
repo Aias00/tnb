@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
 import { projectSessionDirectory } from "../session/storage";
+import { withFileLock } from "../../utils/lockfile";
 
 export type WorkflowParameter = {
   name: string;
@@ -120,6 +121,7 @@ export class WorkflowManager {
   readonly #runsDir: string;
   readonly #now: () => Date;
   readonly #runIdFactory: () => string;
+  readonly #activeRuns = new Set<string>();
 
   constructor(options: WorkflowManagerOptions = {}) {
     const configDir = resolve(options.configDir ?? process.env.TNB_HOME ?? join(homedir(), ".tnb"));
@@ -140,22 +142,25 @@ export class WorkflowManager {
     const name = validateWorkflowName(input.name, "workflow name");
     const steps = normalizeWorkflowSteps(input.steps);
     const parameters = normalizeWorkflowParameters(input.parameters ?? []);
-    const existing = await this.getDefinition(name).catch((error: unknown) => {
-      if (isMissing(error)) return undefined;
-      throw error;
+    const path = this.#definitionPath(name);
+    return await withFileLock(path, async () => {
+      const existing = await this.#readJson(path).then(parseWorkflowDefinition).catch((error: unknown) => {
+        if (isMissing(error)) return undefined;
+        throw error;
+      });
+      const timestamp = this.#timestamp();
+      const definition: WorkflowDefinition = {
+        version: 1,
+        name,
+        ...(input.description?.trim() ? { description: input.description.trim() } : {}),
+        parameters,
+        steps,
+        createdAt: existing?.createdAt ?? timestamp,
+        updatedAt: timestamp,
+      };
+      await this.#writeJsonUnlocked(path, definition);
+      return structuredClone(definition);
     });
-    const timestamp = this.#timestamp();
-    const definition: WorkflowDefinition = {
-      version: 1,
-      name,
-      ...(input.description?.trim() ? { description: input.description.trim() } : {}),
-      parameters,
-      steps,
-      createdAt: existing?.createdAt ?? timestamp,
-      updatedAt: timestamp,
-    };
-    await this.#writeJson(this.#definitionPath(name), definition);
-    return structuredClone(definition);
   }
 
   async getDefinition(name: string): Promise<WorkflowDefinition> {
@@ -180,13 +185,16 @@ export class WorkflowManager {
   }
 
   async deleteDefinition(name: string): Promise<boolean> {
-    try {
-      await unlink(this.#definitionPath(validateWorkflowName(name, "workflow name")));
-      return true;
-    } catch (error) {
-      if (isMissing(error)) return false;
-      throw error;
-    }
+    const path = this.#definitionPath(validateWorkflowName(name, "workflow name"));
+    return await withFileLock(path, async () => {
+      try {
+        await unlink(path);
+        return true;
+      } catch (error) {
+        if (isMissing(error)) return false;
+        throw error;
+      }
+    });
   }
 
   async startRun(input: StartRunInput): Promise<WorkflowRun> {
@@ -216,7 +224,9 @@ export class WorkflowManager {
 
   async getRun(runId: string): Promise<WorkflowRun> {
     const run = parseWorkflowRun(await this.#readJson(this.#runPath(runId)));
-    const recovered = normalizeRecoveredRun(run, this.#timestamp());
+    const recovered = this.#activeRuns.has(run.id)
+      ? { run, changed: false }
+      : normalizeRecoveredRun(run, this.#timestamp());
     if (recovered.changed) await this.#writeRun(recovered.run);
     return structuredClone(recovered.run);
   }
@@ -268,14 +278,17 @@ export class WorkflowManager {
   }
 
   async #executeRun(run: WorkflowRun, input: ExecuteRunInput): Promise<WorkflowRun> {
-    let current = structuredClone(run);
+    if (this.#activeRuns.has(run.id)) throw new Error(`Workflow run ${run.id} is already executing`);
+    this.#activeRuns.add(run.id);
+    try {
+      let current = structuredClone(run);
     current.pauseRequested = false;
     current.status = "running";
     current.startedAt ??= this.#timestamp();
     current.updatedAt = this.#timestamp();
     delete current.completedAt;
     delete current.lastError;
-    await this.#writeRun(current);
+    await this.#writeRun(current, { preservePauseRequest: false });
 
     let executedThisInvocation = 0;
     try {
@@ -394,7 +407,10 @@ export class WorkflowManager {
     current.completedAt = this.#timestamp();
     current.updatedAt = current.completedAt;
     await this.#writeRun(current);
-    return structuredClone(current);
+      return structuredClone(current);
+    } finally {
+      this.#activeRuns.delete(run.id);
+    }
   }
 
   async #listJsonFiles(directory: string): Promise<string[]> {
@@ -412,13 +428,30 @@ export class WorkflowManager {
     return JSON.parse(await readFile(path, "utf8"));
   }
 
-  async #writeRun(run: WorkflowRun): Promise<void> {
-    await this.#writeJson(this.#runPath(run.id), run);
+  async #writeRun(run: WorkflowRun, options: { preservePauseRequest?: boolean } = {}): Promise<void> {
+    const path = this.#runPath(run.id);
+    await withFileLock(path, async () => {
+      let next = structuredClone(run);
+      const current = await this.#readJson(path).then(parseWorkflowRun).catch((error: unknown) => {
+        if (isMissing(error)) return undefined;
+        throw error;
+      });
+      if (current && isTerminalRun(current) && !isTerminalRun(next)) {
+        next = current;
+      } else if (current?.pauseRequested && options.preservePauseRequest !== false && next.status === "running") {
+        next.pauseRequested = true;
+      }
+      await this.#writeJsonUnlocked(path, next);
+    });
   }
 
   async #writeJson(path: string, value: unknown): Promise<void> {
+    await withFileLock(path, () => this.#writeJsonUnlocked(path, value));
+  }
+
+  async #writeJsonUnlocked(path: string, value: unknown): Promise<void> {
     await mkdir(dirname(path), { recursive: true });
-    const temporary = `${path}.${process.pid}.tmp`;
+    const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
     await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
     await rename(temporary, path);
   }
@@ -434,6 +467,10 @@ export class WorkflowManager {
   #timestamp(): string {
     return this.#now().toISOString();
   }
+}
+
+function isTerminalRun(run: WorkflowRun): boolean {
+  return run.status === "completed" || run.status === "completed_with_errors";
 }
 
 export function normalizeWorkflowParameters(parameters: WorkflowParameter[]): WorkflowParameter[] {

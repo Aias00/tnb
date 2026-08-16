@@ -8,6 +8,14 @@ import type { WorktreeSessionState } from "../../core/workspace-state";
 import type { TokenUsage } from "../../providers/types";
 import { addUsage, EMPTY_USAGE, type UsageTotals } from "../usage/cost";
 import { PERMISSION_MODES, type PermissionMode } from "../../core/permissions";
+import { registerCleanup } from "../../utils/cleanup-registry";
+import { parseJsonl } from "../../utils/jsonl";
+import { withFileLock } from "../../utils/lockfile";
+
+const sessionWriteQueues = new Map<string, Promise<void>>();
+const pendingSessionWrites = new Set<Promise<void>>();
+
+registerCleanup(() => flushSessionWrites());
 
 type SessionRecordBase = {
   version: 1;
@@ -225,9 +233,8 @@ export class SessionStore {
   }
 
   async readState(): Promise<SessionState> {
+    await flushSessionWrites(this.filePath);
     const text = await readFile(this.filePath, "utf8");
-    const lines = text.split("\n");
-    const hasUnterminatedTail = !text.endsWith("\n");
     const messages: ConversationMessage[] = [];
     let permissionMode: PermissionMode | undefined;
     let prePlanMode: PermissionMode | undefined;
@@ -238,19 +245,8 @@ export class SessionStore {
     let strategicIntent: string | undefined;
     let parentSessionId: string | undefined;
 
-    for (let index = 0; index < lines.length; index += 1) {
-      const line = lines[index];
-      if (!line) continue;
-      if (hasUnterminatedTail && index === lines.length - 1) break;
-      let value: unknown;
-      try {
-        value = JSON.parse(line);
-      } catch (error) {
-        throw new Error(`Invalid session record at line ${index + 1}`, { cause: error });
-      }
-      if (!isSessionRecord(value) || value.sessionId !== this.sessionId) {
-        throw new Error(`Invalid session record at line ${index + 1}`);
-      }
+    for (const value of parseJsonl<unknown>(text)) {
+      if (!isSessionRecord(value) || value.sessionId !== this.sessionId) continue;
       if (value.type === "compact_boundary") {
         messages.splice(0, messages.length, ...structuredClone(value.messages));
         permissionMode = value.permissionMode;
@@ -368,31 +364,43 @@ export class SessionStore {
   }
 
   private async appendRecords(records: SessionRecord[]): Promise<void> {
-    await mkdir(this.projectDir, { recursive: true });
-    await appendFile(
-      this.filePath,
-      `${records.map((record) => JSON.stringify(record)).join("\n")}\n`,
-      "utf8",
-    );
-  }
-
-  private async readRecords(): Promise<SessionRecord[]> {
-    const text = await readFile(this.filePath, "utf8");
-    if (!text.endsWith("\n")) throw new Error("Cannot fork a session with an incomplete trailing record");
-    return text.split("\n").filter(Boolean).map((line, index) => {
-      let value: unknown;
-      try {
-        value = JSON.parse(line);
-      } catch (error) {
-        throw new Error(`Invalid session record at line ${index + 1}`, { cause: error });
-      }
-      if (!isSessionRecord(value) || value.sessionId !== this.sessionId) {
-        throw new Error(`Invalid session record at line ${index + 1}`);
-      }
-      return value;
+    const payload = `${records.map((record) => JSON.stringify(record)).join("\n")}\n`;
+    await queueSessionWrite(this.filePath, async () => {
+      await mkdir(this.projectDir, { recursive: true });
+      await withFileLock(this.filePath, () =>
+        appendFile(this.filePath, payload, { encoding: "utf8", mode: 0o600 })
+      );
     });
   }
 
+  private async readRecords(): Promise<SessionRecord[]> {
+    await flushSessionWrites(this.filePath);
+    const text = await readFile(this.filePath, "utf8");
+    return parseJsonl<unknown>(text).filter(
+      (value): value is SessionRecord => isSessionRecord(value) && value.sessionId === this.sessionId,
+    );
+  }
+
+}
+
+function queueSessionWrite(filePath: string, operation: () => Promise<void>): Promise<void> {
+  const previous = sessionWriteQueues.get(filePath) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(operation);
+  sessionWriteQueues.set(filePath, current);
+  pendingSessionWrites.add(current);
+  void current.finally(() => {
+    pendingSessionWrites.delete(current);
+    if (sessionWriteQueues.get(filePath) === current) sessionWriteQueues.delete(filePath);
+  }).catch(() => undefined);
+  return current;
+}
+
+export async function flushSessionWrites(filePath?: string): Promise<void> {
+  if (filePath) {
+    await sessionWriteQueues.get(filePath);
+    return;
+  }
+  await Promise.allSettled(Array.from(pendingSessionWrites));
 }
 
 export function projectSessionDirectory(configDir: string, cwd: string): string {

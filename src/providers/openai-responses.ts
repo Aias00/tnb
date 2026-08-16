@@ -79,7 +79,7 @@ async function* streamOpenAIResponses(
   let sawToolCall = false;
   const toolCalls = new Map<number, { id: string; name: string; json: string }>();
   const reasoningIndexes = new Map<string, number>();
-  for await (const value of parseSseJson(response)) {
+  for await (const value of parseSseJson(response, { signal })) {
     const event = value as ResponsesStreamEvent;
     if (event.type === "response.output_item.added" && event.item?.type === "reasoning") {
       const index = event.output_index ?? 0;

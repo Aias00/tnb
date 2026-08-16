@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { cp, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { withFileLock } from "../../utils/lockfile";
 
 import { loadProviderCatalog, resolveProviderSelection } from "../../providers/config";
 import { createConfiguredTransport, type ReasoningEffort } from "../../providers/factory";
@@ -276,16 +277,24 @@ Examples:
     if (action === "set") {
       const raw = options.argv[3];
       if (raw === undefined) throw new Error("config set requires a JSON value");
-      setPath(document, segments, parseConfigValue(raw));
       await beforeSettingsChange(options, path);
-      await writeJsonAtomic(path, document);
+      await withFileLock(path, async () => {
+        const current = await readJsonObject(path);
+        setPath(current, segments, parseConfigValue(raw));
+        await writeJsonAtomic(path, current);
+      });
       options.stdout.write(`Updated ${key} in ${path}\n`);
       return 0;
     }
     if (action === "unset") {
-      if (!deletePath(document, segments)) return 1;
       await beforeSettingsChange(options, path);
-      await writeJsonAtomic(path, document);
+      const removed = await withFileLock(path, async () => {
+        const current = await readJsonObject(path);
+        if (!deletePath(current, segments)) return false;
+        await writeJsonAtomic(path, current);
+        return true;
+      });
+      if (!removed) return 1;
       options.stdout.write(`Removed ${key} from ${path}\n`);
       return 0;
     }
@@ -391,7 +400,7 @@ Examples:
       return 0;
     }
     if (action === "list") return runProviderList(options);
-    if (action === "model") return runProviderModelCommand(options);
+    if (action === "model") return await runProviderModelCommand(options);
     const id = options.argv[2];
     if (!id || !/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(id)) {
       throw new Error(`provider ${action} requires a valid provider id`);
@@ -401,24 +410,29 @@ Examples:
       const requestedModel = optionValue(options.argv, "--model");
       const selection = resolveProviderSelection(catalog, id, requestedModel);
       const path = settingsPath(options);
-      const settings = await readJsonObject(path);
-      settings.provider = selection.provider.id;
-      settings.model = selection.model.id;
       await beforeSettingsChange(options, path);
-      await writeJsonAtomic(path, settings);
+      await withFileLock(path, async () => {
+        const settings = await readJsonObject(path);
+        settings.provider = selection.provider.id;
+        settings.model = selection.model.id;
+        await writeJsonAtomic(path, settings);
+      });
       options.stdout.write(`Default model set to ${selection.provider.id}/${selection.model.id} in ${path}\n`);
       return 0;
     }
     if (action === "test") return runProviderTest(options, id);
     const path = join(resolveConfigDir(options), "models.json");
-    const document = await readJsonObject(path);
-    const providers = objectOrEmpty(document.providers, `models.providers must be an object: ${path}`);
     if (action === "show") {
+      const document = await readJsonObject(path);
+      const providers = objectOrEmpty(document.providers, `models.providers must be an object: ${path}`);
       const provider = providers[id];
       if (provider === undefined) throw new Error(`Custom provider not found: ${id}`);
       options.stdout.write(`${JSON.stringify(provider, null, 2)}\n`);
       return 0;
     }
+    return await withFileLock(path, async () => {
+    const document = await readJsonObject(path);
+    const providers = objectOrEmpty(document.providers, `models.providers must be an object: ${path}`);
     if (action === "remove") {
       if (!options.argv.includes("--yes")) throw new Error("provider remove requires --yes");
       if (!(id in providers)) throw new Error(`Custom provider not found: ${id}`);
@@ -495,6 +509,7 @@ Examples:
     await writeJsonAtomic(path, document);
     options.stdout.write(`Added provider ${id} to ${path}\n`);
     return 0;
+    });
   } catch (error) {
     options.stderr.write(`tnb: ${errorMessage(error)}\n`);
     return 1;
@@ -585,6 +600,16 @@ async function runProviderModelCommand(options: ManagementCommandOptions): Promi
   const providerId = options.argv[3];
   if (!providerId) throw new Error(`provider model ${action} requires a provider id`);
   const path = join(resolveConfigDir(options), "models.json");
+  if (action === "list") return runProviderModelCommandUnlocked(options, action, providerId, path);
+  return withFileLock(path, () => runProviderModelCommandUnlocked(options, action, providerId, path));
+}
+
+async function runProviderModelCommandUnlocked(
+  options: ManagementCommandOptions,
+  action: string,
+  providerId: string,
+  path: string,
+): Promise<number> {
   const document = await readJsonObject(path);
   const providers = objectOrEmpty(document.providers, `models.providers must be an object: ${path}`);
   const provider = objectOrEmpty(providers[providerId], `Custom provider not found: ${providerId}`);

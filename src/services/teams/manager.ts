@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, unlink, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { withFileLock } from "../../utils/lockfile";
 
 export type TeamMemberStatus =
   | "running"
@@ -64,6 +64,7 @@ export type TeamState = {
 type TeamLease = {
   version: 1;
   ownerId: string;
+  generation: string;
   acquiredAt: string;
   heartbeatAt: string;
   expiresAt: string;
@@ -74,6 +75,7 @@ export class TeamManager {
   private writeQueue: Promise<void> = Promise.resolve();
   private listeners = new Set<() => void>();
   private messageListeners = new Set<(message: TeamMessage) => void>();
+  private leaseGeneration: string | undefined;
 
   constructor(private filePath: string) {}
 
@@ -96,6 +98,7 @@ export class TeamManager {
   async switchStorage(filePath: string): Promise<void> {
     await this.commit();
     this.filePath = filePath;
+    this.leaseGeneration = undefined;
     await this.load(filePath);
   }
 
@@ -323,58 +326,46 @@ export class TeamManager {
   async acquireLease(ownerId: string, ttlMs: number, now = Date.now()): Promise<boolean> {
     validateLeaseInput(ownerId, ttlMs);
     const path = `${this.filePath}.lease`;
-    const lease = createLease(ownerId, ttlMs, now);
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        const handle = await open(path, "wx", 0o600);
-        try {
-          await handle.writeFile(`${JSON.stringify(lease, null, 2)}\n`, "utf8");
-        } finally {
-          await handle.close();
-        }
+    return withFileLock(this.filePath, async () => {
+      const current = await readLease(path);
+      if (current && Date.parse(current.expiresAt) > now) {
+        if (current.ownerId !== ownerId) return false;
+        this.leaseGeneration = current.generation;
+        await writeLease(path, refreshLease(current, ttlMs, now));
         return true;
-      } catch (error) {
-        if (!isAlreadyExists(error)) throw error;
-        const current = await readLease(path);
-        if (current?.ownerId === ownerId) return this.renewLease(ownerId, ttlMs, now);
-        if (current && Date.parse(current.expiresAt) > now) return false;
-        await unlink(path).catch((unlinkError: unknown) => {
-          if (!isMissing(unlinkError)) throw unlinkError;
-        });
       }
-    }
-    return false;
+      const lease = createLease(ownerId, ttlMs, now);
+      await writeLease(path, lease);
+      this.leaseGeneration = lease.generation;
+      return true;
+    });
   }
 
   async renewLease(ownerId: string, ttlMs: number, now = Date.now()): Promise<boolean> {
     validateLeaseInput(ownerId, ttlMs);
     const path = `${this.filePath}.lease`;
-    const current = await readLease(path);
-    if (!current || current.ownerId !== ownerId || Date.parse(current.expiresAt) <= now) return false;
-    const next: TeamLease = {
-      ...current,
-      heartbeatAt: new Date(now).toISOString(),
-      expiresAt: new Date(now + ttlMs).toISOString(),
-    };
-    const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(next, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-    const latest = await readLease(path);
-    if (!latest || latest.ownerId !== ownerId) {
-      await unlink(temporary).catch(() => undefined);
-      return false;
-    }
-    await rename(temporary, path);
-    return true;
+    return withFileLock(this.filePath, async () => {
+      const current = await readLease(path);
+      if (
+        !current || current.ownerId !== ownerId || current.generation !== this.leaseGeneration ||
+        Date.parse(current.expiresAt) <= now
+      ) return false;
+      await writeLease(path, refreshLease(current, ttlMs, now));
+      return true;
+    });
   }
 
   async releaseLease(ownerId: string): Promise<boolean> {
     const path = `${this.filePath}.lease`;
-    const current = await readLease(path);
-    if (!current || current.ownerId !== ownerId) return false;
-    await unlink(path).catch((error: unknown) => {
-      if (!isMissing(error)) throw error;
+    return withFileLock(this.filePath, async () => {
+      const current = await readLease(path);
+      if (!current || current.ownerId !== ownerId || current.generation !== this.leaseGeneration) return false;
+      await unlink(path).catch((error: unknown) => {
+        if (!isMissing(error)) throw error;
+      });
+      this.leaseGeneration = undefined;
+      return true;
     });
-    return true;
   }
 
   private appendMessage(
@@ -388,17 +379,24 @@ export class TeamManager {
   }
 
   private applyProtocolTransition(state: TeamState, message: TeamMessage): void {
+    let member: TeamMember | undefined;
     if (message.kind === "shutdown_request") {
-      this.resolveMember(state, message.to).status = "shutdown_requested";
+      member = this.resolveMember(state, message.to);
+      member.status = "shutdown_requested";
     } else if (message.kind === "shutdown_rejected") {
-      this.resolveMember(state, message.from).status = "running";
+      member = this.resolveMember(state, message.from);
+      member.status = "running";
     } else if (message.kind === "shutdown_approved" || message.kind === "teammate_terminated") {
-      this.resolveMember(state, message.from).status = "stopped";
+      member = this.resolveMember(state, message.from);
+      member.status = "stopped";
     } else if (message.kind === "idle_notification") {
-      this.resolveMember(state, message.from).status = "idle";
+      member = this.resolveMember(state, message.from);
+      member.status = "idle";
     } else if (message.kind === "task_completed") {
-      this.resolveMember(state, message.from).status = "completed";
+      member = this.resolveMember(state, message.from);
+      member.status = "completed";
     }
+    if (member) member.updatedAt = message.createdAt;
   }
 
   private requireTeam(name: string): TeamState {
@@ -424,12 +422,14 @@ export class TeamManager {
   private async load(filePath: string): Promise<void> {
     try {
       this.state = parseState(JSON.parse(await readFile(filePath, "utf8")), filePath);
+      const now = new Date().toISOString();
       for (const member of this.state.members) {
         if (member.name !== "main" && (member.status === "running" || member.status === "shutdown_requested")) {
           member.status = "recovering";
+          member.updatedAt = now;
         }
       }
-      this.state.updatedAt = new Date().toISOString();
+      this.state.updatedAt = now;
       await this.commit();
     } catch (error) {
       if (!isMissing(error)) throw error;
@@ -446,13 +446,20 @@ export class TeamManager {
     const filePath = this.filePath;
     const state = structuredClone(this.state);
     this.publish();
-    this.writeQueue = this.writeQueue.then(async () => {
-      await mkdir(dirname(filePath), { recursive: true });
-      const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
-      await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-      await rename(temporary, filePath);
+    let committed: TeamState | undefined;
+    const currentWrite = this.writeQueue.catch(() => undefined).then(async () => {
+      await withFileLock(filePath, async () => {
+        const persisted = await readTeamState(filePath);
+        const merged = persisted ? mergeTeamStates(persisted, state) : state;
+        const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+        await writeFile(temporary, `${JSON.stringify(merged, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+        await rename(temporary, filePath);
+        committed = merged;
+      });
     });
-    await this.writeQueue;
+    this.writeQueue = currentWrite;
+    await currentWrite;
+    if (committed && this.filePath === filePath) this.state = structuredClone(committed);
   }
 
   private publish(): void {
@@ -538,17 +545,16 @@ function isMissing(error: unknown): boolean {
   return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ENOENT";
 }
 
-function isAlreadyExists(error: unknown): boolean {
-  return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "EEXIST";
-}
-
 async function readLease(path: string): Promise<TeamLease | undefined> {
   try {
     const value: unknown = JSON.parse(await readFile(path, "utf8"));
     if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
     const lease = value as Partial<TeamLease>;
     if (lease.version !== 1 || typeof lease.ownerId !== "string" || typeof lease.acquiredAt !== "string" || typeof lease.heartbeatAt !== "string" || typeof lease.expiresAt !== "string") return undefined;
-    return lease as TeamLease;
+    return {
+      ...lease,
+      generation: typeof lease.generation === "string" ? lease.generation : `${lease.ownerId}:${lease.acquiredAt}`,
+    } as TeamLease;
   } catch (error) {
     if (isMissing(error)) return undefined;
     throw error;
@@ -557,7 +563,80 @@ async function readLease(path: string): Promise<TeamLease | undefined> {
 
 function createLease(ownerId: string, ttlMs: number, now: number): TeamLease {
   const timestamp = new Date(now).toISOString();
-  return { version: 1, ownerId, acquiredAt: timestamp, heartbeatAt: timestamp, expiresAt: new Date(now + ttlMs).toISOString() };
+  return {
+    version: 1,
+    ownerId,
+    generation: randomUUID(),
+    acquiredAt: timestamp,
+    heartbeatAt: timestamp,
+    expiresAt: new Date(now + ttlMs).toISOString(),
+  };
+}
+
+function refreshLease(lease: TeamLease, ttlMs: number, now: number): TeamLease {
+  return {
+    ...lease,
+    heartbeatAt: new Date(now).toISOString(),
+    expiresAt: new Date(now + ttlMs).toISOString(),
+  };
+}
+
+async function writeLease(path: string, lease: TeamLease): Promise<void> {
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(lease)}\n`, { encoding: "utf8", mode: 0o600 });
+  await rename(temporary, path);
+}
+
+async function readTeamState(filePath: string): Promise<TeamState | undefined> {
+  try {
+    const source = await readFile(filePath, "utf8");
+    if (!source.trim()) return undefined;
+    return parseState(JSON.parse(source), filePath);
+  } catch (error) {
+    if (isMissing(error)) return undefined;
+    throw error;
+  }
+}
+
+function mergeTeamStates(persisted: TeamState, local: TeamState): TeamState {
+  if (persisted.name !== local.name || persisted.leadSessionId !== local.leadSessionId) {
+    throw new Error(`Team state identity changed while writing '${local.name}'`);
+  }
+
+  const members = new Map(persisted.members.map((member) => [member.agentId, structuredClone(member)]));
+  for (const member of local.members) {
+    const current = members.get(member.agentId);
+    if (!current || Date.parse(member.updatedAt) >= Date.parse(current.updatedAt)) {
+      members.set(member.agentId, structuredClone(member));
+    }
+  }
+
+  const messages = new Map(persisted.messages.map((message) => [message.id, structuredClone(message)]));
+  for (const message of local.messages) {
+    const current = messages.get(message.id);
+    if (!current) {
+      messages.set(message.id, structuredClone(message));
+      continue;
+    }
+    messages.set(message.id, {
+      ...current,
+      ...structuredClone(message),
+      ...(current.deliveredAt || message.deliveredAt ? { deliveredAt: message.deliveredAt ?? current.deliveredAt } : {}),
+      ...(current.deliveredTo || message.deliveredTo ? {
+        deliveredTo: [...new Set([...(current.deliveredTo ?? []), ...(message.deliveredTo ?? [])])],
+      } : {}),
+    });
+  }
+
+  return {
+    version: 2,
+    name: local.name,
+    leadSessionId: local.leadSessionId,
+    createdAt: Date.parse(persisted.createdAt) <= Date.parse(local.createdAt) ? persisted.createdAt : local.createdAt,
+    updatedAt: Date.parse(persisted.updatedAt) >= Date.parse(local.updatedAt) ? persisted.updatedAt : local.updatedAt,
+    members: [...members.values()].sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt)),
+    messages: [...messages.values()].sort((left, right) => Date.parse(left.createdAt) - Date.parse(right.createdAt)),
+  };
 }
 
 function validateLeaseInput(ownerId: string, ttlMs: number): void {

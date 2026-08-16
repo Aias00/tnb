@@ -50,6 +50,61 @@ describe("Agent Team recovery", () => {
     expect(await second.releaseLease("owner-b")).toBe(true);
   });
 
+  test("serializes concurrent lease acquisition across manager instances", async () => {
+    const root = await mkdtemp(join(tmpdir(), "tnb-team-"));
+    roots.push(root);
+    const path = join(root, "team.json");
+    const first = new TeamManager(path);
+    await first.initialize();
+    await first.ensureTeam("delivery", "lead-session");
+    const second = new TeamManager(path);
+    await second.initialize();
+
+    const results = await Promise.all([
+      first.acquireLease("owner-a", 1_000, 1_000),
+      second.acquireLease("owner-b", 1_000, 1_000),
+    ]);
+
+    expect(results.filter(Boolean)).toHaveLength(1);
+  });
+
+  test("fences an expired lease owner after another supervisor takes over", async () => {
+    const root = await mkdtemp(join(tmpdir(), "tnb-team-"));
+    roots.push(root);
+    const path = join(root, "team.json");
+    const first = new TeamManager(path);
+    await first.initialize();
+    await first.ensureTeam("delivery", "lead-session");
+    const replacement = new TeamManager(path);
+    await replacement.initialize();
+
+    expect(await first.acquireLease("owner-a", 100, 1_000)).toBe(true);
+    expect(await replacement.acquireLease("owner-b", 1_000, 1_101)).toBe(true);
+    expect(await first.renewLease("owner-a", 1_000, 1_102)).toBe(false);
+    expect(await first.releaseLease("owner-a")).toBe(false);
+    expect(await replacement.renewLease("owner-b", 1_000, 1_103)).toBe(true);
+  });
+
+  test("preserves concurrent team messages written by separate managers", async () => {
+    const root = await mkdtemp(join(tmpdir(), "tnb-team-"));
+    roots.push(root);
+    const path = join(root, "team.json");
+    const first = new TeamManager(path);
+    await first.initialize();
+    await first.ensureTeam("delivery", "lead-session");
+    const second = new TeamManager(path);
+    await second.initialize();
+
+    await Promise.all([
+      first.send({ teamName: "delivery", from: "main", to: "main", text: "from first" }),
+      second.send({ teamName: "delivery", from: "main", to: "main", text: "from second" }),
+    ]);
+
+    const restored = new TeamManager(path);
+    await restored.initialize();
+    expect(restored.current()?.messages.map(({ text }) => text).sort()).toEqual(["from first", "from second"]);
+  });
+
   test("preserves the durable agent identity when a recovering member is reserved", async () => {
     const root = await mkdtemp(join(tmpdir(), "tnb-team-"));
     roots.push(root);

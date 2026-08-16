@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import { createHash, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { readdir, readFile, stat, unlink } from "node:fs/promises";
 import { homedir } from "node:os";
 import { arch, platform, release } from "node:os";
@@ -189,6 +190,9 @@ import { editPromptInExternalEditor } from "../ui/external-editor";
 import { loadKeybindings } from "../ui/keybindings";
 import { completeWorkspaceFiles } from "../ui/file-completion";
 import { renderTerminalImage } from "../ui/terminal-image";
+import { createFileStateCacheWithSizeLimit, READ_FILE_STATE_CACHE_SIZE } from "../utils/file-state-cache";
+import { registerCleanup } from "../utils/cleanup-registry";
+import { setShutdownResumeHint, setupGracefulShutdown } from "../utils/graceful-shutdown";
 import { McpActivityController } from "../ui/mcp-activity-controller";
 import { PermissionController } from "../ui/permission-controller";
 import { QuestionController } from "../ui/question-controller";
@@ -2376,6 +2380,22 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
   let scheduleManager: ScheduleManager | undefined;
   let extensionRefreshTimer: ReturnType<typeof setInterval> | undefined;
   const sharedPluginToolRuntime = new PluginToolRuntimeManager(options.env);
+  let cleanupPromise: Promise<void> | undefined;
+  let clearResumeHint: () => void = () => undefined;
+  const cleanup = () => cleanupPromise ??= (async () => {
+    if (extensionRefreshTimer) clearInterval(extensionRefreshTimer);
+    extensionRefreshTimer = undefined;
+    await Promise.allSettled([
+      activeHooks?.end("prompt_input_exit"),
+      interactiveMcp?.close(),
+      interactiveTaskManager?.shutdown(),
+      teamSupervisor?.close(),
+      sharedPluginToolRuntime.close(),
+      scheduleManager?.close(),
+      shellManager?.close(),
+    ].filter((operation): operation is Promise<void> => operation !== undefined));
+  })();
+  const unregisterCleanup = registerCleanup(cleanup);
   try {
     const parsed = parseArguments(
       ["-p", "__interactive__", ...options.argv],
@@ -2500,6 +2520,10 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
     });
     const initialSessionId = preparedSession.sessionId;
     let activeInteractiveSessionId = initialSessionId;
+    clearResumeHint = setShutdownResumeHint(() => {
+      const session = new SessionStore({ configDir, cwd: options.cwd, sessionId: activeInteractiveSessionId });
+      return existsSync(session.filePath) ? formatResumeHint(activeInteractiveSessionId) : undefined;
+    });
     const initialSessionNeedsResume = preparedSession.resume;
     if (preparedSession.state?.permissionMode) {
       activePermissionMode = preparedSession.state.permissionMode;
@@ -2951,14 +2975,9 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
     options.stderr.write(`tnb: ${message}\n`);
     return 1;
   } finally {
-    if (extensionRefreshTimer) clearInterval(extensionRefreshTimer);
-    await activeHooks?.end("prompt_input_exit");
-    await interactiveMcp?.close();
-    await interactiveTaskManager?.shutdown();
-    await teamSupervisor?.close();
-    await sharedPluginToolRuntime.close();
-    await scheduleManager?.close();
-    await shellManager?.close();
+    await cleanup();
+    unregisterCleanup();
+    clearResumeHint();
   }
 }
 
@@ -4961,10 +4980,11 @@ function createTools(
   semanticProviderForRoot?: Parameters<typeof createCodebaseInvestigatorTool>[4],
 ): AgentTool[] {
   const approvedRoots = () => [...additionalWorkspaceRoots(), ...(memory?.enabled ? [memory.directory] : [])];
+  const readFileState = createFileStateCacheWithSizeLimit(READ_FILE_STATE_CACHE_SIZE);
   const tools: AgentTool[] = [
-    createReadTool(cwd, mediaCapabilities, approvedRoots),
-    createWriteTool(cwd, approvedRoots),
-    createEditTool(cwd, approvedRoots),
+    createReadTool(cwd, mediaCapabilities, approvedRoots, readFileState),
+    createWriteTool(cwd, approvedRoots, readFileState),
+    createEditTool(cwd, approvedRoots, readFileState),
     createNotebookEditTool(cwd, additionalWorkspaceRoots),
     ...createShellTools(shellManager, env),
     createGrepTool(cwd, {}, additionalWorkspaceRoots),
@@ -5803,6 +5823,7 @@ function writeHookExecutionEvent(
 }
 
 if (import.meta.main) {
+  setupGracefulShutdown();
   const suppliedArgv = Bun.argv.slice(2);
   const remoteControlSocket = suppliedArgv[0] === "remote-control"
     ? optionValue(suppliedArgv, "--socket")

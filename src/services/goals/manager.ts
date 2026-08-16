@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
+import { withFileLock } from "../../utils/lockfile";
+
 export const DEFAULT_GOAL_TURNS = 20;
 
 export type GoalStatus = "active" | "paused" | "complete";
@@ -39,7 +41,11 @@ export class GoalManager {
     try {
       value = parseGoal(JSON.parse(await readFile(this.filePath, "utf8")), this.filePath);
     } catch (error) {
-      if (isMissing(error)) return;
+      if (isMissing(error)) {
+        this.goal = undefined;
+        this.activeSince = undefined;
+        return;
+      }
       throw error;
     }
     if (this.goal?.updatedAt === value.updatedAt && this.goal.status === value.status) return;
@@ -60,88 +66,93 @@ export class GoalManager {
     const normalized = objective.trim();
     if (!normalized) throw new Error("Goal objective must be a non-empty string");
     validateMaxTurns(maxTurns);
-    if (this.goal && this.goal.status !== "complete") {
-      throw new Error("A non-completed goal already exists; complete or clear it before creating another");
-    }
-    const now = new Date().toISOString();
-    this.goal = {
-      id: randomUUID(),
-      objective: normalized,
-      status: "active",
-      maxTurns,
-      turnsUsed: 0,
-      timeUsedSeconds: 0,
-      createdAt: now,
-      updatedAt: now,
-    };
-    this.activeSince = Date.now();
-    await this.persist();
+    await this.mutate((current) => {
+      if (current && current.status !== "complete") {
+        throw new Error("A non-completed goal already exists; complete or clear it before creating another");
+      }
+      const now = new Date().toISOString();
+      return {
+        id: randomUUID(),
+        objective: normalized,
+        status: "active",
+        maxTurns,
+        turnsUsed: 0,
+        timeUsedSeconds: 0,
+        createdAt: now,
+        updatedAt: now,
+      };
+    });
     return this.current()!;
   }
 
   async updateStatus(status: "active" | "complete"): Promise<Goal> {
-    if (!this.goal) throw new Error("No goal exists for this session");
-    if (status === "active") {
-      if (this.goal.status === "complete") throw new Error("A completed goal cannot be resumed");
-      if (this.goal.turnsUsed >= this.goal.maxTurns) {
+    await this.mutate((current) => {
+      if (!current) throw new Error("No goal exists for this session");
+      if (status === "active") {
+        if (current.status === "complete") throw new Error("A completed goal cannot be resumed");
+        if (current.turnsUsed >= current.maxTurns) {
         throw new Error("Goal turn budget is exhausted; use the interactive /goal resume command to grant a fresh budget");
+        }
+        current.status = "active";
+      } else {
+        current.status = "complete";
       }
-      this.goal.status = "active";
-      this.activeSince ??= Date.now();
-    } else {
-      this.accountActiveTime();
-      this.goal.status = "complete";
-      this.activeSince = undefined;
-    }
-    this.goal.updatedAt = new Date().toISOString();
-    await this.persist();
+      current.updatedAt = new Date().toISOString();
+      return current;
+    });
     return this.current()!;
   }
 
   async pause(): Promise<Goal> {
-    if (!this.goal || this.goal.status !== "active") throw new Error("No active goal to pause");
-    this.accountActiveTime();
-    this.goal.status = "paused";
-    this.goal.updatedAt = new Date().toISOString();
-    this.activeSince = undefined;
-    await this.persist();
+    await this.mutate((current) => {
+      if (!current || current.status !== "active") throw new Error("No active goal to pause");
+      current.status = "paused";
+      current.updatedAt = new Date().toISOString();
+      return current;
+    });
     return this.current()!;
   }
 
   async resume(grantFreshBudget = false): Promise<Goal> {
-    if (!this.goal || this.goal.status !== "paused") throw new Error("No paused goal to resume");
-    if (this.goal.turnsUsed >= this.goal.maxTurns) {
-      if (!grantFreshBudget) throw new Error("Goal turn budget is exhausted");
-      this.goal.maxTurns = this.goal.turnsUsed + DEFAULT_GOAL_TURNS;
-    }
-    this.goal.status = "active";
-    this.goal.updatedAt = new Date().toISOString();
-    this.activeSince = Date.now();
-    await this.persist();
+    await this.mutate((current) => {
+      if (!current || current.status !== "paused") throw new Error("No paused goal to resume");
+      if (current.turnsUsed >= current.maxTurns) {
+        if (!grantFreshBudget) throw new Error("Goal turn budget is exhausted");
+        current.maxTurns = current.turnsUsed + DEFAULT_GOAL_TURNS;
+      }
+      current.status = "active";
+      current.updatedAt = new Date().toISOString();
+      return current;
+    });
     return this.current()!;
   }
 
   async recordTurn(countCompletedTurn = false): Promise<Goal | undefined> {
-    if (!this.goal || (this.goal.status !== "active" && !(countCompletedTurn && this.goal.status === "complete"))) {
-      return this.current();
-    }
-    this.accountActiveTime();
-    this.goal.turnsUsed += 1;
-    if (this.goal.status === "active" && this.goal.turnsUsed >= this.goal.maxTurns) this.goal.status = "paused";
-    this.goal.updatedAt = new Date().toISOString();
-    this.activeSince = this.goal.status === "active" ? Date.now() : undefined;
-    await this.persist();
+    await this.mutate((current) => {
+      if (!current || (current.status !== "active" && !(countCompletedTurn && current.status === "complete"))) return current;
+      current.turnsUsed += 1;
+      if (current.status === "active" && current.turnsUsed >= current.maxTurns) current.status = "paused";
+      current.updatedAt = new Date().toISOString();
+      return current;
+    });
     return this.current();
   }
 
   async clear(): Promise<boolean> {
-    if (!this.goal) return false;
-    this.goal = undefined;
-    this.activeSince = undefined;
-    await unlink(this.filePath).catch((error: unknown) => {
-      if (!isMissing(error)) throw error;
+    return await withFileLock(this.filePath, async () => {
+      const current = await this.readCurrent();
+      if (!current) {
+        this.goal = undefined;
+        this.activeSince = undefined;
+        return false;
+      }
+      await unlink(this.filePath).catch((error: unknown) => {
+        if (!isMissing(error)) throw error;
+      });
+      this.goal = undefined;
+      this.activeSince = undefined;
+      return true;
     });
-    return true;
   }
 
   reminder(): string | undefined {
@@ -181,11 +192,32 @@ export class GoalManager {
     this.activeSince = undefined;
   }
 
-  private async persist(): Promise<void> {
-    if (!this.goal) return;
+  private async mutate(operation: (current: Goal | undefined) => Goal | undefined): Promise<void> {
+    await withFileLock(this.filePath, async () => {
+      const diskGoal = await this.readCurrent();
+      const current = diskGoal ? structuredClone(diskGoal) : undefined;
+      if (current && this.goal?.id === current.id) current.timeUsedSeconds += this.activeElapsedSeconds();
+      this.activeSince = undefined;
+      const next = operation(current);
+      this.goal = next;
+      this.activeSince = next?.status === "active" ? Date.now() : undefined;
+      if (next) await this.persistUnlocked(next);
+    });
+  }
+
+  private async readCurrent(): Promise<Goal | undefined> {
+    try {
+      return parseGoal(JSON.parse(await readFile(this.filePath, "utf8")), this.filePath);
+    } catch (error) {
+      if (isMissing(error)) return undefined;
+      throw error;
+    }
+  }
+
+  private async persistUnlocked(goal: Goal): Promise<void> {
     await mkdir(dirname(this.filePath), { recursive: true });
-    const temporary = `${this.filePath}.${process.pid}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(this.goal, null, 2)}\n`, "utf8");
+    const temporary = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
+    await writeFile(temporary, `${JSON.stringify(goal, null, 2)}\n`, "utf8");
     await rename(temporary, this.filePath);
   }
 }

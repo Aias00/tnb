@@ -319,6 +319,32 @@ describe("long-context stress coverage", () => {
     expect(restored.prompt()).toContain("second durable checkpoint");
   });
 
+  test("keeps Session Memory progress and compaction failures monotonic across managers", async () => {
+    const directory = await temporaryDirectory();
+    const path = join(directory, "session-memory.json");
+    const first = new SessionMemoryStore(path);
+    const second = new SessionMemoryStore(path);
+    await Promise.all([first.initialize(), second.initialize()]);
+
+    await Promise.all([
+      first.save("newer summary", [], 90_000),
+      second.save("older summary", [], 70_000),
+    ]);
+    const restored = new SessionMemoryStore(path);
+    await restored.initialize();
+    expect(restored.current()).toMatchObject({ summary: "newer summary", tokenCount: 90_000 });
+
+    await Promise.all([
+      first.recordCompactionAttempt("full", false),
+      second.recordCompactionAttempt("full", false),
+      restored.recordCompactionAttempt("full", false),
+    ]);
+    const afterFailures = new SessionMemoryStore(path);
+    await afterFailures.initialize();
+    expect(afterFailures.current()?.compaction.consecutiveFailures).toBe(3);
+    expect(afterFailures.current()?.compaction.suspendedUntil).toBeDefined();
+  });
+
   test("preserves cumulative usage across multiple large compact boundaries", async () => {
     const configDir = await temporaryDirectory();
     const cwd = await temporaryDirectory();

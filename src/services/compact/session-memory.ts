@@ -1,7 +1,9 @@
+import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 import type { ConversationMessage } from "../../core/message";
+import { withFileLock } from "../../utils/lockfile";
 
 const MINIMUM_TOKENS_TO_INITIALIZE = 60_000;
 const MINIMUM_TOKENS_BETWEEN_UPDATES = 5_000;
@@ -63,12 +65,11 @@ export class SessionMemoryStore {
       updatedAt: new Date().toISOString(),
       compaction: this.snapshot?.compaction ?? { consecutiveFailures: 0 },
     };
-    await mkdir(dirname(this.filePath), { recursive: true });
-    const temporary = `${this.filePath}.${process.pid}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(snapshot, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-    await rename(temporary, this.filePath);
-    this.snapshot = snapshot;
-    return structuredClone(snapshot);
+    await this.update((current) => {
+      if (current && compareSnapshotProgress(current, snapshot) > 0) return current;
+      return { ...snapshot, compaction: current?.compaction ?? snapshot.compaction };
+    });
+    return this.current()!;
   }
 
   refreshInBackground(
@@ -91,28 +92,22 @@ export class SessionMemoryStore {
   }
 
   async recordCompactionAttempt(strategy: string, succeeded: boolean): Promise<void> {
-    const current = this.snapshot ?? {
-      version: 2 as const,
-      summary: "Session Memory has not been initialized.",
-      tokenCount: 0,
-      toolCallCount: 0,
-      messageCount: 0,
-      updatedAt: new Date().toISOString(),
-      compaction: { consecutiveFailures: 0 },
-    };
-    const now = new Date();
-    const consecutiveFailures = succeeded ? 0 : current.compaction.consecutiveFailures + 1;
-    current.compaction = {
-      consecutiveFailures,
-      lastAttemptAt: now.toISOString(),
-      ...(succeeded ? { lastSuccessAt: now.toISOString() } : {}),
-      lastStrategy: strategy,
-      ...(consecutiveFailures >= 3
-        ? { suspendedUntil: new Date(now.getTime() + 5 * 60_000).toISOString() }
-        : {}),
-    };
-    current.updatedAt = now.toISOString();
-    await this.persist(current);
+    await this.update((snapshot) => {
+      const now = new Date();
+      const current = snapshot ?? emptySnapshot(now);
+      const consecutiveFailures = succeeded ? 0 : current.compaction.consecutiveFailures + 1;
+      current.compaction = {
+        consecutiveFailures,
+        lastAttemptAt: now.toISOString(),
+        ...(succeeded ? { lastSuccessAt: now.toISOString() } : {}),
+        lastStrategy: strategy,
+        ...(consecutiveFailures >= 3
+          ? { suspendedUntil: new Date(now.getTime() + 5 * 60_000).toISOString() }
+          : {}),
+      };
+      current.updatedAt = now.toISOString();
+      return current;
+    });
   }
 
   prompt(): string {
@@ -126,13 +121,42 @@ export class SessionMemoryStore {
     ].join("\n");
   }
 
-  private async persist(snapshot: SessionMemorySnapshot): Promise<void> {
-    await mkdir(dirname(this.filePath), { recursive: true });
-    const temporary = `${this.filePath}.${process.pid}.tmp`;
-    await writeFile(temporary, `${JSON.stringify(snapshot, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-    await rename(temporary, this.filePath);
-    this.snapshot = snapshot;
+  private async update(operation: (current: SessionMemorySnapshot | undefined) => SessionMemorySnapshot): Promise<void> {
+    await withFileLock(this.filePath, async () => {
+      const current = await readSnapshot(this.filePath);
+      const snapshot = operation(current);
+      await mkdir(dirname(this.filePath), { recursive: true });
+      const temporary = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
+      await writeFile(temporary, `${JSON.stringify(snapshot, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+      await rename(temporary, this.filePath);
+      this.snapshot = snapshot;
+    });
   }
+}
+
+function emptySnapshot(now: Date): SessionMemorySnapshot {
+  return {
+    version: 2,
+    summary: "Session Memory has not been initialized.",
+    tokenCount: 0,
+    toolCallCount: 0,
+    messageCount: 0,
+    updatedAt: now.toISOString(),
+    compaction: { consecutiveFailures: 0 },
+  };
+}
+
+async function readSnapshot(path: string): Promise<SessionMemorySnapshot | undefined> {
+  try {
+    return parseSnapshot(JSON.parse(await readFile(path, "utf8")), path);
+  } catch (error) {
+    if (isMissing(error)) return undefined;
+    throw error;
+  }
+}
+
+function compareSnapshotProgress(left: SessionMemorySnapshot, right: SessionMemorySnapshot): number {
+  return left.tokenCount - right.tokenCount || left.toolCallCount - right.toolCallCount || left.messageCount - right.messageCount;
 }
 
 function countToolCalls(messages: ConversationMessage[]): number {

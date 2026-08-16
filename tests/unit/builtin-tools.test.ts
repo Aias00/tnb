@@ -11,6 +11,7 @@ import {
   createReadTool,
   createWriteTool,
 } from "../../src/tools/builtins";
+import { createFileStateCacheWithSizeLimit, READ_FILE_STATE_CACHE_SIZE } from "../../src/utils/file-state-cache";
 
 const directories: string[] = [];
 
@@ -45,7 +46,10 @@ describe("built-in tools", () => {
   test("edits an exact unique string", async () => {
     const cwd = await workspace();
     await writeFile(join(cwd, "notes.txt"), "before\n");
-    const tool = createEditTool(cwd);
+    const fileState = createFileStateCacheWithSizeLimit(READ_FILE_STATE_CACHE_SIZE);
+    const read = createReadTool(cwd, undefined, undefined, fileState);
+    const tool = createEditTool(cwd, undefined, fileState);
+    await read.execute(read.validate({ path: "notes.txt" }), new AbortController().signal);
 
     await tool.execute(
       tool.validate({ path: "notes.txt", oldText: "before", newText: "after" }),
@@ -58,7 +62,10 @@ describe("built-in tools", () => {
   test("replaces every exact edit match only when replaceAll is explicit", async () => {
     const cwd = await workspace();
     await writeFile(join(cwd, "notes.txt"), "old old older\n");
-    const tool = createEditTool(cwd);
+    const fileState = createFileStateCacheWithSizeLimit(READ_FILE_STATE_CACHE_SIZE);
+    const read = createReadTool(cwd, undefined, undefined, fileState);
+    const tool = createEditTool(cwd, undefined, fileState);
+    await read.execute(read.validate({ path: "notes.txt" }), new AbortController().signal);
 
     await expect(tool.execute(
       tool.validate({ path: "notes.txt", oldText: "old", newText: "new" }),
@@ -70,6 +77,42 @@ describe("built-in tools", () => {
       new AbortController().signal,
     )).toBe("Edited notes.txt: replaced 3 occurrences");
     expect(await readFile(join(cwd, "notes.txt"), "utf8")).toBe("new new newer\n");
+  });
+
+  test("requires an existing file to be read before write or edit", async () => {
+    const cwd = await workspace();
+    await writeFile(join(cwd, "notes.txt"), "before\n");
+
+    await expect(createWriteTool(cwd).execute(
+      createWriteTool(cwd).validate({ path: "notes.txt", content: "after\n" }),
+      new AbortController().signal,
+    )).rejects.toThrow("has not been read");
+    await expect(createEditTool(cwd).execute(
+      createEditTool(cwd).validate({ path: "notes.txt", oldText: "before", newText: "after" }),
+      new AbortController().signal,
+    )).rejects.toThrow("has not been read");
+  });
+
+  test("rejects write and edit after the file changes since read", async () => {
+    const cwd = await workspace();
+    const target = join(cwd, "notes.txt");
+    await writeFile(target, "observed\n");
+    const fileState = createFileStateCacheWithSizeLimit(READ_FILE_STATE_CACHE_SIZE);
+    const read = createReadTool(cwd, undefined, undefined, fileState);
+    const write = createWriteTool(cwd, undefined, fileState);
+    const edit = createEditTool(cwd, undefined, fileState);
+    await read.execute(read.validate({ path: "notes.txt" }), new AbortController().signal);
+    await writeFile(target, "external change\n");
+
+    await expect(write.execute(
+      write.validate({ path: "notes.txt", content: "replacement\n" }),
+      new AbortController().signal,
+    )).rejects.toThrow("modified since read");
+    await expect(edit.execute(
+      edit.validate({ path: "notes.txt", oldText: "external", newText: "internal" }),
+      new AbortController().signal,
+    )).rejects.toThrow("modified since read");
+    expect(await readFile(target, "utf8")).toBe("external change\n");
   });
 
   test("runs a shell command in the workspace", async () => {

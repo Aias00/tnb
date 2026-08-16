@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { withFileLock } from "../../utils/lockfile";
 
 export type PluginTrustState = "trusted" | "untrusted" | "changed";
 
@@ -58,24 +59,28 @@ export async function pluginTrustState(
 
 export async function trustPlugin(storePath: string, root: string, fingerprint?: string): Promise<PluginTrustRecord> {
   const canonicalRoot = await realpath(root);
-  const document = await readTrustDocument(storePath);
   const record = {
     root: canonicalRoot,
     fingerprint: fingerprint ?? await computePluginTreeSha256(canonicalRoot),
     trustedAt: new Date().toISOString(),
   };
-  document.plugins[canonicalRoot] = record;
-  await writeTrustDocument(storePath, document);
+  await withFileLock(storePath, async () => {
+    const document = await readTrustDocument(storePath);
+    document.plugins[canonicalRoot] = record;
+    await writeTrustDocument(storePath, document);
+  });
   return record;
 }
 
 export async function revokePluginTrust(storePath: string, root: string): Promise<boolean> {
   const canonicalRoot = await realpath(root);
-  const document = await readTrustDocument(storePath);
-  if (!document.plugins[canonicalRoot]) return false;
-  delete document.plugins[canonicalRoot];
-  await writeTrustDocument(storePath, document);
-  return true;
+  return withFileLock(storePath, async () => {
+    const document = await readTrustDocument(storePath);
+    if (!document.plugins[canonicalRoot]) return false;
+    delete document.plugins[canonicalRoot];
+    await writeTrustDocument(storePath, document);
+    return true;
+  });
 }
 
 async function readTrustDocument(path: string): Promise<PluginTrustDocument> {

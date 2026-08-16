@@ -1737,9 +1737,14 @@ describe("tnb print mode", () => {
   test("bypass mode allows write, edit, and bash", async () => {
     const cwd = await workspace();
     await writeFile(join(cwd, "notes.txt"), "before\n");
+    const readThenEdit = new ScriptedTransport([
+      toolTurn("read", { path: "notes.txt" })[0]!,
+      toolTurn("edit", { path: "notes.txt", oldText: "before", newText: "after" })[0]!,
+      [{ type: "text", index: 0, text: "Done" }, { type: "response-end", reason: "end-turn" }],
+    ]);
     const transports = [
       new ScriptedTransport(toolTurn("write", { path: "created.txt", content: "hello" })),
-      new ScriptedTransport(toolTurn("edit", { path: "notes.txt", oldText: "before", newText: "after" })),
+      readThenEdit,
       new ScriptedTransport(toolTurn("bash", { command: "printf ran > ran.txt" })),
     ];
     for (const transport of transports) {

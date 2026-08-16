@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { readFile, rename, writeFile } from "node:fs/promises";
+import { withFileLock } from "../../utils/lockfile";
 
 export type TaskStatus =
   | "pending"
@@ -29,9 +29,10 @@ export type TaskRecord = {
 };
 
 type PersistedTaskState = {
-  version: 1;
+  version: 2;
   nextWorkItemId: number;
   tasks: TaskRecord[];
+  deletedTasks: Record<string, string>;
 };
 
 export type TaskUpdate = {
@@ -54,6 +55,7 @@ export class TaskManager {
   private filePath: string;
   private nextWorkItemId = 1;
   private tasks = new Map<string, TaskRecord>();
+  private deletedTasks = new Map<string, string>();
   private controllers = new Map<string, AbortController>();
   private listeners = new Set<() => void>();
   private snapshot: readonly TaskRecord[] = [];
@@ -162,9 +164,10 @@ export class TaskManager {
     activeForm?: string;
     metadata?: Record<string, unknown>;
   }): Promise<TaskRecord> {
+    const id = await this.reserveWorkItemId();
     const now = new Date().toISOString();
     const task: TaskRecord = {
-      id: String(this.nextWorkItemId),
+      id,
       type: "work-item",
       subject: input.subject,
       description: input.description,
@@ -177,8 +180,8 @@ export class TaskManager {
       ...(input.metadata ? { metadata: structuredClone(input.metadata) } : {}),
     };
     await this.lifecycleHooks.beforeCreate?.(structuredClone(task));
-    this.nextWorkItemId += 1;
     this.tasks.set(task.id, task);
+    this.deletedTasks.delete(task.id);
     await this.commit();
     return structuredClone(task);
   }
@@ -200,6 +203,7 @@ export class TaskManager {
     }
     if (update.status === "deleted") {
       this.tasks.delete(taskId);
+      this.deletedTasks.set(taskId, new Date().toISOString());
       for (const task of this.tasks.values()) {
         task.blocks = task.blocks.filter((id) => id !== taskId);
         task.blockedBy = task.blockedBy.filter((id) => id !== taskId);
@@ -306,10 +310,11 @@ export class TaskManager {
       state = parseState(JSON.parse(await readFile(filePath, "utf8")), filePath);
     } catch (error) {
       if (!isMissing(error)) throw error;
-      state = { version: 1, nextWorkItemId: 1, tasks: [] };
+      state = emptyTaskState();
     }
     this.nextWorkItemId = state.nextWorkItemId;
     this.tasks = new Map(state.tasks.map((task) => [task.id, task]));
+    this.deletedTasks = new Map(Object.entries(state.deletedTasks));
     let changed = false;
     for (const task of this.tasks.values()) {
       if (task.status !== "running") continue;
@@ -368,18 +373,41 @@ export class TaskManager {
   private async commit(): Promise<void> {
     const filePath = this.filePath;
     const state: PersistedTaskState = {
-      version: 1,
+      version: 2,
       nextWorkItemId: this.nextWorkItemId,
       tasks: [...this.tasks.values()].map((task) => structuredClone(task)),
+      deletedTasks: Object.fromEntries(this.deletedTasks),
     };
     this.publish();
-    this.writeQueue = this.writeQueue.then(async () => {
-      await mkdir(dirname(filePath), { recursive: true });
-      const temporary = `${filePath}.${process.pid}.tmp`;
-      await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, "utf8");
-      await rename(temporary, filePath);
+    let committed: PersistedTaskState | undefined;
+    const currentWrite = this.writeQueue.catch(() => undefined).then(async () => {
+      await withFileLock(filePath, async () => {
+        const persisted = await readPersistedTaskState(filePath);
+        const merged = mergeTaskStates(persisted, state);
+        await writeTaskState(filePath, merged);
+        committed = merged;
+      });
     });
-    await this.writeQueue;
+    this.writeQueue = currentWrite;
+    await currentWrite;
+    if (committed && this.filePath === filePath) {
+      this.nextWorkItemId = committed.nextWorkItemId;
+      this.tasks = new Map(committed.tasks.map((task) => [task.id, structuredClone(task)]));
+      this.deletedTasks = new Map(Object.entries(committed.deletedTasks));
+      this.publish();
+    }
+  }
+
+  private async reserveWorkItemId(): Promise<string> {
+    const filePath = this.filePath;
+    return withFileLock(filePath, async () => {
+      const persisted = await readPersistedTaskState(filePath);
+      const next = Math.max(this.nextWorkItemId, persisted.nextWorkItemId);
+      persisted.nextWorkItemId = next + 1;
+      await writeTaskState(filePath, persisted);
+      this.nextWorkItemId = next + 1;
+      return String(next);
+    });
   }
 
   private publish(): void {
@@ -403,14 +431,76 @@ export class TaskManager {
   }
 }
 
+function emptyTaskState(): PersistedTaskState {
+  return { version: 2, nextWorkItemId: 1, tasks: [], deletedTasks: {} };
+}
+
+async function readPersistedTaskState(filePath: string): Promise<PersistedTaskState> {
+  try {
+    return parseState(JSON.parse(await readFile(filePath, "utf8")), filePath);
+  } catch (error) {
+    if (isMissing(error)) return emptyTaskState();
+    throw error;
+  }
+}
+
+async function writeTaskState(filePath: string, state: PersistedTaskState): Promise<void> {
+  const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
+  await rename(temporary, filePath);
+}
+
+function mergeTaskStates(persisted: PersistedTaskState, local: PersistedTaskState): PersistedTaskState {
+  const deletedTasks = { ...persisted.deletedTasks };
+  for (const [id, timestamp] of Object.entries(local.deletedTasks)) {
+    const current = deletedTasks[id];
+    if (!current || Date.parse(timestamp) >= Date.parse(current)) deletedTasks[id] = timestamp;
+  }
+  const tasks = new Map(persisted.tasks.map((task) => [task.id, structuredClone(task)]));
+  for (const task of local.tasks) {
+    const current = tasks.get(task.id);
+    if (!current || Date.parse(task.updatedAt) >= Date.parse(current.updatedAt)) {
+      tasks.set(task.id, structuredClone(task));
+    }
+  }
+  for (const id of Object.keys(deletedTasks)) tasks.delete(id);
+  const existingIds = new Set(tasks.keys());
+  for (const task of tasks.values()) {
+    task.blocks = task.blocks.filter((id) => existingIds.has(id));
+    task.blockedBy = task.blockedBy.filter((id) => existingIds.has(id));
+  }
+  return {
+    version: 2,
+    nextWorkItemId: Math.max(persisted.nextWorkItemId, local.nextWorkItemId),
+    tasks: [...tasks.values()].sort(compareTasks),
+    deletedTasks,
+  };
+}
+
+function compareTasks(left: TaskRecord, right: TaskRecord): number {
+  if (left.type === "work-item" && right.type === "work-item") return Number(left.id) - Number(right.id);
+  return Date.parse(left.createdAt) - Date.parse(right.createdAt) || left.id.localeCompare(right.id);
+}
+
 function parseState(value: unknown, path: string): PersistedTaskState {
   if (!value || typeof value !== "object") throw new Error(`Invalid task state: ${path}`);
-  const state = value as Partial<PersistedTaskState>;
-  if (state.version !== 1 || !Number.isSafeInteger(state.nextWorkItemId) || !Array.isArray(state.tasks)) {
+  const state = value as Omit<Partial<PersistedTaskState>, "version"> & { version?: number };
+  if ((state.version !== 1 && state.version !== 2) || !Number.isSafeInteger(state.nextWorkItemId) || !Array.isArray(state.tasks)) {
     throw new Error(`Invalid task state: ${path}`);
   }
   for (const task of state.tasks) validateTask(task, path);
-  return structuredClone(state as PersistedTaskState);
+  const migrated = structuredClone(state) as PersistedTaskState;
+  migrated.version = 2;
+  migrated.deletedTasks ??= {};
+  if (typeof migrated.deletedTasks !== "object" || migrated.deletedTasks === null || Array.isArray(migrated.deletedTasks)) {
+    throw new Error(`Invalid deleted task state: ${path}`);
+  }
+  for (const [id, timestamp] of Object.entries(migrated.deletedTasks)) {
+    if (!id || typeof timestamp !== "string" || !Number.isFinite(Date.parse(timestamp))) {
+      throw new Error(`Invalid deleted task state: ${path}`);
+    }
+  }
+  return migrated;
 }
 
 function validateTask(value: unknown, path: string): asserts value is TaskRecord {

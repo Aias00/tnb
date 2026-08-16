@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { withFileLock } from "../../utils/lockfile";
 
 export async function addProjectPermissionRule(options: {
   cwd: string;
@@ -8,15 +9,27 @@ export async function addProjectPermissionRule(options: {
   rule: string;
 }): Promise<string> {
   const path = join(options.cwd, ".tnb", "settings.local.json");
-  const settings = await readObject(path);
-  const permissions = objectField(settings, "permissions", path);
-  const existing = permissions[options.behavior];
-  if (existing !== undefined && (!Array.isArray(existing) || existing.some((value) => typeof value !== "string"))) {
-    throw new Error(`permissions.${options.behavior} must be an array of strings: ${path}`);
-  }
-  permissions[options.behavior] = [...new Set([...(existing as string[] | undefined ?? []), options.rule])];
-  settings.permissions = permissions;
-  await writeObjectAtomic(path, settings);
+  await withFileLock(path, async () => {
+    const settings = await readObject(path);
+    const permissions = objectField(settings, "permissions", path);
+    const existing = permissions[options.behavior];
+    if (existing !== undefined && (!Array.isArray(existing) || existing.some((value) => typeof value !== "string"))) {
+      throw new Error(`permissions.${options.behavior} must be an array of strings: ${path}`);
+    }
+    permissions[options.behavior] = [...new Set([...(existing as string[] | undefined ?? []), options.rule])];
+    settings.permissions = permissions;
+    await writeObjectAtomic(path, settings);
+  });
+  return path;
+}
+
+export async function setUserSetting(configDir: string, key: string, value: unknown): Promise<string> {
+  const path = join(configDir, "settings.json");
+  await withFileLock(path, async () => {
+    const settings = await readObject(path);
+    settings[key] = value;
+    await writeObjectAtomic(path, settings);
+  });
   return path;
 }
 

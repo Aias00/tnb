@@ -31,6 +31,7 @@ const DEFAULT_LEASE_HEARTBEAT_MS = 20_000;
 export class TeamSupervisor {
   private unsubscribe: (() => void) | undefined;
   private active = new Set<string>();
+  private resumedMessages = new Set<string>();
   private failures = new Map<string, { attempts: number; retryAt: number }>();
   private timer: ReturnType<typeof setTimeout> | undefined;
   private leaseTimer: ReturnType<typeof setTimeout> | undefined;
@@ -99,7 +100,9 @@ export class TeamSupervisor {
       if ((failure && failure.retryAt > now) || (Number.isFinite(persistedRetryAt) && persistedRetryAt > now)) continue;
       const task = this.findLatestTask(member);
       if (task) {
-        const pending = member.status === "idle" ? this.teams.pendingMessages(member.name)[0] : undefined;
+        const pending = member.status === "idle"
+          ? this.teams.pendingMessages(member.name).find((message) => !this.resumedMessages.has(message.id))
+          : undefined;
         await this.run({ member, task, cause: pending ? "message" : "recovery", ...(pending ? { message: pending } : {}) });
       }
     }
@@ -117,6 +120,7 @@ export class TeamSupervisor {
     if (this.leaseHeld) await this.teams.releaseLease(this.leaseOwnerId);
     this.leaseHeld = false;
     this.failures.clear();
+    this.resumedMessages.clear();
   }
 
   private runTracked(operation: Promise<void>): void {
@@ -127,6 +131,7 @@ export class TeamSupervisor {
   }
 
   private async resumeRecipients(message: TeamMessage): Promise<void> {
+    if (this.resumedMessages.has(message.id)) return;
     if (!await this.ensureLease()) return;
     const state = this.teams.current();
     if (!state) return;
@@ -155,6 +160,7 @@ export class TeamSupervisor {
     this.active.add(spec.member.agentId);
     try {
       await this.resume(spec);
+      if (spec.message) this.resumedMessages.add(spec.message.id);
       this.failures.delete(spec.member.agentId);
       await this.teams.clearRecoveryFailure(this.teams.current()!.name, spec.member.agentId);
     } catch (error) {

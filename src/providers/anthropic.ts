@@ -83,7 +83,7 @@ async function* streamAnthropic(
       let ended = false;
       let sawToolUse = false;
       const reportedUsage = emptyTokenUsage();
-      for await (const value of parseSseJson(response)) {
+      for await (const value of parseSseJson(response, { signal })) {
         const event = value as AnthropicEvent;
         if (event.type === "message_start" && event.message?.usage) {
           const usage = anthropicUsageDelta(reportedUsage, event.message.usage, false);

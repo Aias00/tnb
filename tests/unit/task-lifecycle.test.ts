@@ -73,4 +73,32 @@ describe("task lifecycle", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+
+  test("allocates unique task ids and prevents stale-process resurrection", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "tnb-tasks-"));
+    try {
+      const path = join(directory, "tasks.json");
+      const first = new TaskManager(path);
+      const second = new TaskManager(path);
+      await Promise.all([first.initialize(), second.initialize()]);
+
+      const [alpha, beta] = await Promise.all([
+        first.createWorkItem({ subject: "alpha", description: "first" }),
+        second.createWorkItem({ subject: "beta", description: "second" }),
+      ]);
+      expect([alpha.id, beta.id].sort()).toEqual(["1", "2"]);
+
+      const stale = new TaskManager(path);
+      await stale.initialize();
+      await first.update(alpha.id, { status: "deleted" });
+      await stale.createWorkItem({ subject: "gamma", description: "stale writer continues" });
+
+      const restored = new TaskManager(path);
+      await restored.initialize();
+      expect(restored.list().map(({ subject }) => subject).sort()).toEqual(["beta", "gamma"]);
+      expect(restored.get(alpha.id)).toBeUndefined();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
 });

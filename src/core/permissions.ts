@@ -1,4 +1,4 @@
-import { relative, resolve } from "node:path";
+import { basename, relative, resolve } from "node:path";
 
 import { analyzeShellCommand } from "./shell-permissions";
 
@@ -83,6 +83,25 @@ export type ResolvedPermissionMode = {
   reason?: string;
 };
 
+export const DANGEROUS_AUTO_EDIT_FILES = [
+  ".gitconfig",
+  ".gitmodules",
+  ".bashrc",
+  ".bash_profile",
+  ".zshrc",
+  ".zprofile",
+  ".profile",
+  ".ripgreprc",
+  ".mcp.json",
+] as const;
+
+export const DANGEROUS_AUTO_EDIT_DIRECTORIES = [
+  ".git",
+  ".vscode",
+  ".idea",
+  ".tnb",
+] as const;
+
 export function parsePermissionRule(rule: string): PermissionRuleValue {
   const open = findUnescaped(rule, "(", false);
   if (open < 1) return { toolName: rule };
@@ -138,6 +157,13 @@ export function evaluatePermission(
     return {
       behavior: "deny",
       message: `${tool.name} is unavailable in plan mode`,
+    };
+  }
+
+  if (tool.risk === "write" && isDangerousAutoEditPath(options, tool, input)) {
+    return {
+      behavior: "ask",
+      message: `${tool.name} requested permission to edit a sensitive file`,
     };
   }
 
@@ -290,6 +316,26 @@ function isWorkspacePath(cwd: string, value: string): boolean {
   const target = resolve(cwd, value);
   const rel = relative(resolve(cwd), target);
   return rel === "" || (!rel.startsWith("..") && rel !== "..");
+}
+
+function isDangerousAutoEditPath(
+  options: PermissionOptions,
+  tool: ToolPolicy,
+  input: unknown,
+): boolean {
+  const value = tool.permissionRuleContent?.(input);
+  if (!value) return false;
+  if (value.startsWith("\\\\") || value.startsWith("//")) return true;
+  const absolute = resolve(options.cwd ?? process.cwd(), value);
+  const segments = absolute.split(/[\\/]+/).map((segment) => segment.toLowerCase());
+  for (let index = 0; index < segments.length; index += 1) {
+    const segment = segments[index]!;
+    if (!(DANGEROUS_AUTO_EDIT_DIRECTORIES as readonly string[]).includes(segment)) continue;
+    if (segment === ".tnb" && segments[index + 1] === "worktrees") continue;
+    return true;
+  }
+  const fileName = basename(absolute).toLowerCase();
+  return (DANGEROUS_AUTO_EDIT_FILES as readonly string[]).includes(fileName);
 }
 
 function findMatchingRule(

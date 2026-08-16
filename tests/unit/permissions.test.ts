@@ -269,6 +269,40 @@ describe("permission checker", () => {
     ).toBe("deny");
   });
 
+  test("requires explicit approval for sensitive configuration edits", () => {
+    for (const path of [
+      ".git/config",
+      ".vscode/settings.json",
+      ".tnb/settings.local.json",
+      ".ZSHRC",
+    ]) {
+      expect(
+        evaluatePermission(
+          { mode: "acceptEdits", cwd: "/workspace/project", rules: { allow: [`write(${path})`] } },
+          tool("write", "write"),
+          { path },
+        ),
+      ).toMatchObject({ behavior: "ask", message: "write requested permission to edit a sensitive file" });
+    }
+  });
+
+  test("keeps yolo explicit and permits the managed worktree directory", () => {
+    expect(
+      evaluatePermission(
+        { mode: "bypassPermissions", cwd: "/workspace/project" },
+        tool("write", "write"),
+        { path: ".tnb/settings.local.json" },
+      ).behavior,
+    ).toBe("allow");
+    expect(
+      evaluatePermission(
+        { mode: "acceptEdits", cwd: "/workspace/project" },
+        tool("write", "write"),
+        { path: ".tnb/worktrees/task/src/index.ts" },
+      ).behavior,
+    ).toBe("allow");
+  });
+
   test("auto mode allows safe workspace edits but still gates broader execution", () => {
     expect(
       evaluatePermission(

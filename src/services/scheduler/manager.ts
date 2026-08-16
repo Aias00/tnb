@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
+import { withFileLock } from "../../utils/lockfile";
+
 export const MAX_SCHEDULED_JOBS = 50;
 export const RECURRING_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -15,12 +17,13 @@ export type ScheduledJob = {
   lastFiredAt?: number;
 };
 
-type ScheduledFile = { version: 1; tasks: ScheduledJob[] };
+type ScheduledFile = { version: 2; tasks: ScheduledJob[]; deletedTasks: Record<string, number> };
 type WakeListener = (prompt: string, source: string) => void;
 
 export class ScheduleManager {
   readonly filePath: string;
   private durable = new Map<string, ScheduledJob>();
+  private deletedDurable = new Map<string, number>();
   private session = new Map<string, ScheduledJob>();
   private listeners = new Set<WakeListener>();
   private timer: ReturnType<typeof setInterval> | undefined;
@@ -32,26 +35,8 @@ export class ScheduleManager {
   }
 
   async initialize(): Promise<void> {
-    let text: string;
-    try {
-      text = await readFile(this.filePath, "utf8");
-    } catch (error) {
-      if (isMissingFile(error)) return;
-      throw error;
-    }
-    let value: unknown;
-    try {
-      value = JSON.parse(text);
-    } catch (error) {
-      throw new Error(`Invalid scheduled tasks JSON: ${this.filePath}`, { cause: error });
-    }
-    if (!isObject(value) || value.version !== 1 || !Array.isArray(value.tasks)) {
-      throw new Error(`Invalid scheduled tasks file: ${this.filePath}`);
-    }
-    for (const candidate of value.tasks) {
-      const task = parsePersistedJob(candidate);
-      this.durable.set(task.id, task);
-    }
+    const state = await readScheduledFile(this.filePath);
+    this.adopt(state);
   }
 
   start(): void {
@@ -92,7 +77,10 @@ export class ScheduleManager {
       createdAt: Date.now(),
     };
     (task.durable ? this.durable : this.session).set(task.id, task);
-    if (task.durable) await this.persist();
+    if (task.durable) {
+      this.deletedDurable.delete(task.id);
+      await this.persist();
+    }
     return structuredClone(task);
   }
 
@@ -104,7 +92,9 @@ export class ScheduleManager {
 
   async remove(id: string): Promise<boolean> {
     if (this.session.delete(id)) return true;
+    await this.persist();
     if (!this.durable.delete(id)) return false;
+    this.deletedDurable.set(id, Date.now());
     await this.persist();
     return true;
   }
@@ -159,7 +149,10 @@ export class ScheduleManager {
     for (const task of this.list()) {
       if (task.recurring && now - task.createdAt >= RECURRING_MAX_AGE_MS) {
         (task.durable ? this.durable : this.session).delete(task.id);
-        if (task.durable) durableChanged = true;
+        if (task.durable) {
+          this.deletedDurable.set(task.id, now);
+          durableChanged = true;
+        }
         continue;
       }
       const next = nextCronRun(task.cron, task.lastFiredAt ?? task.createdAt);
@@ -173,6 +166,7 @@ export class ScheduleManager {
         if (current) current.lastFiredAt = now;
       } else {
         collection.delete(task.id);
+        if (task.durable) this.deletedDurable.set(task.id, now);
       }
       if (task.durable) durableChanged = true;
     }
@@ -184,12 +178,75 @@ export class ScheduleManager {
   }
 
   private async persist(): Promise<void> {
-    await mkdir(dirname(this.filePath), { recursive: true });
-    const temporary = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
-    const value: ScheduledFile = { version: 1, tasks: [...this.durable.values()] };
-    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-    await rename(temporary, this.filePath);
+    await withFileLock(this.filePath, async () => {
+      const disk = await readScheduledFile(this.filePath);
+      const merged = mergeScheduledFiles(disk, {
+        version: 2,
+        tasks: [...this.durable.values()],
+        deletedTasks: Object.fromEntries(this.deletedDurable),
+      });
+      await writeScheduledFile(this.filePath, merged);
+      this.adopt(merged);
+    });
   }
+
+  private adopt(state: ScheduledFile): void {
+    this.durable = new Map(state.tasks.map((task) => [task.id, structuredClone(task)]));
+    this.deletedDurable = new Map(Object.entries(state.deletedTasks));
+  }
+}
+
+async function readScheduledFile(filePath: string): Promise<ScheduledFile> {
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(filePath, "utf8"));
+  } catch (error) {
+    if (isMissingFile(error)) return { version: 2, tasks: [], deletedTasks: {} };
+    if (error instanceof SyntaxError) throw new Error(`Invalid scheduled tasks JSON: ${filePath}`, { cause: error });
+    throw error;
+  }
+  if (!isObject(value) || !Array.isArray(value.tasks) || (value.version !== 1 && value.version !== 2)) {
+    throw new Error(`Invalid scheduled tasks file: ${filePath}`);
+  }
+  const deletedTasks: Record<string, number> = {};
+  if (value.version === 2) {
+    if (!isObject(value.deletedTasks)) throw new Error(`Invalid scheduled tasks file: ${filePath}`);
+    for (const [id, deletedAt] of Object.entries(value.deletedTasks)) {
+      if (typeof deletedAt !== "number" || !Number.isFinite(deletedAt)) throw new Error(`Invalid scheduled tasks file: ${filePath}`);
+      deletedTasks[id] = deletedAt;
+    }
+  }
+  const tasks = value.tasks.map(parsePersistedJob).filter((task) => deletedTasks[task.id] === undefined);
+  return { version: 2, tasks, deletedTasks };
+}
+
+function mergeScheduledFiles(first: ScheduledFile, second: ScheduledFile): ScheduledFile {
+  const deletedTasks = { ...first.deletedTasks };
+  for (const [id, deletedAt] of Object.entries(second.deletedTasks)) {
+    deletedTasks[id] = Math.max(deletedTasks[id] ?? 0, deletedAt);
+  }
+  const tasks = new Map<string, ScheduledJob>();
+  for (const task of [...first.tasks, ...second.tasks]) {
+    if (deletedTasks[task.id] !== undefined) continue;
+    const current = tasks.get(task.id);
+    if (!current) {
+      tasks.set(task.id, structuredClone(task));
+      continue;
+    }
+    const lastFiredAt = Math.max(current.lastFiredAt ?? 0, task.lastFiredAt ?? 0);
+    tasks.set(task.id, {
+      ...(current.createdAt <= task.createdAt ? current : task),
+      ...(lastFiredAt > 0 ? { lastFiredAt } : {}),
+    });
+  }
+  return { version: 2, tasks: [...tasks.values()], deletedTasks };
+}
+
+async function writeScheduledFile(filePath: string, value: ScheduledFile): Promise<void> {
+  await mkdir(dirname(filePath), { recursive: true });
+  const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  await rename(temporary, filePath);
 }
 
 type CronField = { values: Set<number>; wildcard: boolean };

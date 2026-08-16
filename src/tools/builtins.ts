@@ -1,4 +1,4 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
 import { defineTool } from "../core/tool";
@@ -10,6 +10,11 @@ import {
   WRITE_TOOL_PROMPT,
 } from "../constants/tool-prompts";
 import { assertToolPathInsideAllowedRoots, resolveWorkspaceRoot } from "../utils/workspace-path";
+import {
+  createFileStateCacheWithSizeLimit,
+  READ_FILE_STATE_CACHE_SIZE,
+  type FileStateCache,
+} from "../utils/file-state-cache";
 import { isImagePath, isPdfPath, readImage, readPdf } from "./read-media";
 
 export { createGlobTool, createGrepTool } from "./search";
@@ -22,6 +27,7 @@ export function createReadTool(
     supportsPdf: true,
   },
   additionalRoots: () => string[] = () => [],
+  readFileState: FileStateCache = createFileStateCacheWithSizeLimit(READ_FILE_STATE_CACHE_SIZE),
 ) {
   return defineTool({
     name: "read",
@@ -69,12 +75,24 @@ export function createReadTool(
       }
       if (isPdfPath(target)) return readPdf(target, path, pages, signal, capabilities);
       if (pages !== undefined) throw new Error("read pages is only valid for PDF files");
-      return readFile(target, { encoding: "utf8", signal });
+      const content = await readFile(target, { encoding: "utf8", signal });
+      const metadata = await stat(target);
+      readFileState.set(target, {
+        content,
+        timestamp: Math.floor(metadata.mtimeMs),
+        offset: undefined,
+        limit: undefined,
+      });
+      return content;
     },
   });
 }
 
-export function createWriteTool(workspaceRoot: WorkspaceRootSource, additionalRoots: () => string[] = () => []) {
+export function createWriteTool(
+  workspaceRoot: WorkspaceRootSource,
+  additionalRoots: () => string[] = () => [],
+  readFileState: FileStateCache = createFileStateCacheWithSizeLimit(READ_FILE_STATE_CACHE_SIZE),
+) {
   return defineTool({
     name: "write",
     description: WRITE_TOOL_PROMPT,
@@ -105,13 +123,26 @@ export function createWriteTool(workspaceRoot: WorkspaceRootSource, additionalRo
       await assertToolPathInsideAllowedRoots(root, path, "write", additionalRoots());
       const target = resolve(root, path);
       await mkdir(dirname(target), { recursive: true });
+      const existing = await readExistingTextFile(target, signal);
+      if (existing !== undefined) assertFileUnchangedSinceRead(target, existing, readFileState);
       await writeFile(target, content, { encoding: "utf8", signal });
+      const metadata = await stat(target);
+      readFileState.set(target, {
+        content,
+        timestamp: Math.floor(metadata.mtimeMs),
+        offset: undefined,
+        limit: undefined,
+      });
       return `Wrote ${Buffer.byteLength(content, "utf8")} bytes to ${path}`;
     },
   });
 }
 
-export function createEditTool(workspaceRoot: WorkspaceRootSource, additionalRoots: () => string[] = () => []) {
+export function createEditTool(
+  workspaceRoot: WorkspaceRootSource,
+  additionalRoots: () => string[] = () => [],
+  readFileState: FileStateCache = createFileStateCacheWithSizeLimit(READ_FILE_STATE_CACHE_SIZE),
+) {
   return defineTool({
     name: "edit",
     description: EDIT_TOOL_PROMPT,
@@ -157,6 +188,7 @@ export function createEditTool(workspaceRoot: WorkspaceRootSource, additionalRoo
       await assertToolPathInsideAllowedRoots(root, path, "write", additionalRoots());
       const target = resolve(root, path);
       const content = await readFile(target, { encoding: "utf8", signal });
+      assertFileUnchangedSinceRead(target, content, readFileState);
       const first = content.indexOf(oldText);
       if (first < 0) throw new Error("edit target text was not found");
       const second = content.indexOf(oldText, first + oldText.length);
@@ -171,9 +203,39 @@ export function createEditTool(workspaceRoot: WorkspaceRootSource, additionalRoo
         encoding: "utf8",
         signal,
       });
+      const metadata = await stat(target);
+      readFileState.set(target, {
+        content: updated,
+        timestamp: Math.floor(metadata.mtimeMs),
+        offset: undefined,
+        limit: undefined,
+      });
       return replaceAll ? `Edited ${path}: replaced ${matches} occurrences` : `Edited ${path}`;
     },
   });
+}
+
+async function readExistingTextFile(target: string, signal: AbortSignal): Promise<string | undefined> {
+  try {
+    return await readFile(target, { encoding: "utf8", signal });
+  } catch (error) {
+    if (isMissingFile(error)) return undefined;
+    throw error;
+  }
+}
+
+function assertFileUnchangedSinceRead(target: string, currentContent: string, readFileState: FileStateCache): void {
+  const lastRead = readFileState.get(target);
+  if (!lastRead || lastRead.isPartialView) {
+    throw new Error("File has not been read yet. Read it first before writing to it.");
+  }
+  if (lastRead.offset !== undefined || lastRead.limit !== undefined || lastRead.content !== currentContent) {
+    throw new Error("File has been modified since read, either by the user or by a formatter. Read it again before writing to it.");
+  }
+}
+
+function isMissingFile(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
 }
 
 function countOccurrences(content: string, search: string): number {

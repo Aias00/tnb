@@ -59,4 +59,28 @@ describe("session goals", () => {
     await goals.pause();
     expect(goals.reminder()).toBeUndefined();
   });
+
+  test("serializes concurrent managers and does not resurrect a cleared goal", async () => {
+    const first = await manager();
+    const second = new GoalManager(first.filePath);
+    await second.initialize();
+
+    const results = await Promise.allSettled([
+      first.create("First goal", 5),
+      second.create("Second goal", 5),
+    ]);
+    expect(results.filter(({ status }) => status === "fulfilled")).toHaveLength(1);
+    expect(results.filter(({ status }) => status === "rejected")).toHaveLength(1);
+
+    await second.refresh();
+    await Promise.all([first.recordTurn(), second.recordTurn()]);
+    const restored = new GoalManager(first.filePath);
+    await restored.initialize();
+    expect(restored.current()?.turnsUsed).toBe(2);
+
+    expect(await first.clear()).toBe(true);
+    expect(await second.recordTurn()).toBeUndefined();
+    await restored.refresh();
+    expect(restored.current()).toBeUndefined();
+  });
 });

@@ -141,6 +141,35 @@ describe("provider management command", () => {
     expect(stderr).toContain("requires --yes");
     expect(await runProviderCommand({ ...common, argv: ["provider", "remove", "local", "--yes"] })).toBe(0);
   });
+
+  test("preserves concurrent provider and model updates", async () => {
+    const configDir = await temporaryDirectory();
+    const common = {
+      env: {},
+      cwd: configDir,
+      configDir,
+      stdout: { write: () => undefined },
+      stderr: { write: () => undefined },
+    };
+    expect(await Promise.all(["alpha", "beta"].map((id) => runProviderCommand({
+      ...common,
+      argv: ["provider", "add", id, "--api", "openai-completions", "--base-url", `https://${id}.example.test/v1`, "--model", `${id}-chat`],
+    })))).toEqual([0, 0]);
+    expect(await Promise.all(["alpha-code", "alpha-reasoning"].map((model) => runProviderCommand({
+      ...common,
+      argv: ["provider", "model", "add", "alpha", model],
+    })))).toEqual([0, 0]);
+
+    const document = JSON.parse(await readFile(join(configDir, "models.json"), "utf8")) as {
+      providers: Record<string, { models: Array<{ id: string }> }>;
+    };
+    expect(Object.keys(document.providers).sort()).toEqual(["alpha", "beta"]);
+    expect(document.providers.alpha?.models.map(({ id }) => id).sort()).toEqual([
+      "alpha-chat",
+      "alpha-code",
+      "alpha-reasoning",
+    ]);
+  });
 });
 
 describe("configuration lifecycle", () => {

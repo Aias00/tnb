@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { loadMcpConfig, loadMcpConfigInputs } from "../../src/services/mcp/config";
+import { loadMcpConfig, loadMcpConfigInputs, updateMcpConfig } from "../../src/services/mcp/config";
 
 const directories: string[] = [];
 async function temporaryDirectory() {
@@ -88,6 +88,20 @@ describe("MCP config", () => {
   test("returns an empty config when the default file does not exist", async () => {
     const directory = await temporaryDirectory();
     expect(await loadMcpConfig(join(directory, "missing.json"))).toEqual({ mcpServers: {} });
+  });
+
+  test("preserves concurrent server updates under the config file lock", async () => {
+    const directory = await temporaryDirectory();
+    const path = join(directory, "mcp.json");
+    await Promise.all(Array.from({ length: 12 }, (_, index) =>
+      updateMcpConfig(path, (servers) => {
+        servers[`server-${index}`] = { command: "bun", args: [`server-${index}.ts`] };
+      })
+    ));
+
+    expect(Object.keys((await loadMcpConfig(path)).mcpServers).sort()).toEqual(
+      Array.from({ length: 12 }, (_, index) => `server-${index}`).sort(),
+    );
   });
 
   test("rejects malformed server definitions", async () => {
