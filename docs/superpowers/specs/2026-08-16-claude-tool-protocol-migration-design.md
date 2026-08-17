@@ -47,10 +47,7 @@ pinned source snapshot:
 - `Grep`
 - `Glob`
 - `Bash`
-- `BashOutput`
-- `BashInput`
-- `BashResize`
-- the pinned Agent tool's exact registered name
+- `Agent`
 - `TaskCreate`
 - `TaskGet`
 - `TaskUpdate`
@@ -58,16 +55,20 @@ pinned source snapshot:
 - `TaskOutput`
 - `TaskStop`
 
-If the pinned source does not independently register one of the Bash auxiliary
-names, use the exact pinned source arrangement rather than inventing it.
-Schema fixtures generated from the pinned modules are the source of truth.
+The pinned snapshot does not independently register `BashOutput`, `BashInput`,
+or `BashResize`; do not expose them as Provider tools. Background output uses
+canonical `TaskOutput`. PTY write/resize/kill remain internal TUI controls and
+SDK/CLI control operations, outside Claude tool parity. Schema fixtures
+generated from the pinned modules are the source of truth.
 
 ## Breaking compatibility contract
 
 - Remove lowercase built-in registrations such as `read`, `write`, `edit`,
   `grep`, `glob`, `bash`, and `task_create`.
-- Do not accept legacy snake_case/camelCase aliases unless the pinned Claude
-  schema itself accepts them.
+- Strip legacy aliases and deprecated fields even when the pinned implementation
+  retains them for compatibility. Provider-facing input accepts canonical names
+  and current fields only: no `Task` alias for `Agent`, no `AgentOutputTool`,
+  `BashOutputTool`, `KillShell`, or deprecated `shell_id`.
 - Do not create hidden duplicate tools for old names.
 - Existing JSONL records remain readable and renderable.
 - Historical lowercase tool-use/result blocks are replayed as conversation
@@ -79,6 +80,9 @@ Schema fixtures generated from the pinned modules are the source of truth.
   it does not silently rewrite settings.
 - Custom commands, Skills, Agents, Plugins, and docs that list old tool names
   must be updated explicitly.
+- CLI `--tools`/`--allowed-tools`/`--disallowed-tools`, Skill `allowed-tools`,
+  and Agent `tools`/`disallowedTools` use exact case-sensitive canonical names;
+  remove their current lowercase normalization for migrated built-ins.
 
 ## Architecture
 
@@ -185,7 +189,7 @@ Port the pinned Bash input schema and result/progress formatting, including:
 - real-time progress;
 - background task identifiers;
 - PTY input, output, resize, and termination APIs exactly as registered by the
-  pinned snapshot.
+  pinned snapshot or, when no Provider tool exists, as internal TUI controls.
 
 Use tnb's existing `ShellSessionManager`, node-pty integration, and graceful
 shutdown ownership. Do not import Claude remote execution, telemetry, or
@@ -193,9 +197,17 @@ platform services.
 
 ## Agent and task tools
 
-Port the pinned Agent tool's exact name/schema, foreground/background behavior,
-model override, agent profile selection, isolated history, tool restriction,
-progress, final result, abort, and resume fields.
+Port the pinned `Agent` name/schema, foreground/background behavior, agent
+profile selection, isolated history, tool restriction, progress, final result,
+and abort behavior. Do not expose tnb's former provider-facing `resume` field;
+the pinned schema has no such field.
+
+Provider-facing `model` is exactly `sonnet | opus | haiku`. Resolve it through
+new optional settings `agentModelAliases.{sonnet,opus,haiku}`. Each value is a
+concrete configured tnb provider/model selector. When an alias is absent, it
+maps to the active main model, allowing custom Providers such as GLM/Qwen to
+use the Claude-style enum without inventing arbitrary schema values. Invalid
+configured selectors fail before launching the child Agent.
 
 Port TaskCreate/Get/Update/List/Output/Stop schemas and result text. Map them to
 tnb's durable `TaskManager`, preserving:
@@ -211,6 +223,20 @@ tnb's durable `TaskManager`, preserving:
 
 Where tnb persistence contains fields absent from Claude's protocol, keep them
 internal and omit them from Provider-facing results.
+
+### Bash/TaskOutput lifetime
+
+Background Bash and PTY processes remain process-local. During the current CLI
+process, register their IDs in a unified TaskOutput resolver so canonical
+`TaskOutput` can poll shell and Agent tasks with pinned `block` and `timeout`
+semantics. Agent/work-item tasks remain durable through `TaskManager`.
+
+Shell process identity is not promoted into durable task state. After CLI
+restart or `--resume`, an old Bash/PTY ID returns the pinned unknown/expired task
+error and cannot be reattached; persisted output files remain available only
+through existing local task inspection commands. Stopped/expired ephemeral IDs
+leave bounded in-process tombstones so repeated TaskOutput/TaskStop calls return
+a stable terminal result rather than targeting a reused process ID.
 
 ## Registry, permissions, prompts, and UI
 
@@ -257,7 +283,10 @@ and JSON Schema from the pinned source. Add behavior tests for:
 - Bash foreground/background/PTY/progress/input/resize/kill/timeout/abort;
 - Agent foreground/background/profile/model/resume/abort;
 - every Task operation, dependency, output, stop, persistence and recovery;
-- ToolSearch activation and context savings;
+- ToolSearch observable activation: before activation each migrated deferred
+  tool is absent from the Provider tool list; after `tool_search`, matched tools
+  appear in the next-turn list and `remainingDeferred` decreases by the exact
+  number activated;
 - permission rules, plan/YOLO, Hooks and legacy diagnostics;
 - TUI tool cards and restored historical lowercase transcripts;
 - Anthropic, OpenAI Chat, and OpenAI Responses tool conversion.
@@ -277,4 +306,3 @@ The migration is complete when:
 - all safety/runtime integrations remain active;
 - all focused and full verification passes on macOS;
 - the merged `main` build exposes only the canonical names.
-
