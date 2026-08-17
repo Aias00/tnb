@@ -10,6 +10,7 @@ import {
 } from "../../src/ui/input-buffer";
 import { applyInkInput, restoreInputHistory } from "../../src/ui/app";
 import { sessionInputHistory } from "../../src/services/session/storage";
+import { clearKillRing, pushToKillRing, resetKillAccumulation } from "../../src/ui/input/cursor";
 
 describe("TUI input buffer", () => {
   test("inserts text at the cursor and supports cursor-aware backspace", () => {
@@ -92,6 +93,44 @@ describe("TUI input buffer", () => {
     expect(buffer.value).toBe("wide line\nshort\nlast");
   });
 
+  test("uses Cursor for grapheme-safe deletion", () => {
+    const family = "👨‍👩‍👧‍👦";
+    let buffer = applyInputKey(createInputBuffer(`A${family}B`), { name: "left", columns: 20 });
+    buffer = applyInputKey(buffer, { name: "backspace", columns: 20 });
+    expect(buffer).toMatchObject({ value: "AB", cursor: 1 });
+
+    const insideCombining = { ...createInputBuffer("e\u0301x"), cursor: 1 };
+    expect(applyInputKey(insideCombining, { name: "delete", columns: 20 })).toMatchObject({ value: "x", cursor: 0 });
+  });
+
+  test("moves by wrapped rows before history", () => {
+    let buffer = { ...createInputBuffer("abcdefghij", ["history"]), cursor: 7 };
+    buffer = applyInputKey(buffer, { name: "up", columns: 6 });
+    expect(buffer).toMatchObject({ value: "abcdefghij", cursor: 2 });
+    expect(buffer.historyDraft).toBeUndefined();
+  });
+
+  test("uses logical lines when terminal columns are unavailable or invalid", () => {
+    const original = { ...createInputBuffer("abc\ndef"), cursor: 6 };
+    expect(applyInputKey(original, { name: "up" }).cursor).toBe(2);
+    expect(applyInputKey(original, { name: "up", columns: 0 }).cursor).toBe(2);
+    expect(applyInputKey(original, { name: "up", columns: -10 }).cursor).toBe(2);
+  });
+
+  test("supports visual-line kill, word kill, yank, and yank-pop", () => {
+    clearKillRing();
+    let buffer = { ...createInputBuffer("hello world"), cursor: 5 };
+    buffer = applyInputKey(buffer, { name: "kill-line-end", columns: 40 });
+    expect(buffer).toMatchObject({ value: "hello", cursor: 5 });
+    buffer = applyInputKey(buffer, { name: "yank", columns: 40 });
+    expect(buffer.value).toBe("hello world");
+
+    clearKillRing();
+    buffer = applyInputKey(createInputBuffer("hello world"), { name: "kill-word", columns: 40 });
+    expect(buffer.value).toBe("hello ");
+    expect(applyInputKey(buffer, { name: "yank", columns: 40 }).value).toBe("hello world");
+  });
+
   test("reverse-searches prompt history from newest to oldest", () => {
     const history = ["inspect provider", "run tests", "fix provider usage"];
     expect(searchInputHistory(history, "provider")).toEqual({ value: "fix provider usage", index: 2 });
@@ -144,4 +183,47 @@ describe("TUI input buffer", () => {
     const middle = applyInputKey(createInputBuffer("abc"), { name: "left" });
     expect(applyInkInput(middle, "d", { ...baseKey, ctrl: true }).value).toBe("ab");
   });
+
+  test("maps main prompt Ctrl keys to Cursor movement and kill-ring operations", () => {
+    const baseKey = inkKey();
+    let buffer = createInputBuffer("hello world");
+    buffer = applyInkInput(buffer, "a", { ...baseKey, ctrl: true }, { columns: 40, scope: "main-prompt" });
+    expect(buffer.cursor).toBe(0);
+    buffer = applyInkInput(buffer, "e", { ...baseKey, ctrl: true }, { columns: 40, scope: "main-prompt" });
+    expect(buffer.cursor).toBe(buffer.value.length);
+    buffer = applyInkInput(buffer, "w", { ...baseKey, ctrl: true }, { columns: 40, scope: "main-prompt" });
+    expect(buffer.value).toBe("hello ");
+    buffer = applyInkInput(buffer, "y", { ...baseKey, ctrl: true }, { columns: 40, scope: "main-prompt" });
+    expect(buffer.value).toBe("hello world");
+    buffer = { ...buffer, cursor: 5 };
+    buffer = applyInkInput(buffer, "k", { ...baseKey, ctrl: true }, { columns: 40, scope: "main-prompt" });
+    expect(buffer.value).toBe("hello");
+  });
+
+  test("enables yank-pop only in the main prompt", () => {
+    const baseKey = inkKey();
+    clearKillRing();
+    pushToKillRing("first");
+    resetKillAccumulation();
+    pushToKillRing("second");
+    let buffer = applyInkInput(createInputBuffer(""), "y", { ...baseKey, ctrl: true }, { columns: 40, scope: "main-prompt" });
+    expect(buffer.value).toBe("second");
+    buffer = applyInkInput(buffer, "y", { ...baseKey, meta: true }, { columns: 40, scope: "main-prompt" });
+    expect(buffer.value).toBe("first");
+
+    const modal = applyInkInput(createInputBuffer("modal"), "k", { ...baseKey, ctrl: true }, { columns: 40, scope: "modal" });
+    const pty = applyInkInput(createInputBuffer("pty"), "k", { ...baseKey, ctrl: true }, { columns: 40, scope: "pty" });
+    expect(modal.value).toBe("modal");
+    expect(pty.value).toBe("pty");
+  });
 });
+
+function inkKey() {
+  return {
+    upArrow: false, downArrow: false, leftArrow: false, rightArrow: false,
+    pageDown: false, pageUp: false, home: false, end: false, return: false,
+    escape: false, ctrl: false, shift: false, tab: false, backspace: false,
+    delete: false, meta: false, super: false, hyper: false, capsLock: false,
+    numLock: false,
+  };
+}

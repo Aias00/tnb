@@ -17,6 +17,8 @@ import type { McpActivity } from "./mcp-activity-controller";
 import type { TranscriptSearchState } from "./transcript/search";
 import type { ShellRuntimeSnapshot } from "../services/shell/manager";
 import type { InputHistorySearch } from "./input-buffer";
+import { buildPromptLayout, promptContentColumns, type PromptLayout } from "./input/prompt-layout";
+import { Ansi } from "./ink/Ansi";
 
 export type TuiViewProps = {
   state: TuiState;
@@ -92,7 +94,15 @@ export const TuiView = memo(function TuiView({
     setNewerRows(Math.max(0, viewport.contentHeight - viewport.viewportHeight - viewport.scrollTop));
   }, []);
   const suggestionRows = commandSuggestions.length || (!commandSuggestions.length ? inputCompletions.length : 0);
-  const transcriptHeight = measureTranscriptHeight({ terminalRows: rows, terminalColumns: columns, input, suggestionRows });
+  const promptMode = vimMode ? (vimInsert ? "INSERT" : "NORMAL") : undefined;
+  const contentColumns = promptContentColumns(columns, promptMode);
+  const promptLayout = buildPromptLayout({
+    text: input,
+    offset: cursor,
+    terminalColumns: columns,
+    prefixColumns: columns - contentColumns,
+  });
+  const transcriptHeight = measureTranscriptHeight({ terminalRows: rows, promptLayout, suggestionRows });
   return (
     <Box width={columns} height={rows} overflow="hidden" flexDirection="column" paddingX={1}>
       {!management && !shellPanel ? (
@@ -141,11 +151,10 @@ export const TuiView = memo(function TuiView({
           {!commandSuggestions.length && inputCompletions.length ? <InputCompletions values={inputCompletions} selection={inputCompletionIndex} color={primaryColor} /> : null}
           {!commandSuggestions.length && !inputCompletions.length && completionNotice ? <CompletionNotice message={completionNotice} /> : null}
           {!transcriptSearch && !historySearch ? <PromptInputView
-            value={input}
-            cursor={cursor}
+            layout={promptLayout}
             disabled={state.busy}
             color={primaryColor}
-            {...(vimMode ? { mode: vimInsert ? "INSERT" : "NORMAL" } : {})}
+            {...(promptMode ? { mode: promptMode } : {})}
           /> : null}
         </>
       )}
@@ -480,15 +489,12 @@ function QuestionDialog({
   );
 }
 
-function PromptInputView({ value, cursor, disabled, mode, color }: { value: string; cursor: number; disabled: boolean; mode?: string; color: "magenta" | "cyan" | "blue" | "green" }) {
-  const before = value.slice(0, cursor);
-  const current = value[cursor] ?? " ";
-  const after = value.slice(cursor + (value[cursor] ? 1 : 0));
+function PromptInputView({ layout, disabled, mode, color }: { layout: PromptLayout; disabled: boolean; mode?: string; color: "magenta" | "cyan" | "blue" | "green" }) {
   return (
     <Box flexShrink={0} borderStyle="round" borderColor={disabled ? "gray" : color} paddingX={1}>
       {mode ? <Text color={mode === "NORMAL" ? "yellow" : "green"}>[{mode}] </Text> : null}
       <Text color={color}>{figures.pointer} </Text>
-      <Text dimColor={disabled}>{before}<Text inverse>{current}</Text>{after}</Text>
+      <Text color={color}><Ansi dimColor={disabled}>{layout.visibleText}</Ansi></Text>
     </Box>
   );
 }

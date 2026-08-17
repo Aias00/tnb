@@ -42,6 +42,23 @@ describe("Ink TUI view", () => {
     expect(frame).toContain("next instruction");
   });
 
+  test("renders wrapped CJK and emoji input without splitting graphemes", () => {
+    const input = "ab界cd👨‍👩‍👧‍👦efghij";
+    const frame = renderToString(
+      <TuiView
+        state={createTuiState("test-model", "default")}
+        input={input}
+        cursor={5}
+        columns={18}
+        rows={12}
+      />,
+      { columns: 18 },
+    );
+    expect(frame).toContain("界");
+    expect(frame).toContain("👨‍👩‍👧‍👦");
+    expect(frame).not.toContain("�");
+  });
+
   test("renders current MCP progress while a turn is active", () => {
     const state = reduceTuiState(createTuiState("test-model", "default"), {
       type: "submit",

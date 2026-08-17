@@ -6,7 +6,7 @@ describe('custom renderer PTY lifecycle', () => {
     const fixture = resolve(import.meta.dir, '../fixtures/custom-renderer-tui.tsx')
     const bunExecutable = join(process.env.HOME ?? '', '.bun', 'bin', 'bun')
     const transcript = `/tmp/tnb-custom-renderer-${process.pid}.typescript`
-    const command = `(sleep 0.2; printf '\\033[<64;10;10M'; sleep 0.05; printf '\\003'; sleep 0.2; printf '\\003') | script -q ${JSON.stringify(transcript)} ${JSON.stringify(bunExecutable)} ${JSON.stringify(fixture)}`
+    const command = `(sleep 0.2; printf '\\033[200~line one\\n界 emoji 👨‍👩‍👧‍👦\\nline three\\033[201~'; sleep 0.1; printf '\\033[A\\033[B'; sleep 0.05; printf '\\033[<64;10;10M'; sleep 0.05; printf '\\003'; sleep 0.2; printf '\\003') | script -q ${JSON.stringify(transcript)} ${JSON.stringify(bunExecutable)} ${JSON.stringify(fixture)}`
     const child = Bun.spawn(
       ['sh', '-c', command],
       {
@@ -32,6 +32,10 @@ describe('custom renderer PTY lifecycle', () => {
       expect(output).toContain('\u001b[?1049h')
       expect(output).toContain('\u001b[?1006h')
       expect(output).toContain('fixture-model')
+      expect(output).toContain('[Pasted text #1 +3 lines]')
+      expect(output).not.toContain('[200~')
+      expect(output).not.toContain('[201~')
+      expect(output).not.toContain('�')
       expect(output).toContain('Press Ctrl+C again to exit')
       expect(output).toContain('\u001b[?1006l')
       expect(output).toContain('\u001b[?1049l')

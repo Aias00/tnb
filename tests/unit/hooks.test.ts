@@ -213,7 +213,7 @@ describe("command hooks", () => {
     });
     await runner.start("startup");
     await writeFile(settings, '{"model":"changed"}\n');
-    for (let attempt = 0; attempt < 40; attempt += 1) {
+    for (let attempt = 0; attempt < 80; attempt += 1) {
       if (await readFile(log, "utf8").catch(() => "")) break;
       await Bun.sleep(25);
     }

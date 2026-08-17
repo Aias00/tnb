@@ -1,10 +1,28 @@
 import stripAnsi from "strip-ansi";
 
+import { stringWidth } from "./ink/stringWidth";
+import {
+  Cursor,
+  getLastKill,
+  pushToKillRing,
+  recordYank,
+  resetKillAccumulation,
+  resetYankState,
+  updateYankLength,
+  yankPop,
+} from "./input/cursor";
+import { normalizedGraphemeOffset } from "./input/intl";
+
 export type InputKey =
-  | { name: "text"; text: string }
-  | { name: "left" | "right" | "up" | "down" | "backspace" | "delete" }
-  | { name: "home" | "end" | "word-left" | "word-right" | "delete-to-end" }
-  | { name: "enter"; shift?: boolean };
+  | { name: "text"; text: string; columns?: number }
+  | {
+      name:
+        | "left" | "right" | "up" | "down" | "backspace" | "delete"
+        | "home" | "end" | "word-left" | "word-right" | "delete-to-end"
+        | "kill-line-start" | "kill-line-end" | "kill-word" | "yank" | "yank-pop";
+      columns?: number;
+    }
+  | { name: "enter"; shift?: boolean; columns?: number };
 
 export type InputBuffer = {
   value: string;
@@ -36,54 +54,68 @@ export function createInputBuffer(value = "", history: string[] = []): InputBuff
 
 export function applyInputKey(buffer: InputBuffer, key: InputKey): InputBuffer {
   const current = clearSubmission(buffer);
+  const cursor = createBufferCursor(current, key.columns);
   if (key.name === "text") {
     const text = normalizeTerminalInput(key.text);
     const paste = collapsePastedText(current, text);
-    return updateValue(
-      paste.buffer,
-      `${current.value.slice(0, current.cursor)}${paste.text}${current.value.slice(current.cursor)}`,
-      current.cursor + paste.text.length,
-    );
+    resetKillAccumulation();
+    resetYankState();
+    return updateFromCursor(paste.buffer, createBufferCursor(paste.buffer, key.columns).insert(paste.text));
   }
-  if (key.name === "left") return { ...current, cursor: Math.max(0, current.cursor - 1) };
-  if (key.name === "home") return { ...current, cursor: lineStart(current.value, current.cursor) };
-  if (key.name === "end") return { ...current, cursor: lineEnd(current.value, current.cursor) };
-  if (key.name === "word-left") return { ...current, cursor: previousWord(current.value, current.cursor) };
-  if (key.name === "word-right") return { ...current, cursor: nextWord(current.value, current.cursor) };
-  if (key.name === "right") {
-    return { ...current, cursor: Math.min(current.value.length, current.cursor + 1) };
-  }
-  if (key.name === "backspace") {
-    if (current.cursor === 0) return current;
-    return updateValue(
-      current,
-      `${current.value.slice(0, current.cursor - 1)}${current.value.slice(current.cursor)}`,
-      current.cursor - 1,
-    );
-  }
-  if (key.name === "delete") {
-    if (current.cursor === current.value.length) return current;
-    return updateValue(
-      current,
-      `${current.value.slice(0, current.cursor)}${current.value.slice(current.cursor + 1)}`,
-      current.cursor,
-    );
-  }
+  if (key.name === "left") return moveWithCursor(current, cursor.left());
+  if (key.name === "right") return moveWithCursor(current, cursor.right());
+  if (key.name === "home") return moveWithCursor(current, cursor.startOfLine());
+  if (key.name === "end") return moveWithCursor(current, cursor.endOfLine());
+  if (key.name === "word-left") return moveWithCursor(current, cursor.prevWord());
+  if (key.name === "word-right") return moveWithCursor(current, cursor.nextWord());
+  if (key.name === "backspace") return editWithCursor(current, cursor.backspace());
+  if (key.name === "delete") return editWithCursor(current, cursor.del());
   if (key.name === "delete-to-end") {
-    const end = lineEnd(current.value, current.cursor);
-    return updateValue(
-      current,
-      `${current.value.slice(0, current.cursor)}${current.value.slice(end)}`,
-      current.cursor,
-    );
+    return editWithCursor(current, cursor.deleteToLineEnd().cursor);
+  }
+  if (key.name === "kill-line-end") {
+    const result = cursor.deleteToLineEnd();
+    pushToKillRing(result.killed, "append");
+    return updateFromCursor(current, result.cursor);
+  }
+  if (key.name === "kill-line-start") {
+    const result = cursor.deleteToLineStart();
+    pushToKillRing(result.killed, "prepend");
+    return updateFromCursor(current, result.cursor);
+  }
+  if (key.name === "kill-word") {
+    const result = cursor.deleteWordBefore();
+    pushToKillRing(result.killed, "prepend");
+    return updateFromCursor(current, result.cursor);
+  }
+  if (key.name === "yank") {
+    const text = getLastKill();
+    if (!text) return current;
+    const next = cursor.insert(text);
+    recordYank(cursor.offset, text.length);
+    return updateFromCursor(current, next);
+  }
+  if (key.name === "yank-pop") {
+    const result = yankPop();
+    if (!result) return current;
+    const text = `${cursor.text.slice(0, result.start)}${result.text}${cursor.text.slice(result.start + result.length)}`;
+    updateYankLength(result.text.length);
+    return updateFromCursor(current, Cursor.fromText(text, cursor.measuredText.columns + 1, result.start + result.text.length));
   }
   if (key.name === "up" || key.name === "down") {
-    const cursor = moveVertical(current.value, current.cursor, key.name);
-    if (cursor !== current.cursor) return { ...current, cursor };
+    resetKillAccumulation();
+    resetYankState();
+    const visual = key.name === "up" ? cursor.up() : cursor.down();
+    if (!visual.equals(cursor)) return updateCursorPosition(current, visual);
+    if (current.historyDraft || (current.history?.length && !current.value.includes("\n"))) {
+      return navigateHistory(current, key.name);
+    }
+    const logical = key.name === "up" ? cursor.upLogicalLine() : cursor.downLogicalLine();
+    if (!logical.equals(cursor)) return updateCursorPosition(current, logical);
     return navigateHistory(current, key.name);
   }
   if (key.name === "enter") {
-    if (key.shift) return applyInputKey(current, { name: "text", text: "\n" });
+    if (key.shift) return applyInputKey(current, { name: "text", text: "\n", columns: key.columns });
     const submitted = expandPastedText(current.value, current.pastedContents).trim();
     return submitted ? { ...current, submitted } : current;
   }
@@ -104,44 +136,6 @@ export function searchInputHistory(
   return undefined;
 }
 
-function lineStart(value: string, cursor: number): number {
-  return value.lastIndexOf("\n", Math.max(0, cursor - 1)) + 1;
-}
-
-function lineEnd(value: string, cursor: number): number {
-  const end = value.indexOf("\n", cursor);
-  return end === -1 ? value.length : end;
-}
-
-function moveVertical(value: string, cursor: number, direction: "up" | "down"): number {
-  const start = lineStart(value, cursor);
-  const column = cursor - start;
-  if (direction === "up") {
-    if (start === 0) return cursor;
-    const previousEnd = start - 1;
-    const previousStart = lineStart(value, previousEnd);
-    return Math.min(previousStart + column, previousEnd);
-  }
-  const end = lineEnd(value, cursor);
-  if (end === value.length) return cursor;
-  const nextStart = end + 1;
-  return Math.min(nextStart + column, lineEnd(value, nextStart));
-}
-
-function previousWord(value: string, cursor: number): number {
-  let index = cursor;
-  while (index > 0 && /\s/.test(value[index - 1]!)) index -= 1;
-  while (index > 0 && !/\s/.test(value[index - 1]!)) index -= 1;
-  return index;
-}
-
-function nextWord(value: string, cursor: number): number {
-  let index = cursor;
-  while (index < value.length && !/\s/.test(value[index]!)) index += 1;
-  while (index < value.length && /\s/.test(value[index]!)) index += 1;
-  return index;
-}
-
 function clearSubmission(buffer: InputBuffer): InputBuffer {
   if (buffer.submitted === undefined) return buffer;
   const { submitted: _submitted, ...rest } = buffer;
@@ -158,6 +152,35 @@ function updateValue(buffer: InputBuffer, value: string, cursor: number): InputB
     ...(wasBrowsing ? { pastedContents: undefined, nextPasteId: undefined } : {}),
     ...(current.history?.length ? { historyIndex: current.history.length } : {}),
   };
+}
+
+function createBufferCursor(buffer: InputBuffer, columns?: number): Cursor {
+  const normalizedColumns = Number.isFinite(columns) && Number(columns) >= 2
+    ? Math.floor(Number(columns))
+    : Math.max(2, stringWidth(buffer.value) + 2);
+  const measured = Cursor.fromText(buffer.value, normalizedColumns, 0);
+  const offset = normalizedGraphemeOffset(buffer.value, buffer.cursor);
+  return new Cursor(measured.measuredText, offset);
+}
+
+function moveWithCursor(buffer: InputBuffer, cursor: Cursor): InputBuffer {
+  resetKillAccumulation();
+  resetYankState();
+  return updateCursorPosition(buffer, cursor);
+}
+
+function editWithCursor(buffer: InputBuffer, cursor: Cursor): InputBuffer {
+  resetKillAccumulation();
+  resetYankState();
+  return updateFromCursor(buffer, cursor);
+}
+
+function updateCursorPosition(buffer: InputBuffer, cursor: Cursor): InputBuffer {
+  return { ...buffer, value: cursor.text, cursor: cursor.offset };
+}
+
+function updateFromCursor(buffer: InputBuffer, cursor: Cursor): InputBuffer {
+  return updateValue(buffer, cursor.text, cursor.offset);
 }
 
 function navigateHistory(buffer: InputBuffer, direction: "up" | "down"): InputBuffer {

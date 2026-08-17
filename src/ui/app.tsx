@@ -12,6 +12,7 @@ import type { ToolExecutionEvent } from "../core/agent-loop";
 import type { PermissionMode, PermissionPromptDecision } from "../core/permissions";
 import type { ModelEvent } from "../providers/types";
 import { applyInputKey, createInputBuffer, searchInputHistory, type InputBuffer, type InputHistorySearch } from "./input-buffer";
+import { promptContentColumns } from "./input/prompt-layout";
 import { PermissionController } from "./permission-controller";
 import { QuestionController } from "./question-controller";
 import { McpActivityController } from "./mcp-activity-controller";
@@ -397,6 +398,8 @@ export function TuiApp(options: TuiAppOptions) {
   }, [management, permission, question, scheduledPrompts, state.busy, submit]);
 
   useInput((input, key) => {
+    const promptMode = vimMode ? (vimInsert ? "INSERT" : "NORMAL") : undefined;
+    const promptColumns = promptContentColumns(terminalSize.columns, promptMode);
     if (permission) {
       if (key.leftArrow || key.rightArrow || key.upArrow || key.downArrow) {
         const decisions: PermissionPromptDecision[] = permission.suggestedRule
@@ -706,6 +709,12 @@ export function TuiApp(options: TuiAppOptions) {
       setVerboseTranscript((value) => !value);
       return;
     }
+    if (bufferRef.current.value && key.ctrl && (input === "u" || input === "d")) {
+      const next = applyInkInput(bufferRef.current, input, key, { columns: promptColumns, scope: "main-prompt" });
+      bufferRef.current = next;
+      setBuffer(next);
+      return;
+    }
     const transcriptInput = mapTranscriptInput(
       input,
       key,
@@ -724,6 +733,7 @@ export function TuiApp(options: TuiAppOptions) {
         const next = applyInputKey(bufferRef.current, {
           name: "text",
           text: `${bufferRef.current.value ? " " : ""}[Image: ${path}]`,
+          columns: promptColumns,
         });
         bufferRef.current = next;
         setBuffer(next);
@@ -749,27 +759,27 @@ export function TuiApp(options: TuiAppOptions) {
       let next = current;
       if (input === "i") setVimInsert(true);
       else if (input === "I") {
-        next = applyInputKey(current, { name: "home" });
+        next = applyInputKey(current, { name: "home", columns: promptColumns });
         setVimInsert(true);
       }
       else if (input === "a") {
-        next = { ...current, cursor: Math.min(current.value.length, current.cursor + 1) };
+        next = applyInputKey(current, { name: "right", columns: promptColumns });
         setVimInsert(true);
       } else if (input === "A") {
-        next = applyInputKey(current, { name: "end" });
+        next = applyInputKey(current, { name: "end", columns: promptColumns });
         setVimInsert(true);
-      } else if (input === "h") next = applyInputKey(current, { name: "left" });
-      else if (input === "l") next = applyInputKey(current, { name: "right" });
-      else if (input === "b") next = applyInputKey(current, { name: "word-left" });
-      else if (input === "w") next = applyInputKey(current, { name: "word-right" });
-      else if (input === "x") next = applyInputKey(current, { name: "delete" });
-      else if (input === "X") next = applyInputKey(current, { name: "backspace" });
-      else if (input === "D") next = applyInputKey(current, { name: "delete-to-end" });
+      } else if (input === "h") next = applyInputKey(current, { name: "left", columns: promptColumns });
+      else if (input === "l") next = applyInputKey(current, { name: "right", columns: promptColumns });
+      else if (input === "b") next = applyInputKey(current, { name: "word-left", columns: promptColumns });
+      else if (input === "w") next = applyInputKey(current, { name: "word-right", columns: promptColumns });
+      else if (input === "x") next = applyInputKey(current, { name: "delete", columns: promptColumns });
+      else if (input === "X") next = applyInputKey(current, { name: "backspace", columns: promptColumns });
+      else if (input === "D") next = applyInputKey(current, { name: "kill-line-end", columns: promptColumns });
       else if (input === "C") {
-        next = applyInputKey(current, { name: "delete-to-end" });
+        next = applyInputKey(current, { name: "kill-line-end", columns: promptColumns });
         setVimInsert(true);
-      } else if (input === "0") next = applyInputKey(current, { name: "home" });
-      else if (input === "$") next = applyInputKey(current, { name: "end" });
+      } else if (input === "0") next = applyInputKey(current, { name: "home", columns: promptColumns });
+      else if (input === "$") next = applyInputKey(current, { name: "end", columns: promptColumns });
       bufferRef.current = next;
       setBuffer(next);
       return;
@@ -834,7 +844,7 @@ export function TuiApp(options: TuiAppOptions) {
     completionController.current?.abort();
     setInputCompletions(undefined);
     setCompletionNotice(undefined);
-    const next = applyInkInput(bufferRef.current, input, key);
+    const next = applyInkInput(bufferRef.current, input, key, { columns: promptColumns, scope: "main-prompt" });
     bufferRef.current = next;
     setBuffer(next);
     if (next.submitted) submit(next.submitted);
@@ -898,20 +908,31 @@ export function applyInkInput(
   buffer: InputBuffer,
   input: string,
   key: Parameters<Parameters<typeof useInput>[0]>[1],
+  options: { columns?: number; scope?: "main-prompt" | "modal" | "pty" } = {},
 ): InputBuffer {
-  if (key.return) return applyInputKey(buffer, { name: "enter", shift: key.shift });
-  if (key.leftArrow) return applyInputKey(buffer, { name: "left" });
-  if (key.rightArrow) return applyInputKey(buffer, { name: "right" });
-  if (key.home) return applyInputKey(buffer, { name: "home" });
-  if (key.end) return applyInputKey(buffer, { name: "end" });
-  if (key.upArrow) return applyInputKey(buffer, { name: "up" });
-  if (key.downArrow) return applyInputKey(buffer, { name: "down" });
+  const columns = options.columns;
+  if (options.scope === "main-prompt") {
+    if (key.ctrl && input === "a") return applyInputKey(buffer, { name: "home", columns });
+    if (key.ctrl && input === "e") return applyInputKey(buffer, { name: "end", columns });
+    if (key.ctrl && input === "k") return applyInputKey(buffer, { name: "kill-line-end", columns });
+    if (key.ctrl && input === "u") return applyInputKey(buffer, { name: "kill-line-start", columns });
+    if (key.ctrl && input === "w") return applyInputKey(buffer, { name: "kill-word", columns });
+    if (key.ctrl && input === "y") return applyInputKey(buffer, { name: "yank", columns });
+    if (key.meta && input === "y") return applyInputKey(buffer, { name: "yank-pop", columns });
+  }
+  if (key.return) return applyInputKey(buffer, { name: "enter", shift: key.shift, columns });
+  if (key.leftArrow) return applyInputKey(buffer, { name: "left", columns });
+  if (key.rightArrow) return applyInputKey(buffer, { name: "right", columns });
+  if (key.home) return applyInputKey(buffer, { name: "home", columns });
+  if (key.end) return applyInputKey(buffer, { name: "end", columns });
+  if (key.upArrow) return applyInputKey(buffer, { name: "up", columns });
+  if (key.downArrow) return applyInputKey(buffer, { name: "down", columns });
   // Ink 6 reports the DEL byte (0x7f), emitted by Backspace in common macOS
   // terminals, as `delete`. Treat both flags as backward deletion so the
   // physical Backspace key works consistently; Ctrl+D remains forward delete.
-  if (key.backspace || key.delete) return applyInputKey(buffer, { name: "backspace" });
-  if (key.ctrl && input === "d") return applyInputKey(buffer, { name: "delete" });
-  if (input && !key.ctrl && !key.meta) return applyInputKey(buffer, { name: "text", text: input });
+  if (key.backspace || key.delete) return applyInputKey(buffer, { name: "backspace", columns });
+  if (key.ctrl && input === "d") return applyInputKey(buffer, { name: "delete", columns });
+  if (input && !key.ctrl && !key.meta) return applyInputKey(buffer, { name: "text", text: input, columns });
   return buffer;
 }
 
