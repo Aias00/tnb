@@ -55,12 +55,20 @@
 
 ## Task 5: Port Bash and canonical TaskOutput shell resolution
 
-**Create:** `src/tools/claude/bash/`, `src/tools/claude/tasks/task-output-resolver.ts`, focused Bash/PTY tests.
+**Create:** `src/tools/claude/bash/`, `src/services/tasks/output-resolver.ts`, focused Bash/PTY tests.
 
 - [ ] Write failing tests for pinned Bash schema/result/progress, foreground/background, timeout, abort, sandbox, output truncation, and process cleanup.
 - [ ] Write failing TaskOutput tests for `block`/`timeout`, active shell/Agent tasks, completion, stop, expiry, and restart unknown-task result.
 - [ ] Port pinned Bash behavior while injecting ShellSessionManager, command permission AST, sandbox, Hooks, and cleanup registry.
-- [ ] Register background shell IDs in a process-local resolver with bounded tombstones; do not persist process identity.
+- [ ] Implement `TaskOutputResolver` in `src/services/tasks/output-resolver.ts`.
+  Its API must cover `registerShell(id)`, `read(id,{block,timeout,signal})`,
+  `stop(id)`, `expire(id)`, and tombstone lookup. It delegates durable Agent/work
+  items to TaskManager and live shell/PTY IDs to ShellSessionManager; shell
+  identities remain process-local with bounded terminal tombstones.
+- [ ] In `src/entrypoints/cli.ts`, construct one resolver per interactive/print
+  runtime and inject the same instance into canonical Bash, TaskOutput, and
+  TaskStop factories. Rewrite/remove the migrated portions of `src/tools/tasks.ts`
+  and `src/tools/shell.ts` so there is no second output/stop dispatch path.
 - [ ] Keep PTY write/resize/kill available only through TUI/SDK internal controls.
 - [ ] Run shell, sandbox, cleanup, TaskOutput, and PTY tests plus typecheck.
 
@@ -86,11 +94,18 @@
 
 ## Task 8: Atomic registry, prompt, permission, and TUI cutover
 
-**Modify:** `src/entrypoints/cli.ts`, tool registry/search, prompts, built-in Skills/Agents, permissions, Hooks, TUI cards, docs, legacy tests.
+**Modify:** `src/entrypoints/cli.ts`, `src/tools/agent.ts`,
+`src/services/skills/tool.ts`, `src/constants/prompts.ts`,
+`src/services/hooks/runner.ts`, tool registry/search, built-in Skills/Agents,
+permissions, TUI cards, docs, and legacy tests.
 
 - [ ] Add failing registry test asserting migrated lowercase names are absent and canonical names are present in one turn—never mixed.
 - [ ] Replace old factories with `src/tools/claude` factories; remove migrated implementations from legacy aggregators when no internal consumer remains.
 - [ ] Update system/tool prompts, ToolSearch deferred entries, allowed-tool resources, Hook payload expectations, exact-case permissions, TUI renderers, and docs.
+- [ ] Remove lowercase normalization for migrated names in `selectCliTools`,
+  `filterCliTools`, hook model tool filtering, `selectAgentTools`, and
+  `selectSkillTools`. Hook condition matching also becomes exact-case for tool
+  names; event names and non-tool matchers retain their existing semantics.
 - [ ] Add historical JSONL tests: lowercase tool blocks still render/export/compact/rewind unchanged but cannot dispatch.
 - [ ] Verify ToolSearch observable: deferred tools absent before activation, appear next turn after search, and `remainingDeferred` decreases exactly.
 - [ ] Run Provider adapter fixtures for Anthropic, OpenAI Chat, and Responses plus all registry/permission/TUI/session tests.
@@ -109,7 +124,10 @@ git diff --check
 ```
 
 - [ ] Smoke `tnb -p --tools`/`tnb tools` and assert only canonical migrated names.
-- [ ] Create one runtime commit: `git add src tests scripts docs && git commit -m "feat: adopt Claude core tool protocol"`.
+- [ ] Inspect `git status --short` and the complete migration diff. Stage only
+  reviewed migration paths explicitly; never blanket-add `src`, `tests`,
+  `scripts`, or `docs`. Run `git diff --cached --name-only` and
+  `git diff --cached --check`, confirm no unrelated user file is staged, then
+  commit with `git commit -m "feat: adopt Claude core tool protocol"`.
 - [ ] Re-run full verification on committed HEAD; require clean worktree and no child processes.
 - [ ] Push `feat/claude-tool-protocol`; do not merge before finishing-branch review.
-
