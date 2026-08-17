@@ -78,6 +78,27 @@ export type PromptInputSubmit = {
 interprets ordinary prompt characters, cursor movement, Vim commands, history
 movement, paste markers, completion selection, undo, or stash commands.
 
+Replace the string-only turn boundary with:
+
+```ts
+export type TuiTurn = {
+  input: PromptInputSubmit;
+  sessionId: string;
+  resume: boolean;
+  // existing signal and event callbacks remain unchanged
+};
+```
+
+For slash/custom commands, `app.tsx` parses `input.expanded`. For an Agent turn,
+the interactive CLI adapter converts `input.expanded` plus every referenced
+image record into `Array<TextBlock | MediaBlock>` using the existing
+workspace-confined attachment loader. `display` is the transcript/history form;
+`expanded` is the text sent to command expansion, MCP prompt expansion, and the
+Agent. Image references remain textual markers in `expanded` and add image
+`MediaBlock`s beside the text. The nested CLI receives both `-p input.expanded`
+and `promptContent`; Provider adapters continue to consume only canonical
+message content.
+
 ### Editor state
 
 ```ts
@@ -97,6 +118,7 @@ export type PastedContent =
       type: "image";
       path: string;
       mediaType: "image/png" | "image/jpeg" | "image/gif" | "image/webp";
+      missing?: boolean;
     };
 ```
 
@@ -120,6 +142,11 @@ Both forms are atomic tokens:
 - History, undo, redo, and stash retain the referenced content.
 - Submission expands pasted text and converts images into the existing
   multimodal request format.
+
+For pasted-text references, `X` is exactly the number of newline sequences in
+the stored text, matching the reference behavior: `line1\nline2\nline3` renders
+`+2 lines`; a single-line paste omits the suffix. Formatter, parser, migration,
+and tests use this definition.
 
 The current `[Image: /absolute/path]` display form is migrated when loading
 existing input state. It remains accepted as ordinary legacy text when no
@@ -163,14 +190,17 @@ Vim actions operate through Cursor and cannot split atomic references.
 
 ### Undo and stash
 
-Undo snapshots contain `value`, `cursorOffset`, `pastedContents`, and mode.
+Undo snapshots contain the complete `PromptEditorState`: `value`,
+`cursorOffset`, prompt `mode`, Vim mode, `pastedContents`, and `nextPasteId`.
 Rapid insertions use the reference debounce/buffer policy; structural actions
 such as paste, token deletion, Vim operators, external editor, and history
 acceptance create explicit boundaries.
 
-Prompt stash is a bounded LIFO stack. Stashing clears the active editor without
-submitting. Pop restores text, cursor, mode, and pasted contents. Stash state is
-session-local and is not written into the conversation JSONL until submission.
+Prompt stash follows the reference single-slot behavior. Invoking stash with a
+non-empty prompt overwrites the slot with the complete `PromptEditorState` and
+clears the editor. Invoking it with an empty prompt restores and clears the
+slot. It is not a stack. Stash state is session-local and is not written into
+the conversation JSONL until submission.
 
 ### History and resume
 
@@ -184,13 +214,59 @@ export type PromptHistoryEntry = {
 };
 ```
 
+Persist prompt reconstruction metadata on the submitted user message:
+
+```ts
+export type StoredPastedContent =
+  | { id: number; type: "text"; content?: string; contentHash?: string }
+  | { id: number; type: "image"; path: string; mediaType: PastedImageMediaType };
+
+export type PersistedPromptInput = {
+  version: 1;
+  display: string;
+  mode: PromptInputMode;
+  pastedContents: StoredPastedContent[];
+};
+
+export type UserConversationMessage = {
+  role: "user";
+  content: Array<TextBlock | ToolResultBlock | MediaBlock>;
+  promptInput?: PersistedPromptInput;
+};
+```
+
+`AgentLoopOptions` accepts optional `promptInput`; the initial user message
+stores it, while Provider serialization continues to read only `role` and
+`content`. When prompt metadata is present, the Agent loop creates a distinct
+user message rather than merging it into an existing trailing user message.
+Compact and rewind boundaries already store complete messages, so the metadata
+survives those transitions and session forks.
+
+Text content up to 1024 characters is stored inline. Larger text is written by
+a hash-addressed paste store under
+`<projectSessionDirectory>/prompt-pastes/<sha256>` using atomic writes and the
+existing file lock utility; JSONL stores only `contentHash`. Image metadata
+stores path and media type, never base64 bytes.
+
+`SessionStore.load()` resolves prompt metadata and returns
+`SessionState.promptHistory: PromptHistoryEntry[]`. It validates IDs, reference
+grammar, mutually exclusive `content`/`contentHash`, hashes, media types, and
+paths. Missing/corrupt text-store entries leave the reference visible with no
+expandable content. Missing image files become image records with
+`missing: true`; they are displayed but excluded from attachment loading.
+
+`initialInputHistory`, `restoreInputHistory`, and interactive resume results
+change from `string[]` to `PromptHistoryEntry[]`. Legacy messages without
+`promptInput` are converted from their text blocks with empty pasted contents,
+so existing sessions remain resumable. Summary/session-picker helpers continue
+to derive plain strings from `entry.display`.
+
 Up/Down first moves within visual/logical rows. At the top or bottom boundary it
 navigates history and preserves the current draft. Rapid repeated arrows use a
 synchronous ref and chunked loading to avoid stale React closures.
 
-Resumed sessions reconstruct history from user prompt records. New session
-records must persist enough attachment metadata to restore image pills without
-embedding image bytes in JSONL. Missing image files render a non-executable
+Resumed sessions use `SessionState.promptHistory`; they do not reconstruct image
+pills from base64 message blocks. Missing image files render a non-executable
 missing-reference pill and remain visible to the user.
 
 ### External editor
@@ -207,7 +283,12 @@ After the editor closes:
 2. preserve unchanged image markers and their content records;
 3. collapse newly introduced large text using the ordinary paste threshold;
 4. remove orphaned content records;
-5. restore a grapheme-valid cursor at the returned offset or end of text.
+5. restore a grapheme-valid cursor at end of text.
+
+The external editor protocol remains `{ content?, error? }`; it does not claim
+to recover editor cursor position because common `$EDITOR` integrations do not
+provide one. On any error, restore the exact pre-editor snapshot including
+cursor, modes, pasted contents, and undo boundary.
 
 ### Autocomplete
 
@@ -292,4 +373,3 @@ complete when:
 - the complete suite and PTY tests pass on macOS;
 - the binary builds and exits without leftover processes;
 - the merge result is verified on `main`.
-
