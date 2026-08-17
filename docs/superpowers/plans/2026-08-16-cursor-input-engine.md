@@ -107,12 +107,11 @@ Run: `bun test tests/unit/cursor.test.ts`
 
 Expected: FAIL with module-not-found for `src/ui/input/cursor`.
 
-- [ ] **Step 5: Commit the red test**
+- [ ] **Step 5: Keep the red test as an uncommitted local checkpoint**
 
-```bash
-git add tests/unit/cursor.test.ts
-git commit -m "test: characterize Cursor input behavior"
-```
+Run: `git diff --check`
+
+Expected: no whitespace errors. Do not commit while the branch is red.
 
 ## Task 2: Port the complete Cursor and Unicode engine
 
@@ -163,12 +162,12 @@ Run: `bun x tsc --noEmit`
 
 Expected: PASS without changing Cursor algorithms.
 
-- [ ] **Step 5: Commit the mechanical port**
+- [ ] **Step 5: Record a green local checkpoint without committing**
 
-```bash
-git add src/ui/input/intl.ts src/ui/input/cursor.ts tests/unit/cursor.test.ts
-git commit -m "feat: port Cursor Unicode editing engine"
-```
+Run: `git diff --check`
+
+Expected: no whitespace errors. Keep all migration work uncommitted until the
+full verification task.
 
 ## Task 3: Introduce the canonical PromptLayout
 
@@ -260,12 +259,11 @@ Run: `bun test tests/unit/prompt-layout.test.ts tests/unit/cursor.test.ts`
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Record a green local checkpoint without committing**
 
-```bash
-git add src/ui/input/prompt-layout.ts tests/unit/prompt-layout.test.ts
-git commit -m "feat: add canonical prompt layout"
-```
+Run: `git diff --check`
+
+Expected: no whitespace errors.
 
 ## Task 4: Replace InputBuffer editing with Cursor operations
 
@@ -292,6 +290,11 @@ test("moves by visual rows before history", () => {
   expect(buffer).toMatchObject({ value: "abcdefghij", cursor: 2 });
 });
 ```
+
+Add adapter-boundary cases that start the cursor inside `e\u0301` and the
+family ZWJ emoji and assert the first operation snaps to the containing
+grapheme start. Add `columns: undefined`, `columns: 0`, and negative columns
+cases and assert Up/Down use logical lines without visual wrapping.
 
 - [ ] **Step 2: Add failing kill/yank adapter tests**
 
@@ -320,8 +323,24 @@ export type InputKey =
   | { name: "enter"; shift?: boolean; columns?: number };
 ```
 
-Use `Cursor.fromText(buffer.value, normalizeColumns(key.columns), buffer.cursor)`
-for editing. For Up/Down, call visual movement first, then logical movement,
+Create the adapter through one exact helper:
+
+```ts
+import { stringWidth } from "./ink/stringWidth";
+import { Cursor } from "./input/cursor";
+
+function createBufferCursor(buffer: InputBuffer, columns?: number): Cursor {
+  const normalizedColumns = Number.isFinite(columns) && Number(columns) >= 2
+    ? Math.floor(Number(columns))
+    : Math.max(2, stringWidth(buffer.value) + 2);
+  const measured = Cursor.fromText(buffer.value, normalizedColumns, 0);
+  const offset = measured.measuredText.snapToGraphemeBoundary(buffer.cursor);
+  return new Cursor(measured.measuredText, offset);
+}
+```
+
+The width fallback intentionally makes every logical line wide enough to avoid
+visual wrapping. For Up/Down, call visual movement first, then logical movement,
 then `navigateHistory` only when both return an equal Cursor. Translate every
 Cursor result through one helper that updates normalized text and offset while
 preserving history and paste metadata.
@@ -335,12 +354,11 @@ Run: `bun test tests/unit/tui-input.test.ts tests/unit/cursor.test.ts tests/unit
 
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 6: Record a green local checkpoint without committing**
 
-```bash
-git add src/ui/input-buffer.ts tests/unit/tui-input.test.ts
-git commit -m "refactor: drive prompt editing through Cursor"
-```
+Run: `git diff --check`
+
+Expected: no whitespace errors.
 
 ## Task 5: Route main-prompt keybindings and isolate modal/PTY inputs
 
@@ -356,6 +374,7 @@ git commit -m "refactor: drive prompt editing through Cursor"
 Extend `applyInkInput` tests to assert:
 
 - main prompt `Ctrl+K/U/W/Y` and `Meta+Y` map to kill/yank InputKeys;
+- main prompt `Ctrl+A/E` map to the same visual-line operations as Home/End;
 - modal scope ignores kill/yank bindings;
 - PTY scope does not consume Ctrl key sequences;
 - Home/End receive current prompt columns;
@@ -377,14 +396,35 @@ type ApplyInkInputOptions = {
 ```
 
 Default to `modal` to preserve existing call sites. Only `main-prompt` maps
-kill/yank bindings. The final prompt call supplies:
+kill/yank bindings. Add explicit routes for `key.ctrl && input === "a"` to
+`home` and `key.ctrl && input === "e"` to `end`. The final prompt call supplies:
 
 ```ts
 applyInkInput(bufferRef.current, input, key, {
-  columns: promptContentColumns(terminalSize.columns, vimMode ? vimModeLabel : undefined),
+  columns: promptContentColumns(
+    terminalSize.columns,
+    vimMode ? (vimInsert ? "INSERT" : "NORMAL") : undefined,
+  ),
   scope: "main-prompt",
 });
 ```
+
+Define `promptContentColumns` in `src/ui/input/prompt-layout.ts` and use it from
+both `app.tsx` and `tui.tsx`:
+
+```ts
+import { stringWidth } from "../ink/stringWidth";
+
+export function promptContentColumns(terminalColumns: number, mode?: string): number {
+  const borderAndPaddingColumns = 4;
+  const pointerColumns = 2;
+  const modeColumns = mode ? stringWidth(`[${mode}] `) : 0;
+  return Math.max(2, terminalColumns - borderAndPaddingColumns - pointerColumns - modeColumns);
+}
+```
+
+`Cursor.fromText` reserves its own final cursor cell from this content width;
+callers must not subtract another cell.
 
 Question/session rename inputs use `modal`; shell input uses `pty`.
 
@@ -406,12 +446,11 @@ Run: `bun test tests/unit/tui-input.test.ts tests/unit/keybindings.test.ts tests
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Record a green local checkpoint without committing**
 
-```bash
-git add src/ui/app.tsx tests/unit/tui-input.test.ts tests/unit/keybindings.test.ts
-git commit -m "feat: wire Cursor prompt keybindings"
-```
+Run: `git diff --check`
+
+Expected: no whitespace errors.
 
 ## Task 6: Use PromptLayout for rendering and height
 
@@ -443,9 +482,11 @@ units.
 
 - [ ] **Step 3: Build PromptLayout once in `TuiView`**
 
-Calculate the exact prefix width from border/padding, pointer, space, and the
-optional Vim mode label. Pass the resulting `PromptLayout` to both
-`PromptInputView` and `measureTranscriptHeight`.
+Derive the mode string exactly as
+`vimMode ? (vimInsert ? "INSERT" : "NORMAL") : undefined`. Use the shared
+`promptContentColumns` helper for border/padding, pointer, and mode-label width.
+Pass the resulting `PromptLayout` to both `PromptInputView` and
+`measureTranscriptHeight`; neither consumer may repeat the formula.
 
 - [ ] **Step 4: Render Cursor output through the copied ANSI component**
 
@@ -477,12 +518,11 @@ Run: `bun test tests/unit/tui-view.test.tsx tests/unit/transcript-viewport.test.
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 7: Record a green local checkpoint without committing**
 
-```bash
-git add src/ui/tui.tsx src/ui/transcript/layout.ts tests/unit/tui-view.test.tsx tests/unit/transcript-viewport.test.tsx
-git commit -m "feat: render prompts from Cursor layout"
-```
+Run: `git diff --check`
+
+Expected: no whitespace errors.
 
 ## Task 7: Full verification and PTY regression
 
@@ -535,11 +575,16 @@ git diff --check
 Expected: all tests pass, build completes, version prints `0.1.0`, and diff
 check is empty.
 
-- [ ] **Step 5: Commit verification changes**
+- [ ] **Step 5: Create the single verified migration commit**
 
 ```bash
-git add tests/e2e/tui-custom-renderer-pty.test.ts tests/fixtures/custom-renderer-tui.tsx
-git commit -m "test: verify Cursor input in a real terminal"
+git add src/ui/input src/ui/input-buffer.ts src/ui/app.tsx src/ui/tui.tsx \
+  src/ui/transcript/layout.ts tests/unit/cursor.test.ts \
+  tests/unit/prompt-layout.test.ts tests/unit/tui-input.test.ts \
+  tests/unit/keybindings.test.ts tests/unit/tui-view.test.tsx \
+  tests/unit/transcript-viewport.test.tsx \
+  tests/e2e/tui-custom-renderer-pty.test.ts tests/fixtures/custom-renderer-tui.tsx
+git commit -m "feat: migrate prompt editing to Cursor engine"
 ```
 
 - [ ] **Step 6: Inspect history and working tree**
@@ -549,6 +594,12 @@ git status --short
 git log --oneline --decorate -10
 ```
 
-Expected: clean worktree with small, ordered Cursor migration commits on
-`feat/cursor-input-engine`.
+Expected: clean worktree with exactly one implementation commit after the
+design and plan commits on `feat/cursor-input-engine`.
 
+- [ ] **Step 7: Push the verified feature branch**
+
+Run: `git push -u origin feat/cursor-input-engine`
+
+Expected: remote branch points at the single verified migration commit. Do not
+merge to `main` until the implementation review confirms the rollout criteria.
