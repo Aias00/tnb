@@ -10,6 +10,8 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-16-complete-prompt-input-migration-design.md`
 
+**Pinned authorized source root:** `/Users/aias/Work/github/codercli/claude-code/package/src-extracted/src`. All history, hook, component, and Vim ports in this plan must read from this root; do not mix the parallel source snapshots.
+
 ---
 
 ## File map
@@ -28,6 +30,7 @@
 - `src/ui/prompt-input/PromptInput.tsx`
 - `src/ui/prompt-input/vim/{motions,operators,text-objects,transitions,types}.ts`
 - `src/services/session/prompt-paste-store.ts`
+- `src/core/prompt-input.ts` — message/session-facing persisted prompt metadata types.
 - focused `tests/unit/prompt-*.test.ts` files matching each unit.
 
 **Modify:**
@@ -48,8 +51,8 @@ implementation commit.
 - [ ] Write failing tests for:
 
 ```ts
-expect(formatPastedTextRef(1, "line1\nline2\nline3")).toBe("[Pasted text #1 +2 lines]");
-expect(formatPastedTextRef(2, "single")).toBe("[Pasted text #2]");
+expect(formatPastedTextRef(1, getPastedTextRefNumLines("line1\nline2\nline3"))).toBe("[Pasted text #1 +2 lines]");
+expect(formatPastedTextRef(2, getPastedTextRefNumLines("single"))).toBe("[Pasted text #2]");
 expect(formatImageRef(3)).toBe("[Image #3]");
 ```
 
@@ -57,9 +60,9 @@ Also test typed token ranges, malformed/duplicate IDs, reverse-order expansion,
 and placeholder-like strings inside pasted content.
 
 - [ ] Run `bun test tests/unit/prompt-references.test.ts`; expect module-not-found.
-- [ ] Define exact spec types: `PromptEditorState`, `PastedContent`,
-  `StoredPastedContent`, `PersistedPromptInput`, `PromptHistoryEntry`,
-  `PromptInputSubmit`, and `PromptInputHandle`.
+- [ ] Define UI-local types only: `PromptEditorState`, live `PastedContent`,
+  `PromptHistoryEntry`, `PromptInputSubmit`, and `PromptInputHandle`. Do not put
+  persisted message types under `src/ui`.
 - [ ] Port `getPastedTextRefNumLines`, formatters, and parser from authorized
   `history.ts`. Expand only matching typed records; return referenced images
   separately.
@@ -67,8 +70,8 @@ and placeholder-like strings inside pasted content.
 
 ## Task 2: Paste store and user-message metadata
 
-**Files:** create `prompt-paste-store.ts` and its test; modify `message.ts`,
-`agent-loop.ts`, and query-loop tests.
+**Files:** create `prompt-paste-store.ts`, `src/core/prompt-input.ts`, and tests;
+modify `message.ts`, `agent-loop.ts`, and query-loop tests.
 
 - [ ] Write failing tests for inline content at 1024 characters, external store
   above 1024, SHA-256 dedupe, concurrent writes, hash validation, missing/corrupt
@@ -79,6 +82,9 @@ and placeholder-like strings inside pasted content.
 - [ ] Run focused tests; expect missing API failures.
 - [ ] Implement atomic `0o600` hash storage with `withFileLock`, unique temp file,
   rename, and `/^[a-f0-9]{64}$/` validation.
+- [ ] Define `StoredPastedContent` and `PersistedPromptInput` in
+  `src/core/prompt-input.ts`. The UI imports these core contracts when creating
+  persistence metadata; core/session code never imports from `src/ui`.
 - [ ] Extend the user-message type and `AgentLoopOptions.promptInput`; attach it
   only to the initial prompt message. Keep Provider adapters unchanged and lock
   this with tests.
@@ -86,22 +92,24 @@ and placeholder-like strings inside pasted content.
 
 ## Task 3: Structured session history and resume
 
-**Files:** modify session storage, CLI, app types, and session/CLI tests.
+**Files:** modify session storage and session tests. Do not change app/TUI input
+types in this task.
 
 - [ ] Add failing tests for inline/hash text, image metadata, missing image,
   malformed metadata rejection, missing paste hash, and legacy message migration.
-- [ ] Add failing `--resume`, `/resume`, `/continue`, and fork tests asserting
-  exact `PromptHistoryEntry[]`; picker summaries remain plain display strings.
+- [ ] Add failing `SessionStore.load()` tests asserting exact structured prompt
+  history; picker summaries remain plain display strings.
 - [ ] Extend `isConversationMessage` validation: positive unique IDs, canonical
   reference grammar, supported media types, mutually exclusive content/hash,
   valid hashes, and safe non-empty paths.
 - [ ] Resolve prompt metadata during `SessionStore.load()` into
   `SessionState.promptHistory`. Read hashes via the paste store; stat image paths
   without reading bytes; mark missing records.
-- [ ] Convert `initialInputHistory`, resume results, `restoreInputHistory`, and
-  switching from `string[]` to structured entries. Legacy messages use joined
-  text and empty content records.
-- [ ] Run session/CLI tests and typecheck; expect PASS. Do not commit.
+- [ ] Keep current `sessionInputHistory(): string[]`, `initialInputHistory`, and
+  app APIs unchanged as a temporary compatibility path. Add a new structured
+  `sessionPromptHistory()`/`SessionState.promptHistory`; the legacy helper maps
+  `entry.display`. This keeps Tasks 3–7 compilable before the component cutover.
+- [ ] Run session tests and typecheck; expect PASS. Do not commit.
 
 ## Task 4: Complete Vim engine port
 
@@ -182,17 +190,30 @@ and placeholder-like strings inside pasted content.
   `review [Image #1] [Pasted text #2 +2 lines]`. Assert structured TuiTurn,
   workspace validation, expanded text plus one image block, persisted metadata,
   Provider metadata exclusion, and missing-image non-loading.
+- [ ] Add failing `--resume`, `/resume`, `/continue`, session-switch, and fork
+  tests asserting the new component receives exact `PromptHistoryEntry[]` while
+  picker summaries remain plain strings.
 - [ ] Add failing priority tests: modal > completion > history search >
   PromptInput > transcript > global exit, including Ctrl+C/U/D, Escape, PTY,
   and busy Agent state.
 - [ ] Remove main `buffer`, direct character/Vim dispatch, prompt history
   mutation, completion mutation, and image-path string insertion from `app.tsx`.
   Keep modal/PTY InputBuffers and a `PromptInputHandle` ref.
+- [ ] At this cutover, change `initialInputHistory`, `restoreInputHistory`, and
+  interactive resume result types from `string[]` to `PromptHistoryEntry[]`.
+  Remove the temporary string adapter from main-prompt call sites; retain the
+  plain-display helper only for summaries and legacy external APIs.
 - [ ] Mount PromptInput in existing layout while preserving transcript height,
   status, theme, fullscreen, and selection.
 - [ ] In interactive `runTurn`, use `input.expanded` for commands; collect only
   referenced non-missing images, validate/load them through the shared attachment
   loader, and pass canonical `promptContent` plus `promptInput` metadata.
+- [ ] Refactor `src/services/attachments/load.ts` to expose
+  `loadPromptImageBlocks({ cwd, paths, capabilities, signal }): Promise<MediaBlock[]>`.
+  It must reuse the existing workspace/path/file/media validation but return only
+  image `MediaBlock`s—no `[Attached image: ...]` synthetic `TextBlock`. Keep
+  `loadPromptAttachments()` behavior unchanged for CLI `--attachment` and build
+  it from shared internal validators rather than duplicating security checks.
 - [ ] Run TUI/CLI/query-loop tests and typecheck; expect PASS. Do not commit.
 
 ## Task 9: PTY and full verification
@@ -228,4 +249,3 @@ git commit -m "feat: migrate complete PromptInput editor"
   clean worktree.
 - [ ] Push with `git push -u origin feat/complete-prompt-input`; local and remote
   commits must match. Do not merge before finishing-branch review.
-
