@@ -281,7 +281,9 @@ and JSON Schema from the pinned source. Add behavior tests for:
 - Write/Edit stale snapshots, unique/all replacements, atomicity and symlinks;
 - Grep/Glob filters, ignore rules, limits, ordering and no matches;
 - Bash foreground/background/PTY/progress/input/resize/kill/timeout/abort;
-- Agent foreground/background/profile/model/resume/abort;
+- Agent foreground/background/profile/model/abort, plus background Agent
+  recovery through internal TaskManager/TaskOutput state—not a Provider-facing
+  Agent `resume` field;
 - every Task operation, dependency, output, stop, persistence and recovery;
 - ToolSearch observable activation: before activation each migrated deferred
   tool is absent from the Provider tool list; after `tool_search`, matched tools
