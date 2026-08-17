@@ -101,8 +101,8 @@ semantics.
 
 Connect the main prompt input event layer to the Cursor kill-ring operations:
 
-- `Ctrl+K`: kill to logical line end;
-- `Ctrl+U`: kill to logical line start;
+- `Ctrl+K`: kill to the visual wrapped-line end;
+- `Ctrl+U`: kill to the visual wrapped-line start;
 - `Ctrl+W`: kill the preceding word;
 - `Ctrl+Y`: yank the latest killed text;
 - `Meta+Y`: rotate the kill ring after a yank.
