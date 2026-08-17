@@ -53,6 +53,7 @@ export type TuiViewProps = {
   shellPanel?: boolean;
   shellSelection?: number;
   shellInput?: string;
+  onPromptClick?(row: number, column: number): void;
 };
 
 export const TuiView = memo(function TuiView({
@@ -88,6 +89,7 @@ export const TuiView = memo(function TuiView({
   shellPanel = false,
   shellSelection = 0,
   shellInput,
+  onPromptClick,
 }: TuiViewProps) {
   const [newerRows, setNewerRows] = useState(0);
   const updateViewportStatus = useCallback((viewport: { scrollTop: number; contentHeight: number; viewportHeight: number }) => {
@@ -155,6 +157,7 @@ export const TuiView = memo(function TuiView({
             disabled={state.busy}
             color={primaryColor}
             {...(promptMode ? { mode: promptMode } : {})}
+            {...(onPromptClick ? { onClick: onPromptClick } : {})}
           /> : null}
         </>
       )}
@@ -489,9 +492,12 @@ function QuestionDialog({
   );
 }
 
-function PromptInputView({ layout, disabled, mode, color }: { layout: PromptLayout; disabled: boolean; mode?: string; color: "magenta" | "cyan" | "blue" | "green" }) {
+function PromptInputView({ layout, disabled, mode, color, onClick }: { layout: PromptLayout; disabled: boolean; mode?: string; color: "magenta" | "cyan" | "blue" | "green"; onClick?(row: number, column: number): void }) {
   return (
-    <Box flexShrink={0} borderStyle="round" borderColor={disabled ? "gray" : color} paddingX={1}>
+    <Box flexShrink={0} borderStyle="round" borderColor={disabled ? "gray" : color} paddingX={1} {...(onClick ? { onClick: (event) => {
+      const modeColumns = mode ? `[${mode}] `.length : 0;
+      onClick(Math.max(0, event.localRow - 1), Math.max(0, event.localCol - 4 - modeColumns));
+    } } : {})}>
       {mode ? <Text color={mode === "NORMAL" ? "yellow" : "green"}>[{mode}] </Text> : null}
       <Text color={color}>{figures.pointer} </Text>
       <Text color={color}><Ansi dimColor={disabled}>{layout.visibleText}</Ansi></Text>

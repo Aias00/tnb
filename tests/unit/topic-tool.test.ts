@@ -27,6 +27,7 @@ describe("update topic tool", () => {
 
     expect(await session.readState()).toEqual({
       messages: [],
+      promptHistory: [],
       title: "Provider adapter",
       summary: "Implement and verify provider conversion.",
       strategicIntent: "Keep protocol differences outside the Agent loop.",

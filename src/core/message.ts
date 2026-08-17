@@ -36,5 +36,6 @@ export type ToolResultBlock = {
 };
 
 export type ConversationMessage =
-  | { role: "user"; content: Array<TextBlock | ToolResultBlock | MediaBlock> }
+  | { role: "user"; content: Array<TextBlock | ToolResultBlock | MediaBlock>; promptInput?: PersistedPromptInput }
   | { role: "assistant"; content: Array<TextBlock | ThinkingBlock | ToolUseBlock> };
+import type { PersistedPromptInput } from "./prompt-input";

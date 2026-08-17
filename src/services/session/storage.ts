@@ -11,6 +11,8 @@ import { PERMISSION_MODES, type PermissionMode } from "../../core/permissions";
 import { registerCleanup } from "../../utils/cleanup-registry";
 import { parseJsonl } from "../../utils/jsonl";
 import { withFileLock } from "../../utils/lockfile";
+import type { PersistedPromptInput, PromptHistoryEntry, StoredPastedContent } from "../../core/prompt-input";
+import { PromptPasteStore } from "./prompt-paste-store";
 
 const sessionWriteQueues = new Map<string, Promise<void>>();
 const pendingSessionWrites = new Set<Promise<void>>();
@@ -74,6 +76,7 @@ export type SessionStoreOptions = {
 
 export type SessionState = {
   messages: ConversationMessage[];
+  promptHistory?: PromptHistoryEntry[];
   permissionMode?: PermissionMode;
   prePlanMode?: PermissionMode;
   worktree?: WorktreeSessionState;
@@ -269,6 +272,7 @@ export class SessionStore {
     }
     return {
       messages,
+      promptHistory: await sessionPromptHistory(messages, new PromptPasteStore(this.projectDir)),
       ...(permissionMode ? { permissionMode } : {}),
       ...(prePlanMode ? { prePlanMode } : {}),
       ...(worktree ? { worktree } : {}),
@@ -486,7 +490,7 @@ function isOptionalPermissionMode(value: unknown): value is PermissionMode | und
 function isConversationMessage(value: unknown): value is ConversationMessage {
   if (typeof value !== "object" || value === null) return false;
   const message = value as { role?: unknown; content?: unknown };
-  return (
+  const valid = (
     (message.role === "user" || message.role === "assistant") &&
     Array.isArray(message.content) &&
     message.content.every(
@@ -496,6 +500,8 @@ function isConversationMessage(value: unknown): value is ConversationMessage {
         typeof (block as { type?: unknown }).type === "string",
     )
   );
+  if (!valid) return false;
+  return message.role !== "user" || !("promptInput" in message) || isPersistedPromptInput((message as { promptInput?: unknown }).promptInput);
 }
 
 function isMissing(error: unknown): boolean {
@@ -510,6 +516,7 @@ export function sessionInputHistory(messages: ConversationMessage[]): string[] {
   return messages.flatMap((message) => {
     if (message.role !== "user") return [];
     if (message.content.some((block) => block.type === "tool-result")) return [];
+    if (message.promptInput?.display.trim()) return [message.promptInput.display.trim()];
     const text = message.content
       .filter((block) => block.type === "text")
       .map((block) => block.text)
@@ -517,6 +524,61 @@ export function sessionInputHistory(messages: ConversationMessage[]): string[] {
       .trim();
     return text ? [text] : [];
   });
+}
+
+export async function sessionPromptHistory(
+  messages: ConversationMessage[],
+  pasteStore: PromptPasteStore,
+): Promise<PromptHistoryEntry[]> {
+  const entries: PromptHistoryEntry[] = [];
+  for (const message of messages) {
+    if (message.role !== "user" || message.content.some((block) => block.type === "tool-result")) continue;
+    if (!message.promptInput) {
+      const display = message.content.filter((block) => block.type === "text").map((block) => block.text).join("\n").trim();
+      if (display) entries.push({ display, mode: "prompt", pastedContents: {} });
+      continue;
+    }
+    const pastedContents: PromptHistoryEntry["pastedContents"] = {};
+    for (const stored of message.promptInput.pastedContents) {
+      if (stored.type === "text") {
+        const content = await pasteStore.resolveText(stored);
+        pastedContents[stored.id] = content === undefined
+          ? { id: stored.id, type: "text", unresolved: true }
+          : { id: stored.id, type: "text", content };
+      } else {
+        const missing = await stat(stored.path).then((value) => !value.isFile()).catch(() => true);
+        pastedContents[stored.id] = { ...stored, ...(missing ? { missing: true } : {}) };
+      }
+    }
+    entries.push({ display: message.promptInput.display, mode: message.promptInput.mode, pastedContents });
+  }
+  return entries;
+}
+
+function isPersistedPromptInput(value: unknown): value is PersistedPromptInput {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const prompt = value as Partial<PersistedPromptInput>;
+  if (prompt.version !== 1 || typeof prompt.display !== "string" || !prompt.display.trim() ||
+      (prompt.mode !== "prompt" && prompt.mode !== "bash") || !Array.isArray(prompt.pastedContents)) return false;
+  const ids = new Set<number>();
+  for (const content of prompt.pastedContents) {
+    if (!isStoredPastedContent(content) || ids.has(content.id)) return false;
+    ids.add(content.id);
+  }
+  return true;
+}
+
+function isStoredPastedContent(value: unknown): value is StoredPastedContent {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const content = value as Partial<StoredPastedContent>;
+  if (!Number.isSafeInteger(content.id) || Number(content.id) <= 0) return false;
+  if (content.type === "text") {
+    const inline = typeof content.content === "string";
+    const hash = typeof content.contentHash === "string" && /^[a-f0-9]{64}$/.test(content.contentHash);
+    return inline !== hash;
+  }
+  return content.type === "image" && typeof content.path === "string" && content.path.length > 0 &&
+    ["image/png", "image/jpeg", "image/gif", "image/webp"].includes(String(content.mediaType));
 }
 
 function userPrompts(messages: ConversationMessage[]): string[] {

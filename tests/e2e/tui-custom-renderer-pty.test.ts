@@ -6,7 +6,7 @@ describe('custom renderer PTY lifecycle', () => {
     const fixture = resolve(import.meta.dir, '../fixtures/custom-renderer-tui.tsx')
     const bunExecutable = join(process.env.HOME ?? '', '.bun', 'bin', 'bun')
     const transcript = `/tmp/tnb-custom-renderer-${process.pid}.typescript`
-    const command = `(sleep 0.2; printf '\\033[200~line one\\n界 emoji 👨‍👩‍👧‍👦\\nline three\\033[201~'; sleep 0.1; printf '\\033[A\\033[B'; sleep 0.05; printf '\\033[<64;10;10M'; sleep 0.05; printf '\\003'; sleep 0.2; printf '\\003') | script -q ${JSON.stringify(transcript)} ${JSON.stringify(bunExecutable)} ${JSON.stringify(fixture)}`
+    const command = `(sleep 0.2; printf '\\033[200~line one\\n界 emoji 👨‍👩‍👧‍👦\\nline three\\nline four\\033[201~'; sleep 0.1; printf '\\033[A\\033[B'; sleep 0.05; printf '\\033[<64;10;10M'; sleep 0.05; printf '\\003'; sleep 0.2; printf '\\003') | script -q ${JSON.stringify(transcript)} ${JSON.stringify(bunExecutable)} ${JSON.stringify(fixture)}`
     const child = Bun.spawn(
       ['sh', '-c', command],
       {

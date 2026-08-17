@@ -68,7 +68,7 @@ import {
   createMcpElicitationHandler,
   type McpElicitationContext,
 } from "../services/mcp/elicitation";
-import { SessionStore, sessionInputHistory } from "../services/session/storage";
+import { SessionStore, projectSessionDirectory, sessionInputHistory } from "../services/session/storage";
 import type { SessionState } from "../services/session/storage";
 import { exportConversation } from "../services/session/export";
 import { SubagentTranscript } from "../services/session/subagent-transcript";
@@ -84,7 +84,11 @@ import { TeamSupervisor } from "../services/teams/supervisor";
 import { GoalManager } from "../services/goals/manager";
 import { nextCronRun, ScheduleManager } from "../services/scheduler/manager";
 import { loadSettings } from "../services/settings/load";
-import { loadPromptAttachments } from "../services/attachments/load";
+import { loadPromptAttachments, loadPromptImageBlocks } from "../services/attachments/load";
+import { PromptPasteStore } from "../services/session/prompt-paste-store";
+import type { PersistedPromptInput } from "../core/prompt-input";
+import type { PromptInputSubmit } from "../ui/prompt-input/types";
+import type { PastedContent } from "../ui/prompt-input/types";
 import { saveClipboardImage } from "../services/clipboard/image";
 import { addProjectPermissionRule } from "../services/settings/write";
 import {
@@ -228,6 +232,7 @@ export type CliOptions = {
   pluginToolRuntime?: PluginToolRuntimeManager;
   pluginCatalog?: Awaited<ReturnType<typeof loadPlugins>>["plugins"];
   promptContent?: Array<TextBlock | MediaBlock>;
+  promptInput?: PersistedPromptInput;
   configDir?: string;
   sessionIdFactory?: () => string;
   permissionPrompt?(request: PermissionAskRequest): Promise<PermissionPromptDecision>;
@@ -1925,6 +1930,7 @@ export async function runCli(options: CliOptions): Promise<number> {
       transport,
       model: selectedModel,
       prompt: explicitPromptContent ?? expandedCommand?.prompt ?? parsed.prompt,
+      ...(options.promptInput ? { promptInput: options.promptInput } : {}),
       systemPrompt: () => systemPromptFor(toolCatalog?.listTools() ?? exposedTools),
       messages: history,
       tools: exposedTools,
@@ -2625,7 +2631,6 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
     );
     interactiveMcp = await connectInteractiveMcp();
     let mcp = interactiveMcp;
-    const pendingClipboardImages: string[] = [];
 
     const initialManagement = parsed.resumePicker
       ? await createResumeManagement(configDir, options.cwd)
@@ -2655,7 +2660,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
       ...(preparedSession.state
         ? {
             initialTranscript: conversationDisplayTranscript(preparedSession.state.messages),
-            initialInputHistory: sessionInputHistory(preparedSession.state.messages),
+            initialInputHistory: preparedSession.state.promptHistory ?? [],
             ...(preparedSession.state.usage ? { initialUsage: preparedSession.state.usage } : {}),
           }
         : {}),
@@ -2677,9 +2682,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
       shellManager: activeShellManager,
       scheduleManager,
       async pasteImage() {
-        const path = await saveClipboardImage(options.cwd);
-        if (path) pendingClipboardImages.push(path);
-        return path;
+        return saveClipboardImage(options.cwd);
       },
       async displayImage(path) {
         const sequence = await renderTerminalImage(resolve(options.cwd, path), options.env);
@@ -2902,11 +2905,11 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
       },
       async runTurn(turn) {
         await refreshInteractiveResources();
-        const clipboardAttachments = pendingClipboardImages.splice(0);
-        const expandedCommand = expandCommandInput(turn.prompt, interactiveResources.commands.commands);
-        const expandedSkill = expandSkillInvocation(turn.prompt, interactiveResources.skills);
+        const prompt = turn.input.expanded;
+        const expandedCommand = expandCommandInput(prompt, interactiveResources.commands.commands);
+        const expandedSkill = expandSkillInvocation(prompt, interactiveResources.skills);
         const promptContent = await expandMcpPromptInput(
-          expandedCommand?.prompt ?? expandedSkill ?? turn.prompt,
+          expandedCommand?.prompt ?? expandedSkill ?? prompt,
           mcp.prompts,
           mcp.clients,
           turn.signal,
@@ -2921,16 +2924,27 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
           activeSelection.model.id,
           "--permission-mode",
           activePermissionMode,
-          ...clipboardAttachments.flatMap((path) => ["--attachment", path]),
           ...(activeReasoningEffort ? ["--thinking", activeReasoningEffort] : []),
           ...(activeFastMode ? ["--fast"] : []),
         ];
+        const promptImages = Object.values(turn.input.pastedContents).filter(
+          (content): content is Extract<PastedContent, { type: "image" }> => content.type === "image" && !content.missing,
+        );
+        const imageBlocks = await loadPromptImageBlocks({
+          cwd: options.cwd,
+          paths: promptImages.map(({ path }) => path),
+          capabilities: { supportsVision: activeSelection.model.supportsVision, supportsPdf: activeSelection.model.supportsPdf },
+          signal: turn.signal,
+        });
+        const canonicalPrompt = promptContent ?? [{ type: "text" as const, text: expandedCommand?.prompt ?? expandedSkill ?? prompt }];
+        const persistedPrompt = await persistPromptInput(
+          turn.input,
+          new PromptPasteStore(projectSessionDirectory(configDir, options.cwd)),
+        );
         let errorOutput = "";
-        let exitCode: number;
-        try {
-          exitCode = await runCli({
+        const exitCode = await runCli({
             ...options,
-            argv: ["-p", turn.prompt, ...interactiveArgs, ...runtimeArgs, ...resumeArgs],
+            argv: ["-p", prompt, ...interactiveArgs, ...runtimeArgs, ...resumeArgs],
             stdout: { write: () => undefined },
             stderr: { write: (text) => void (errorOutput += text) },
             sessionIdFactory: () => turn.sessionId,
@@ -2946,7 +2960,8 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
             hookRunner: activeHooks!,
             pluginToolRuntime: sharedPluginToolRuntime,
             pluginCatalog: interactiveResources.plugins,
-            ...(promptContent ? { promptContent } : {}),
+            promptContent: [...canonicalPrompt, ...imageBlocks],
+            promptInput: persistedPrompt,
             permissionPrompt: turn.permissionPrompt,
             permissionSessionRules,
             askUser: turn.questionPrompt,
@@ -2958,12 +2973,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
               activePermissionMode = mode;
               turn.onPermissionModeChange(mode);
             },
-          });
-        } finally {
-          await Promise.all(clipboardAttachments.map((path) =>
-            unlink(join(options.cwd, path)).catch(() => undefined)
-          ));
-        }
+        });
         if (exitCode !== 0) {
           throw new Error(errorOutput.trim().replace(/^tnb:\s*/, "") || "Request failed");
         }
@@ -5728,6 +5738,14 @@ function finalAssistantText(messages: ConversationMessage[]): string {
     if (text) return text;
   }
   throw new Error("Subagent completed without a text result");
+}
+
+async function persistPromptInput(input: PromptInputSubmit, store: PromptPasteStore): Promise<PersistedPromptInput> {
+  const pastedContents = await Promise.all(Object.values(input.pastedContents).map(async (content) => {
+    if (content.type === "text") return store.storeText(content.id, content.content);
+    return { id: content.id, type: "image" as const, path: content.path, mediaType: content.mediaType };
+  }));
+  return { version: 1, display: input.display, mode: input.mode, pastedContents };
 }
 
 function lastAssistantText(messages: ConversationMessage[]): string {

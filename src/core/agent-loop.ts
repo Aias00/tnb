@@ -9,6 +9,7 @@ import type { AgentTool, ToolProgressData } from "./tool";
 import type { ToolCatalog } from "./tool-search";
 import type { ModelEvent, ModelTransport, StopReason, TokenUsage } from "../providers/types";
 import { addUsage, EMPTY_USAGE } from "../services/usage/cost";
+import type { PersistedPromptInput } from "./prompt-input";
 
 export const DEFAULT_SUBAGENT_MAX_TURNS = 200;
 export const MAX_OUTPUT_TOKEN_RECOVERIES = 3;
@@ -40,6 +41,7 @@ export type AgentLoopOptions = {
   transport: ModelTransport;
   model: string;
   prompt: string | Array<TextBlock | MediaBlock>;
+  promptInput?: PersistedPromptInput;
   messages?: ConversationMessage[];
   systemPrompt?: string | (() => string);
   tools: AgentTool[];
@@ -103,9 +105,10 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<{
     content: typeof prompt === "string"
       ? [{ type: "text", text: prompt }]
       : structuredClone(prompt),
+    ...(options.promptInput ? { promptInput: structuredClone(options.promptInput) } : {}),
   };
   const lastMessage = messages.at(-1);
-  if (lastMessage?.role === "user") lastMessage.content.push(...structuredClone(promptMessage.content));
+  if (lastMessage?.role === "user" && !options.promptInput) lastMessage.content.push(...structuredClone(promptMessage.content));
   else messages.push(promptMessage);
   await options.onMessage?.(structuredClone(promptMessage));
   let outputTokenRecoveries = 0;
@@ -150,7 +153,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<{
             ...(options.systemPrompt
               ? { systemPrompt: typeof options.systemPrompt === "function" ? options.systemPrompt() : options.systemPrompt }
               : {}),
-            messages: structuredClone(messages),
+            messages: providerMessages(messages),
             tools: availableTools.map(({ name, description, inputSchema }) => ({
               name,
               description,
@@ -278,6 +281,13 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<{
   }
 
   throw new Error(`Maximum turn count (${maxTurns}) exceeded`);
+}
+
+function providerMessages(messages: ConversationMessage[]): ConversationMessage[] {
+  return messages.map((message) => {
+    if (message.role !== "user" || message.promptInput === undefined) return structuredClone(message);
+    return { role: "user", content: structuredClone(message.content) };
+  });
 }
 
 function isContextOverflowError(error: unknown): boolean {

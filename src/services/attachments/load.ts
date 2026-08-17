@@ -47,3 +47,13 @@ export async function loadPromptAttachments(options: {
   }
   return blocks;
 }
+
+export async function loadPromptImageBlocks(options: {
+  cwd: string;
+  paths: string[];
+  capabilities: { supportsVision: boolean; supportsPdf: boolean };
+  signal: AbortSignal;
+}): Promise<MediaBlock[]> {
+  const blocks = await loadPromptAttachments({ ...options, prompt: "" });
+  return blocks.filter((block): block is MediaBlock => block.type === "image" || block.type === "document");
+}

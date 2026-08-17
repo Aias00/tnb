@@ -23,6 +23,33 @@ class ScriptedTransport implements ModelTransport {
 }
 
 describe("agent loop", () => {
+  test("persists prompt metadata without exposing it to the Provider", async () => {
+    const transport = new ScriptedTransport([[
+      { type: "text", index: 0, text: "ok" },
+      { type: "response-end", reason: "end-turn" },
+    ]]);
+    const seen: ConversationMessage[] = [];
+    const promptInput = {
+      version: 1 as const,
+      display: "review [Image #1]",
+      mode: "prompt" as const,
+      pastedContents: [{ id: 1, type: "image" as const, path: "screen.png", mediaType: "image/png" as const }],
+    };
+    const result = await runAgentLoop({
+      transport,
+      model: "test",
+      prompt: "review [Image #1]",
+      promptInput,
+      messages: [{ role: "user", content: [{ type: "text", text: "prior" }] }],
+      tools: [],
+      authorize: async () => ({ behavior: "allow" }),
+      onMessage: (message) => { seen.push(message); },
+    });
+    expect(seen[0]).toMatchObject({ role: "user", promptInput });
+    expect(result.messages[1]).toMatchObject({ role: "user", promptInput });
+    expect(transport.requests[0]?.messages[1]).not.toHaveProperty("promptInput");
+  });
+
   test("accepts canonical multimodal prompt content", async () => {
     const transport = new ScriptedTransport([[
       { type: "text", index: 0, text: "seen" },

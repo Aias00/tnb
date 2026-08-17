@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { appendFile, mkdtemp, rm, utimes } from "node:fs/promises";
+import { appendFile, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 import { SessionStore } from "../../src/services/session/storage";
+import { PromptPasteStore } from "../../src/services/session/prompt-paste-store";
 import type { ConversationMessage } from "../../src/core/message";
 
 const directories: string[] = [];
@@ -23,6 +24,37 @@ const messages: ConversationMessage[] = [
 ];
 
 describe("JSONL session storage", () => {
+  test("restores structured prompt history with hashed text and image metadata", async () => {
+    const configDir = await temporaryDirectory();
+    const cwd = await temporaryDirectory();
+    const image = join(cwd, "screen.png");
+    await writeFile(image, "png");
+    const store = new SessionStore({ configDir, cwd, sessionId: "prompt-history" });
+    const pasteStore = new PromptPasteStore(store.projectDir);
+    const text = "large\n".repeat(300);
+    const storedText = await pasteStore.storeText(2, text);
+    await store.append([{
+      role: "user",
+      content: [{ type: "text", text: "review [Image #1] [Pasted text #2 +300 lines]" }],
+      promptInput: {
+        version: 1,
+        display: "review [Image #1] [Pasted text #2 +300 lines]",
+        mode: "prompt",
+        pastedContents: [
+          { id: 1, type: "image", path: image, mediaType: "image/png" },
+          storedText,
+        ],
+      },
+    }]);
+    expect((await store.readState()).promptHistory).toEqual([{
+      display: "review [Image #1] [Pasted text #2 +300 lines]",
+      mode: "prompt",
+      pastedContents: {
+        1: { id: 1, type: "image", path: image, mediaType: "image/png" },
+        2: { id: 2, type: "text", content: text },
+      },
+    }]);
+  });
   test("appends and restores messages for one project session", async () => {
     const configDir = await temporaryDirectory();
     const cwd = await temporaryDirectory();
@@ -170,6 +202,7 @@ describe("JSONL session storage", () => {
 
     expect(await store.readState()).toEqual({
       messages,
+      promptHistory: [{ display: "hello", mode: "prompt", pastedContents: {} }],
       permissionMode: "plan",
       prePlanMode: "acceptEdits",
     });
@@ -256,6 +289,7 @@ describe("JSONL session storage", () => {
     const fork = await source.forkTo("forked-session");
     expect(await fork.readState()).toEqual({
       messages,
+      promptHistory: [{ display: "hello", mode: "prompt", pastedContents: {} }],
       title: "Provider investigation",
       summary: "Compare provider request and streaming behavior.",
       strategicIntent: "Keep the Agent loop provider-neutral.",
