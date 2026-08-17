@@ -97,12 +97,12 @@ types in this task.
 
 - [ ] Add failing tests for inline/hash text, image metadata, missing image,
   malformed metadata rejection, missing paste hash, and legacy message migration.
-- [ ] Add failing `SessionStore.load()` tests asserting exact structured prompt
+- [ ] Add failing `SessionStore.readState()` tests asserting exact structured prompt
   history; picker summaries remain plain display strings.
 - [ ] Extend `isConversationMessage` validation: positive unique IDs, canonical
   reference grammar, supported media types, mutually exclusive content/hash,
   valid hashes, and safe non-empty paths.
-- [ ] Resolve prompt metadata during `SessionStore.load()` into
+- [ ] Resolve prompt metadata during `SessionStore.readState()` into
   `SessionState.promptHistory`. Read hashes via the paste store; stat image paths
   without reading bytes; mark missing records.
 - [ ] Keep current `sessionInputHistory(): string[]`, `initialInputHistory`, and
