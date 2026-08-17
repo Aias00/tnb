@@ -63,18 +63,43 @@ starts only when movement cannot continue upward or downward.
 
 ### Prompt rendering
 
-The prompt view will use Cursor viewport and position data rather than slicing
-the JavaScript string at an arbitrary code-unit offset. Cursor placement must
-never split a grapheme cluster or render in the middle of a wide terminal cell.
+The adapter exposes one canonical layout object:
 
-The existing long-paste placeholder remains ordinary editable text. Its hidden
-content stays in `InputBuffer.pastedContents` and expands only at submission.
-A later migration may make paste references atomic pills, but this migration
-must not silently broaden scope.
+```ts
+type PromptLayout = {
+  contentColumns: number;
+  wrappedLines: string[];
+  viewportStartLine: number;
+  viewportEndLine: number;
+  cursorLine: number;
+  cursorColumn: number;
+  visibleText: string;
+  totalWrappedLines: number;
+  promptRowsUsed: number;
+};
+```
+
+The prompt view will use this Cursor-derived layout rather than slicing the
+JavaScript string at an arbitrary code-unit offset. Transcript/prompt height
+calculation must consume the same `PromptLayout`; it must not independently
+recompute wrapping from raw input. `contentColumns` follows the reference
+`Cursor.fromText()` contract, including its reserved cursor cell. Cursor
+placement must never split a grapheme cluster or render in the middle of a wide
+terminal cell.
+
+The complete Cursor source is migrated, including its token/chip helpers, but
+the tnb adapter does not register tnb placeholders as Cursor tokens in this
+migration. `[Pasted text #N +X lines]` and `[Image: path]` remain ordinary text
+for movement and deletion. Their hidden content stays in
+`InputBuffer.pastedContents` and expands only at submission. Reference helpers
+such as `deleteTokenBefore`, image-reference snapping, and chip-special movement
+remain available but are not called for these tnb forms. A later migration may
+adopt atomic pills, but this migration must not silently change their editing
+semantics.
 
 ### Kill ring and keybindings
 
-Connect the existing input event layer to the Cursor kill-ring operations:
+Connect the main prompt input event layer to the Cursor kill-ring operations:
 
 - `Ctrl+K`: kill to logical line end;
 - `Ctrl+U`: kill to logical line start;
@@ -84,7 +109,33 @@ Connect the existing input event layer to the Cursor kill-ring operations:
 
 Consecutive compatible kill operations accumulate using the reference engine's
 rules. Ordinary insertion or navigation resets kill accumulation when required.
-No new global keybinding configuration format is introduced.
+The underlying reference kill ring remains module-global, but only the main
+prompt invokes kill/yank bindings in this migration. `questionOther`, session
+rename, and PTY `shellInput` retain basic editing and do not read or mutate the
+kill ring. This prevents prompt editing shortcuts from consuming terminal input
+intended for a child PTY. No new global keybinding configuration format is
+introduced.
+
+### Movement mapping
+
+The adapter uses the following normative command mapping:
+
+| Input | Cursor behavior |
+| --- | --- |
+| Left / Right | `left()` / `right()` by grapheme |
+| Up / Down | `up()` / `down()` visual wrapped line; then logical-line fallback; then history |
+| Home / Ctrl+A | `startOfLine()` visual wrapped line |
+| End / Ctrl+E | `endOfLine()` visual wrapped line |
+| Ctrl+K | `deleteToLineEnd()` visual wrapped line, append to kill ring |
+| Ctrl+U | `deleteToLineStart()` visual wrapped line, prepend to kill ring |
+| Ctrl+W | `deleteWordBefore()`, prepend to kill ring |
+| Ctrl+Y / Meta+Y | yank latest / yank-pop |
+| Vim `0` / `I` | `startOfLine()`; `I` then enters insert mode |
+| Vim `$` / `A` | `endOfLine()`; `A` then enters insert mode |
+| Vim `D` / `C` | `deleteToLineEnd()`; `C` then enters insert mode |
+
+This intentionally adopts the reference visual-line semantics for wrapped
+input instead of preserving tnb's former logical-only Home/End behavior.
 
 ## Data flow
 
@@ -115,6 +166,7 @@ Add focused tests for:
 
 - ASCII and logical multiline movement;
 - visual movement across wrapped terminal rows;
+- the exact Home/End/Ctrl/Vim movement table above;
 - CJK double-width positioning;
 - emoji, ZWJ sequences, and combining characters;
 - insertion and deletion at grapheme boundaries;
@@ -136,4 +188,3 @@ Land the migration as one isolated commit after the design and implementation
 plan commits. The work is complete when the main TUI uses the Cursor engine for
 rendering and editing, all focused and full tests pass, the compiled binary
 starts successfully, and local `main` matches `origin/main`.
-
