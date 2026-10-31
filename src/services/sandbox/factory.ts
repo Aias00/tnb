@@ -40,6 +40,7 @@ export function createSandbox(options: {
   settings?: SandboxSettings | undefined;
   env: Record<string, string | undefined>;
 }, host: SandboxHost = createSandboxHost(options.env)): SandboxRuntime | undefined {
+  options = structuredClone(options);
   const config = mergeSandboxConfig(options);
   if (!config.enabled) return undefined;
   const availability = getAvailabilityForConfig({ config, env: options.env }, host);

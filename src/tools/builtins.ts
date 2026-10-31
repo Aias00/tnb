@@ -47,6 +47,11 @@ export function createReadTool(
   readFileState: FileStateCache = createFileStateCacheWithSizeLimit(READ_FILE_STATE_CACHE_SIZE),
 ) {
   return defineTool({
+    bindExecution(): import("../core/tool").AgentTool {
+      const root = resolveWorkspaceRoot(currentWorkspaceRoot(workspaceRoot));
+      const roots = additionalRoots().map(resolveWorkspaceRoot);
+      return createReadTool(root, capabilities, () => roots, readFileState);
+    },
     name: "read",
     description: READ_TOOL_PROMPT,
     inputSchema: objectSchema(
@@ -111,6 +116,11 @@ export function createWriteTool(
   readFileState: FileStateCache = createFileStateCacheWithSizeLimit(READ_FILE_STATE_CACHE_SIZE),
 ) {
   return defineTool({
+    bindExecution(): import("../core/tool").AgentTool {
+      const root = resolveWorkspaceRoot(currentWorkspaceRoot(workspaceRoot));
+      const roots = additionalRoots().map(resolveWorkspaceRoot);
+      return createWriteTool(root, () => roots, readFileState);
+    },
     name: "write",
     description: WRITE_TOOL_PROMPT,
     inputSchema: objectSchema(
@@ -165,6 +175,11 @@ export function createEditTool(
   readFileState: FileStateCache = createFileStateCacheWithSizeLimit(READ_FILE_STATE_CACHE_SIZE),
 ) {
   return defineTool({
+    bindExecution(): import("../core/tool").AgentTool {
+      const root = resolveWorkspaceRoot(currentWorkspaceRoot(workspaceRoot));
+      const roots = additionalRoots().map(resolveWorkspaceRoot);
+      return createEditTool(root, () => roots, readFileState);
+    },
     name: "edit",
     description: EDIT_TOOL_PROMPT,
     inputSchema: objectSchema(

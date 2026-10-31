@@ -113,9 +113,7 @@ export function defaultWritableRoots(cwd: string, allowedPaths: readonly string[
   return uniquePaths([
     cwd,
     host.temporaryDirectory,
-    join(host.homeDirectory, ".npm"),
-    join(host.homeDirectory, ".cache"),
-    join(host.homeDirectory, ".bun"),
+    ...[".npm", ".cache", ".bun"].map((name) => join(host.homeDirectory, name)).filter((path) => host.exists(path)),
     ...allowedPaths,
   ], host);
 }

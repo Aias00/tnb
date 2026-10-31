@@ -117,12 +117,11 @@ describe("sandbox runtime factory", () => {
     const wrapped = runtime?.wrap("C:/Windows/System32/cmd.exe", ["/c", "echo ok"], "C:/work");
     expect(wrapped?.file).toBe("C:/Program Files/PowerShell/7/pwsh.exe");
     expect(wrapped?.args).toEqual(expect.arrayContaining(["-EncodedCommand"]));
-    expect(wrapped?.args.slice(-4)).toEqual([
-      "--tnb-profile",
-      "restrictive",
-      "--tnb-allowed-paths",
-      JSON.stringify(["C:/cache"]),
-    ]);
+    const script = Buffer.from(wrapped!.args.at(-1)!, "base64").toString("utf16le");
+    expect(script).toContain("$tnbCwd = 'C:/work'");
+    expect(script).toContain("$tnbExeArgs = @('/c', 'echo ok')");
+    expect(script).toContain(`$env:TNB_SANDBOX_ALLOWED_PATHS = '["C:/cache"]'`);
+
   });
 
   test("fails closed when no backend is available", () => {

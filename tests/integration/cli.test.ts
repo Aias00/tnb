@@ -337,7 +337,7 @@ describe("tnb print mode", () => {
       stderr: { write: (text) => { stderr += text; } },
       transport,
     })).toBe(1);
-    expect(stderr).toContain("Maximum budget of $0.01 exceeded");
+    expect(stderr).toContain("Maximum budget of $0.01 reached");
   });
 
   test("attaches repeated workspace text and image files to the initial prompt", async () => {

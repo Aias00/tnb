@@ -2,12 +2,38 @@ import { createAnthropicTransport } from "./anthropic";
 import { createFallbackTransport } from "./fallback";
 import { createOpenAITransport } from "./openai";
 import { createOpenAIResponsesTransport } from "./openai-responses";
-import type { ProviderSelection } from "./config";
+import { resolveProviderSelection, type ProviderSelection } from "./config";
 import type { ModelTransport } from "./types";
+import type { BillingRoute } from "../services/usage/budget";
 
 export type ReasoningEffort = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
+export function resolveBillingRoute(selection: ProviderSelection, modelId: string): BillingRoute {
+  const { provider } = selection;
+  const model = modelId === selection.model.id ? selection.model
+    : provider.models.find((item) => item.id === modelId)
+      ?? ((provider.id === "anthropic" || provider.id === "openai")
+        ? resolveProviderSelection({ providers: { [provider.id]: provider } }, provider.id, modelId).model : undefined);
+  return { provider: provider.id, model: modelId, ...(model?.pricing ? { pricing: model.pricing } : {}) };
+}
+
 export function createConfiguredTransport(
+  selection: ProviderSelection,
+  reasoningEffort?: ReasoningEffort,
+  fastMode = false,
+): ModelTransport {
+  const transport = createRawConfiguredTransport(selection, reasoningEffort, fastMode);
+  return {
+    async *stream(request, signal) {
+      const billing = resolveBillingRoute(selection, request.model);
+      for await (const event of transport.stream(request, signal)) {
+        yield event.type === "usage" ? { ...event, billing } : event;
+      }
+    },
+  };
+}
+
+function createRawConfiguredTransport(
   selection: ProviderSelection,
   reasoningEffort?: ReasoningEffort,
   fastMode = false,

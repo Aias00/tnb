@@ -1,5 +1,6 @@
 import type { AgentLoopOptions } from "./agent-loop";
 import type { MediaBlock, ToolResultBlock, ToolUseBlock } from "./message";
+import { isDeepStrictEqual } from "node:util";
 
 /** Shared execution boundary for main agents, Skills and delegated agents. */
 export async function executeTool(
@@ -8,7 +9,7 @@ export async function executeTool(
   signal: AbortSignal,
   scope?: string,
 ): Promise<{ result: ToolResultBlock; attachments: MediaBlock[] }> {
-  const tool = options.toolCatalog
+  let tool = options.toolCatalog
     ? options.toolCatalog.getTool(use.name)
     : options.tools.find((candidate) => candidate.name === use.name);
   if (!tool) return { result: toolError(use.id, `Unknown tool: ${use.name}`), attachments: [] };
@@ -20,17 +21,29 @@ export async function executeTool(
     let input = tool.validate(use.input);
     const pre = await options.beforeTool?.({ id: use.id, name: use.name, input: structuredClone(input) });
     if (pre?.input !== undefined) input = tool.validate(pre.input);
+    input = structuredClone(input);
+    const context = structuredClone(options.executionContext?.());
+    const assertAuthority = () => {
+      if (!isDeepStrictEqual(context, options.executionContext?.())) {
+        throw new Error("Execution authority changed while authorizing this tool; request fresh approval");
+      }
+    };
+    tool = tool.bindExecution?.() ?? tool;
     const decision = pre?.decision?.behavior === "deny"
       ? pre.decision
-      : await options.authorize(tool, input, { toolUseId: use.id, preApproved: pre?.decision?.behavior === "allow" });
+      : await options.authorize(tool, structuredClone(input), { toolUseId: use.id, preApproved: pre?.decision?.behavior === "allow" });
     if (decision.behavior === "deny") {
       return { result: toolError(use.id, decision.message), attachments: [] };
     }
-    if (decision.updatedInput !== undefined) input = tool.validate(decision.updatedInput);
+    if (decision.updatedInput !== undefined) input = structuredClone(tool.validate(decision.updatedInput));
+    assertAuthority();
     signal.throwIfAborted();
     if (options.callJournal) {
       journalBarrier = true;
       invocationId = await options.callJournal.intend(use, input, scope);
+      journalBarrier = false;
+      assertAuthority();
+      journalBarrier = true;
       await options.callJournal.dispatch(invocationId);
       journalBarrier = false;
     }
@@ -44,6 +57,8 @@ export async function executeTool(
       startedAt,
     });
     started = true;
+    assertAuthority();
+    signal.throwIfAborted();
     const output = await tool.execute(input, signal, (data) => {
       emit(options, {
         type: "tool-execution-progress",

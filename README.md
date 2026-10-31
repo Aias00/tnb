@@ -11,6 +11,8 @@ The implementation selectively studies mature coding-agent implementations, incl
 The local runtime adds mandatory permission checks after hooks, balanced
 compaction and truncation handling, coordinated file edits, request-owned tool
 snapshots, per-run task identities, and conservative journal-based recovery.
+Shared transport billing covers children and summaries; per-call execution
+bindings protect approval waits; native sandbox checks exercise OS effects.
 See [runtime lifecycle and recovery](docs/architecture-reference.md#runtime-lifecycle-and-recovery)
 for the source comparison, behavior changes and implementation boundaries.
 

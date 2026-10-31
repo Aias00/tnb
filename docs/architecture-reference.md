@@ -56,6 +56,7 @@ The local runtime hardening follows the fixed source comparison used in
 | Pi Durable intent before execution | Persist intended/dispatched/settled call records; recover saved outcomes and block unresolved effects. |
 | Pi file mutation queue | Coordinate canonical file writes across cooperating processes, recheck read receipts under the lock, then atomically replace one file. |
 | DeepSeek activation identity | Give each background task run its own attempt ID and retain a stopping state until its Promise settles. |
+| Shared execution authority and spend ownership | Pin file roots and shell launch context per call; share one transport ledger across an invocation and its child activations. |
 
 `core/tool-runtime.ts` is the shared tool execution boundary used by the main
 loop, Skills and delegated agents. A post-hook or progress observer cannot
@@ -86,12 +87,47 @@ session-log source revisions when provided by the runtime, so a newer compact
 history is not rejected merely because its token count decreased; late
 background summaries cannot replace a newer revision.
 
-The deterministic hardening tests cover actual local file effects, journal
-failure barriers, lost transcript results, stop/restart ownership, policy
-composition and MCP refresh during a model request. Real model task quality,
-platform sandbox enforcement, shared cross-agent billing ceilings and complete
-execution-target authorization remain separate work; this change does not
-claim those guarantees.
+`UsageBudget` wraps the transport once at the composition root. Main turns,
+children, Skills (including a different Provider), Hook models, compaction,
+Session Memory and MCP sampling use the same ledger. Configured transports
+attribute each usage event to its actual Provider/model route, so a concurrent
+fallback does not change the pricing of another response. Usage records are
+appended when received, including spend reported before a stream fails or is
+cancelled. A failed usage append aborts the invocation rather than continuing
+with an incomplete ledger. JSON results use this shared usage and the persisted
+session total, rather than recalculating all tokens at the final model's rate.
+Managed background agents retain their originating budget after the main turn
+returns; releasing the last activation closes it. Later usage updates the
+session ledger; an already-emitted result is a snapshot, not the eventual total
+of still-running tasks. A failed parent invocation cancels its budget.
+
+`--max-budget-usd` refuses requests with unknown configured pricing. Reaching
+the reported-spend ceiling aborts shared requests and stops new admission.
+This is not a prepaid hard cap: concurrent requests already sent can overshoot,
+Providers may omit final usage after cancellation, and configured prices may
+differ from an invoice. No paid Provider calls are required by the tests.
+
+ToolRuntime passes a clone to authorization and executes only normalized
+arguments or an explicit validated `updatedInput`. Built-in read/write/edit
+tools bind canonical workspace and approved roots before approval; shell
+execution binds cwd and uses the manager's copied environment for both policy
+classification and process launch. Background and PTY startup keep that cwd
+across awaits. CLI loops also compare monotonic workspace/permission-mode
+revisions after authorization, journal I/O and observer callbacks; changed
+authority requires fresh approval. MCP adapters pin definitions/client identity
+and reject connection-generation changes. Session recovery and schema-cache
+refresh do not automatically replay an approved tool effect.
+
+The deterministic tests cover local file effects, journal barriers, recovery,
+task ownership, policy composition, MCP refresh, shared billing, cancellation
+and approval races. Native sandbox tests exercise workspace/forbidden writes,
+descendant inheritance, sensitive-file differences and local networking.
+macOS enforcement was run locally; Linux and Windows have dedicated CI jobs
+whose remote results must be checked separately. See [sandbox.md](sandbox.md).
+External filesystem replacement races are not eliminated by an OS descriptor
+capability, and third-party tools must implement `bindExecution` when they
+capture mutable execution state. Real model task quality and external service
+exactly-once effects remain outside these deterministic guarantees.
 
 ## Session storage
 

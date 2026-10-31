@@ -131,10 +131,6 @@ function buildBubblewrapArgs(options: {
     "--unshare-ipc",
     "--unshare-uts",
     "--unshare-cgroup-try",
-    "--proc",
-    "/proc",
-    "--dev",
-    "/dev",
     ...(options.network === "blocked" ? ["--unshare-net"] : []),
     "--clearenv",
     "--setenv",
@@ -150,7 +146,8 @@ function buildBubblewrapArgs(options: {
   const profileArgs = isStrictProfile(options.profile)
     ? buildStrictBubblewrapArgs(options)
     : buildHostBoundBubblewrapArgs(options);
-  return [...common, ...profileArgs, "--chdir", options.cwd, "--", options.executable, ...options.executableArgs];
+  // Mount the filesystem before proc/dev so a root bind cannot replace them.
+  return [...common, ...profileArgs, "--proc", "/proc", "--dev", "/dev", "--chdir", options.cwd, "--", options.executable, ...options.executableArgs];
 }
 
 function buildHostBoundBubblewrapArgs(options: {

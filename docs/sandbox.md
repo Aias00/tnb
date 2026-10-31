@@ -39,8 +39,7 @@ Or enable it in `~/.tnb/settings.json` or a project settings file:
   networking when `network` is not set;
 - `allowedPaths`: additional read/write roots outside the active workspace.
 
-The three filesystem profiles combine with the two network profiles to form
-six modes:
+The backend must support the selected filesystem and network policy:
 
 - `permissive`: host reads and ordinary operations are allowed, while writes
   remain restricted to the workspace, temporary/cache roots, and
@@ -49,8 +48,15 @@ six modes:
 - `strict`: reads are limited to the workspace, runtime/system roots, caches,
   and `allowedPaths`;
 - `open`: direct outbound network access plus the local debugger inbound port;
-- `proxied`: outbound traffic is restricted to `localhost:8877`, matching the
-  mature proxy profile used by the reference implementation.
+- `proxied`: on macOS, outbound traffic is restricted to `localhost:8877`;
+- blocked (`networkAccess: false`): macOS denies network operations; Linux
+  uses a separate network namespace. Windows refuses this mode.
+
+| Backend | Filesystem | Network | Additional boundary |
+| --- | --- | --- | --- |
+| macOS Seatbelt | Policy enforcement, including workspace `.env` denial | Open, proxied, blocked | Descendant processes inherit the policy |
+| Linux bubblewrap | Namespace mounts; writable grants and read-only host or strict roots | Open, blocked | No filename-based `.env` exclusion in the workspace bind |
+| Windows PowerShell | Best-effort wrapper; native child programs retain host filesystem access | Open only | Job Object cleanup is best-effort; strict and AppContainer are rejected |
 
 `--sandbox` enables the configured policy without replacing its `allowedPaths`
 or profile settings. `TNB_SANDBOX=true|false|sandbox-exec` is also supported;
@@ -66,8 +72,24 @@ not interchangeable implementations of sensitive-file protection.
 Set `networkAccess` to `false` to deny network access from tools while retaining
 normal Provider connectivity in tnb itself.
 
-Sandboxing fails closed when the selected backend is unavailable. macOS uses
-Seatbelt, Linux uses bubblewrap namespaces, and Windows uses constrained
-PowerShell plus a Job Object for process cleanup. Windows reports filesystem
-isolation as best-effort and refuses unsupported network/filesystem modes
-instead of claiming parity with Seatbelt or bubblewrap.
+Sandboxing fails closed when the selected backend is unavailable. The shell
+manager runs a bounded launch probe before its first command in each cwd and
+does not fall back to an unsandboxed process if that probe fails. Executable
+discovery in `getSandboxAvailability` describes the backend, not proof that
+host namespace/OS policy permits it to launch. A launch probe alone also does
+not prove confinement.
+
+`tests/integration/sandbox-native.test.ts` executes real processes. It checks
+successful workspace writes, denied writes by a descendant outside grants,
+the platform's `.env` behavior, and an open-versus-blocked loopback connection.
+The Windows case explicitly checks native writes outside grants, documenting
+the absence of filesystem isolation rather than asserting a false denial.
+The fixtures contain synthetic data and live outside writable temp/cache roots.
+CI sets `TNB_REQUIRE_NATIVE_SANDBOX=1` so a missing backend fails the job;
+ordinary local runs skip native cases if no backend is installed. The CI jobs
+install bubblewrap on Linux and use native macOS and Windows runners.
+
+The local macOS run passed. Linux and Windows enforcement results require
+their CI runs; generating those workflows locally is not evidence they passed.
+File tools, Hook commands, plugins, MCP servers and model HTTP calls run in the
+tnb host process or their own runtimes and are outside this shell sandbox.

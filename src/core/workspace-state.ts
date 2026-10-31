@@ -14,6 +14,8 @@ export class WorkspaceState {
   #cwd: string;
   #worktree: WorktreeSessionState | undefined;
   #additionalRoots: string[] = [];
+  #revision = 0;
+  get revision(): number { return this.#revision; }
 
   constructor(cwd: string) {
     this.originalCwd = cwd;
@@ -34,7 +36,7 @@ export class WorkspaceState {
     const canonical = realpathSync(resolve(this.#cwd, path));
     if (!statSync(canonical).isDirectory()) throw new Error(`Workspace root is not a directory: ${canonical}`);
     if (canonical === realpathSync(resolve(this.#cwd))) return canonical;
-    if (!this.#additionalRoots.includes(canonical)) this.#additionalRoots.push(canonical);
+    if (!this.#additionalRoots.includes(canonical)) { this.#additionalRoots.push(canonical); this.#revision++; }
     return canonical;
   }
 
@@ -42,16 +44,19 @@ export class WorkspaceState {
     if (this.#worktree) throw new Error("This session is already using an isolated worktree");
     this.#worktree = structuredClone(worktree);
     this.#cwd = worktree.worktreePath;
+    this.#revision++;
   }
 
   restore(worktree: WorktreeSessionState | undefined): void {
     this.#worktree = worktree ? structuredClone(worktree) : undefined;
     this.#cwd = worktree?.worktreePath ?? this.originalCwd;
+    this.#revision++;
   }
 
   exit(): void {
     this.#cwd = this.#worktree?.originalCwd ?? this.originalCwd;
     this.#worktree = undefined;
+    this.#revision++;
   }
 }
 

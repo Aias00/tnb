@@ -41,6 +41,24 @@ class MemoryTransport implements McpTransport {
 }
 
 describe("MCP client", () => {
+  test("session recovery never automatically replays an approved tool effect", async () => {
+    let effects = 0;
+    const transport = new MemoryTransport((message) => {
+      if (!("id" in message) || !("method" in message)) return undefined;
+      if (message.method === "tools/call") { effects++; throw new McpSessionExpiredError(); }
+      return { jsonrpc: "2.0", id: message.id, result: message.method === "initialize"
+        ? { protocolVersion: "2025-11-25", capabilities: { tools: {} } } : {} };
+    });
+    const client = new McpClient(transport);
+    await client.connect();
+    const before = client.executionRevision;
+    try {
+      await expect(client.callTool("effect", {})).rejects.toThrow("outcome may be unknown");
+      expect(effects).toBe(1);
+      expect(client.executionRevision).toBeGreaterThan(before);
+    } finally { await client.close(); }
+  });
+
   test("opens and cancels a correlated 2026-07-28 subscription", async () => {
     const transport = new MemoryTransport((message) => {
       if (!("id" in message) || !("method" in message)) return undefined;

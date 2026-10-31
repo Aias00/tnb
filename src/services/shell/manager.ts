@@ -1,4 +1,4 @@
-import { createWriteStream, type WriteStream } from "node:fs";
+import { createWriteStream, realpathSync, type WriteStream } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { platform } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { Terminal } from "@xterm/headless";
 import { resolveShellInvocation } from "../../core/shell-permissions";
 import type { SandboxRuntime } from "../sandbox/macos";
+import { probeSandboxRuntime } from "../sandbox/probe";
 import type { ToolProgressReporter } from "../../core/tool";
 
 export const DEFAULT_BASH_TIMEOUT_MS = 120_000;
@@ -98,6 +99,9 @@ export class ShellSessionManager {
   readonly #tasks = new Map<string, BackgroundTask>();
   readonly #taskIdsByPid = new Map<number, string>();
   readonly #ptySessions = new Map<number, PtySession>();
+  readonly #sandboxProbes = new Map<string, Promise<void>>();
+  #targetRevision = 0;
+  get targetRevision(): number { return this.#targetRevision; }
 
   constructor(options: {
     cwd: string;
@@ -107,7 +111,7 @@ export class ShellSessionManager {
   }) {
     this.#cwd = options.cwd;
     this.#outputDir = options.outputDir;
-    this.#env = options.env ?? process.env;
+    this.#env = Object.freeze({ ...(options.env ?? process.env) });
     this.#sandbox = options.sandbox;
   }
 
@@ -119,13 +123,21 @@ export class ShellSessionManager {
     return this.#cwd;
   }
 
+  get environment(): Record<string, string | undefined> { return { ...this.#env }; }
+
+  captureCwd(): string { return realpathSync(this.#cwd); }
+
   async runForeground(
     command: string,
     timeoutMs: number,
     signal: AbortSignal,
     onProgress?: ToolProgressReporter,
+    cwd = this.#cwd,
   ): Promise<string> {
-    const child = this.#spawnChild(command);
+    signal.throwIfAborted();
+    await this.#ensureSandbox(cwd);
+    signal.throwIfAborted();
+    const child = this.#spawnChild(command, cwd);
     let stdout = "";
     let stderr = "";
     let liveOutput = "";
@@ -175,15 +187,20 @@ export class ShellSessionManager {
   }
 
   async runBackground(command: string, options: {
+    cwd?: string;
+    signal?: AbortSignal;
     kind?: "bash" | "monitor";
     onStdoutLine?(line: string): void;
     onExit?(status: ShellTaskStatus, exitCode: number): void;
   } = {}): Promise<ShellTaskSnapshot> {
+    const cwd = options.cwd ?? this.#cwd;
     await mkdir(this.#outputDir, { recursive: true });
+    await this.#ensureSandbox(cwd);
+    options.signal?.throwIfAborted();
     const id = `${options.kind ?? "bash"}_${randomUUID().slice(0, 8)}`;
     const outputPath = join(this.#outputDir, `${id}.log`);
     const writer = createWriteStream(outputPath, { flags: "a", encoding: "utf8" });
-    const child = this.#spawnChild(command);
+    const child = this.#spawnChild(command, cwd);
     const task: BackgroundTask = {
       id,
       pid: child.pid ?? 0,
@@ -204,6 +221,7 @@ export class ShellSessionManager {
       throw new Error("Background command did not expose a process id");
     }
     this.#tasks.set(id, task);
+    this.#targetRevision++;
     this.#taskIdsByPid.set(task.pid, id);
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
@@ -232,6 +250,8 @@ export class ShellSessionManager {
   }
 
   async startPty(options: {
+    cwd?: string;
+    signal?: AbortSignal;
     command: string;
     cols?: number;
     rows?: number;
@@ -243,16 +263,20 @@ export class ShellSessionManager {
     }
     const cols = positiveDimension(options.cols, DEFAULT_PTY_COLS, "cols");
     const rows = positiveDimension(options.rows, DEFAULT_PTY_ROWS, "rows");
+    const cwd = options.cwd ?? this.#cwd;
+    await this.#ensureSandbox(cwd);
+    options.signal?.throwIfAborted();
     const shell = resolveShell(this.#env);
-    const executable = this.#wrapExecutable(shell.file, shell.args(options.command));
+    const executable = this.#wrapExecutable(shell.file, shell.args(options.command), cwd);
     const process = await spawnPtyBridge({
       file: executable.file,
       args: executable.args,
       cols,
       rows,
-      cwd: this.#cwd,
+      cwd,
       env: this.#env,
     });
+    if (options.signal?.aborted) { process.kill(); options.signal.throwIfAborted(); }
     const terminal = new Terminal({ cols, rows, scrollback: 10_000, allowProposedApi: true });
     const session: PtySession = {
       pid: process.pid,
@@ -282,6 +306,7 @@ export class ShellSessionManager {
       }),
     );
     this.#ptySessions.set(session.pid, session);
+    this.#targetRevision++;
     await this.#waitForPty(session, options.waitMs, options.idleMs, initialActivity);
     return this.#snapshotPty(session);
   }
@@ -359,6 +384,7 @@ export class ShellSessionManager {
     for (const disposable of session.disposables) disposable.dispose();
     session.terminal.dispose();
     this.#ptySessions.delete(pid);
+    this.#targetRevision++;
   }
 
   async close(): Promise<void> {
@@ -372,19 +398,29 @@ export class ShellSessionManager {
     await Promise.allSettled([...this.#tasks.values()].map((task) => task.result));
   }
 
-  #spawnChild(command: string): ChildProcessWithoutNullStreams {
+  #spawnChild(command: string, cwd: string): ChildProcessWithoutNullStreams {
     const shell = resolveShell(this.#env);
-    const executable = this.#wrapExecutable(shell.file, shell.args(command));
+    const executable = this.#wrapExecutable(shell.file, shell.args(command), cwd);
     return spawnChild(executable.file, executable.args, {
-      cwd: this.#cwd,
+      cwd,
       env: this.#env as NodeJS.ProcessEnv,
       detached: platform() !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
     });
   }
 
-  #wrapExecutable(file: string, args: string[]): { file: string; args: string[] } {
-    return this.#sandbox?.wrap(file, args, this.#cwd) ?? { file, args };
+  async #ensureSandbox(cwd: string): Promise<void> {
+    if (!this.#sandbox) return;
+    let probe = this.#sandboxProbes.get(cwd);
+    if (!probe) {
+      probe = probeSandboxRuntime(this.#sandbox, cwd, this.#env);
+      this.#sandboxProbes.set(cwd, probe);
+    }
+    await probe;
+  }
+
+  #wrapExecutable(file: string, args: string[], cwd: string): { file: string; args: string[] } {
+    return this.#sandbox?.wrap(file, args, cwd) ?? { file, args };
   }
 
   #appendTaskOutput(task: BackgroundTask, chunk: string, notify = false): void {

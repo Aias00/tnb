@@ -182,7 +182,7 @@ describe("command hooks", () => {
     await runner.start("startup");
     await writeFile(join(directory, "watched.txt"), "changed\n");
     for (let attempt = 0; attempt < 40; attempt += 1) {
-      if (await readFile(log, "utf8").catch(() => "")) break;
+      if (events.includes("response") && await readFile(log, "utf8").catch(() => "")) break;
       await Bun.sleep(25);
     }
     await runner.end("prompt_input_exit");

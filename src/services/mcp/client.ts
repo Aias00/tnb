@@ -176,6 +176,8 @@ export class McpClient {
   private nextProgressToken = 1;
   private started = false;
   private connected = false;
+  private executionRevisionValue = 0;
+  get executionRevision(): number { return this.executionRevisionValue; }
   private capabilities: Record<string, unknown> = {};
   private readonly notificationListeners = new Map<string, Set<NotificationListener>>();
   private readonly resourceSubscriptions = new Set<string>();
@@ -255,6 +257,7 @@ export class McpClient {
         "server/discover result",
       );
       this.applyDiscovery(result);
+      this.executionRevisionValue++;
       this.connected = true;
       return true;
     } catch (error) {
@@ -324,6 +327,7 @@ export class McpClient {
       throw new Error("MCP server declares none of the tools, resources, or prompts capabilities");
     }
     await this.notify("notifications/initialized");
+    this.executionRevisionValue++;
     this.connected = true;
     if (restoreSubscriptions && this.supportsResourceSubscriptions()) {
       for (const uri of this.resourceSubscriptions) {
@@ -574,10 +578,8 @@ export class McpClient {
         throw error;
       }
       await this.listTools();
-      result = asObject(
-        await this.request("tools/call", params, signal, this.toolTimeoutMs),
-        "tools/call result",
-      );
+      this.executionRevisionValue++;
+      throw new Error("MCP tool definitions changed; request fresh approval before calling again", { cause: error });
     }
     if (!Array.isArray(result.content)) {
       throw new Error("MCP tools/call result has no content array");
@@ -606,6 +608,7 @@ export class McpClient {
       );
       this.resourceSubscriptions.clear();
     }
+    this.executionRevisionValue++;
     this.connected = false;
     const error = new Error("MCP client closed");
     for (const [id, pending] of this.pending) {
@@ -759,9 +762,14 @@ export class McpClient {
     timeoutMs = this.requestTimeoutMs,
     recoverExpiredSession = true,
   ): Promise<unknown> {
+    const executionRevision = this.executionRevision;
+    const boundExecution = method === "tools/call" || method === "resources/read" || method === "resources/subscribe";
     try {
       let requestParams = params;
       while (true) {
+        if (boundExecution && executionRevision !== this.executionRevision) {
+          throw new Error("MCP connection changed; request fresh approval");
+        }
         const result = await this.requestOnce(method, requestParams, signal, timeoutMs);
         if (this.protocolEra !== "modern") return result;
         const object = asObject(result, `${method} result`);
@@ -787,6 +795,9 @@ export class McpClient {
         !this.closing
       ) {
         await this.recoverSession();
+        if (boundExecution) {
+          throw new Error("MCP session expired; execution outcome may be unknown. Request fresh approval before another call", { cause: error });
+        }
         return await this.requestOnce(method, params, signal, timeoutMs);
       }
       throw error;
@@ -985,6 +996,7 @@ export class McpClient {
 
   private async recoverSession(): Promise<void> {
     if (this.recovery) return await this.recovery;
+    this.executionRevisionValue++;
     this.connected = false;
     const recovery = this.initializeSession(true);
     this.recovery = recovery;
@@ -1101,6 +1113,7 @@ export class McpClient {
   }
 
   private failPending(error: Error): void {
+    this.executionRevisionValue++;
     this.connected = false;
     for (const [id, pending] of this.pending) {
       if (pending.timer) clearTimeout(pending.timer);

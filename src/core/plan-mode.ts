@@ -9,6 +9,8 @@ export type InferredPlanModeState = {
 export class PermissionModeState {
   private mode: PermissionMode;
   private prePlanMode: PermissionMode | undefined;
+  private revisionValue = 0;
+  get revision(): number { return this.revisionValue; }
 
   constructor(
     initial: PermissionMode,
@@ -46,6 +48,7 @@ export class PermissionModeState {
   }
 
   private setMode(mode: PermissionMode): PermissionMode {
+    this.revisionValue++;
     this.mode = mode;
     this.onChange?.(mode);
     return mode;

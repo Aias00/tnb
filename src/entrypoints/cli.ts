@@ -31,6 +31,7 @@ import { getAutoCompactThresholdForCapabilities } from "../providers/models";
 import {
   createConfiguredTransport,
   createConfiguredTransportWithFallback,
+  resolveBillingRoute,
   type ReasoningEffort,
 } from "../providers/factory";
 import { ProviderHttpError, ProviderStreamError } from "../providers/retry";
@@ -161,7 +162,8 @@ import { formatIdeContextPrompt, IdeJsonRpcBridge, isIdeJsonRpcLine } from "../s
 import { runIdeCommand } from "../services/remote-control/ide-command";
 import { createSessionWorktree } from "../services/worktree/manager";
 import { CheckpointManager } from "../services/checkpoint/manager";
-import { addUsage, calculateCostUsd, EMPTY_USAGE } from "../services/usage/cost";
+import { EMPTY_USAGE } from "../services/usage/cost";
+import { UsageBudget } from "../services/usage/budget";
 import {
   loadPlugins,
   loadPluginHooks,
@@ -223,6 +225,8 @@ export type CliOptions = {
   stdout: Writer;
   stderr: Writer;
   transport?: ModelTransport;
+  /** Route requests from shared MCP connections through the current invocation ledger. */
+  onInvocationTransport?(transport: ModelTransport | undefined): void;
   shellManager?: ShellSessionManager;
   mcpConnections?: McpConnections;
   taskManager?: TaskManager;
@@ -973,6 +977,7 @@ function stripGoalLoopOptions(argv: string[]): string[] {
 
 export async function runCli(options: CliOptions): Promise<number> {
   let releaseSession: (() => Promise<void>) | undefined;
+  let usageBudget: UsageBudget | undefined;
   let teamSupervisor = options.teamSupervisor;
   let ownsTeamSupervisor = false;
   let mcp: McpConnections | undefined;
@@ -1042,7 +1047,6 @@ export async function runCli(options: CliOptions): Promise<number> {
         throw new Error(`--max-budget-usd requires pricing for fallback ${fallbackSelection.provider.id}/${fallbackSelection.model.id}`);
       }
     }
-    let billingSelection = selection;
     for (const warning of settings.warnings ?? []) options.stderr.write(`tnb: ${warning}\n`);
     const requestedPermissionMode =
       parsed.permissionMode ?? mainAgentProfile?.permissionMode ?? settings.permissions?.defaultMode ?? "default";
@@ -1095,6 +1099,9 @@ export async function runCli(options: CliOptions): Promise<number> {
       if (parsed.sessionId) await assertSessionIdAvailable(configDir, options.cwd, parsed.sessionId);
     }
     releaseSession = await session.acquireRun();
+    const restoredSession = resumedSessionId
+      ? await session.readState()
+      : { messages: [] as ConversationMessage[] };
     if (parsed.sessionName) await session.setTitle(parsed.sessionName);
     pluginToolRuntime = options.pluginToolRuntime ?? new PluginToolRuntimeManager(options.env);
     ownsPluginToolRuntime = options.pluginToolRuntime === undefined;
@@ -1105,13 +1112,20 @@ export async function runCli(options: CliOptions): Promise<number> {
     );
     await pluginLifecycle.initialize();
     await pluginLifecycle.start(activePlugins);
-    const transport = options.transport ?? lazyModelTransport(() => createConfiguredTransportWithFallback(
-      selection,
-      fallbackSelection,
-      parsed.thinking,
-      () => { billingSelection = fallbackSelection!; },
-      effectiveFastMode,
-    ));
+    usageBudget = new UsageBudget({
+      ...(parsed.maxBudgetUsd !== undefined ? { maxCostUsd: parsed.maxBudgetUsd } : {}),
+      onUsage: (record) => session.appendUsage(record),
+    });
+    const budget = usageBudget;
+    // A local options copy shares cancellation with tools, children and maintenance work.
+    options = { ...options, signal: options.signal
+      ? AbortSignal.any([options.signal, budget.signal]) : budget.signal };
+    const meter = (raw: ModelTransport, route: ProviderSelection) => budget.wrap(raw,
+      (request) => resolveBillingRoute(route, request.model));
+    const transport = meter(options.transport ?? lazyModelTransport(() => createConfiguredTransportWithFallback(
+      selection, fallbackSelection, parsed.thinking, undefined, effectiveFastMode,
+    )), selection);
+    options.onInvocationTransport?.(transport);
     const hooks = options.hookRunner ?? new HookRunner({
         ...(Object.keys(effectiveHooks).length ? { hooks: effectiveHooks } : {}),
         cwd: options.cwd,
@@ -1164,9 +1178,6 @@ export async function runCli(options: CliOptions): Promise<number> {
       }),
     });
     ownsShellManager = options.shellManager === undefined;
-    const restoredSession = resumedSessionId
-      ? await session.readState()
-      : { messages: [] as ConversationMessage[] };
     if (parsed.worktree) {
       const worktreeName = typeof parsed.worktree === "string"
         ? parsed.worktree
@@ -1217,6 +1228,15 @@ export async function runCli(options: CliOptions): Promise<number> {
     if (inferredPlanMode.mode !== resolvedPermissionMode.mode) {
       options.onPermissionModeChange?.(inferredPlanMode.mode);
     }
+    const executionContext = () => ({
+      workspace: workspace.revision,
+      cwd: workspace.current(),
+      shellCwd: shellManager?.cwd,
+      roots: workspace.additionalRoots(),
+      permissionMode: permissionModeState.revision,
+      denyRules: settings.permissions?.deny,
+      askRules: settings.permissions?.ask,
+    });
     const checkPermission = createPermissionChecker({
       ...permissionBaseOptions,
       mode: resolvedPermissionMode.mode,
@@ -1499,7 +1519,8 @@ export async function runCli(options: CliOptions): Promise<number> {
           mode: resolvedAgentMode.mode,
           onPermissionRequest: permissionRequestHook,
         });
-        const executeAgent = async (agentSignal: AbortSignal) => {
+        const executeAgentWork = async (agentSignal: AbortSignal) => {
+          agentSignal = AbortSignal.any([agentSignal, budget.signal]);
           const transcript = new SubagentTranscript({
             projectDir: session.projectDir,
             sessionId: session.sessionId,
@@ -1525,6 +1546,7 @@ export async function runCli(options: CliOptions): Promise<number> {
               ...(restoredMessages.length ? { messages: restoredMessages } : {}),
               systemPrompt: `${systemPromptFor(nestedTools, nestedModel)}\n\n${buildAgentProfileInstruction(profile, description)}`,
               tools: nestedTools,
+              executionContext,
               ...(teamName && teammateName ? {
                 beforeTurn: async () => ({
                   context: await drainTeamContext(teamManager, teamName, teammateName),
@@ -1590,6 +1612,10 @@ export async function runCli(options: CliOptions): Promise<number> {
             throw error;
           }
         };
+        const executeAgent = (agentSignal: AbortSignal) => {
+          const release = budget.retain();
+          return executeAgentWork(agentSignal).finally(release);
+        };
         if (runtimeTaskId) {
           if (teamName && teammateName) await teamManager.attachTask(teamName, agentId, runtimeTaskId);
           return executeAgent(signal);
@@ -1649,7 +1675,7 @@ export async function runCli(options: CliOptions): Promise<number> {
             const skillEffort = normalizeSkillEffort(skill.effort, parsed.thinking);
             const skillTransport = skillSelection.provider.id === selection.provider.id && skillEffort === parsed.thinking
               ? transport
-              : createConfiguredTransport(skillSelection, skillEffort);
+              : meter(createConfiguredTransport(skillSelection, skillEffort), skillSelection);
             const agentId = randomUUID();
             const agentType = requestedProfile?.name ?? `skill:${skill.name}`;
             const transcript = new SubagentTranscript({
@@ -1671,11 +1697,13 @@ export async function runCli(options: CliOptions): Promise<number> {
                 transport: skillTransport,
                 model: skillSelection.model.id,
                 tools: nestedTools,
+                executionContext,
               }),
               agent: createHookModelHandler({
                 transport: skillTransport,
                 model: skillSelection.model.id,
                 tools: nestedTools,
+                executionContext,
               }),
             });
             await skillHooks?.start("startup", skillSelection.model.id, signal);
@@ -1709,6 +1737,7 @@ export async function runCli(options: CliOptions): Promise<number> {
                   "# Active skill\n\nFollow the selected skill instructions and return its result to the parent Agent. Supporting resources remain on disk and should be read only when needed.",
                 ].filter(Boolean).join("\n\n"),
                 tools: nestedTools,
+                executionContext,
                 onMessage: (message) => transcript.append(message),
                 callJournal: transcript.calls,
                 ...(skillHooks ? { beforePrompt: async (submittedPrompt: string | Array<TextBlock | MediaBlock>) => {
@@ -1889,6 +1918,7 @@ export async function runCli(options: CliOptions): Promise<number> {
     hooks.setModelHandlers({
       prompt: createHookModelHandler({ transport, model: selectedModel, tools: [] }),
       agent: createHookModelHandler({
+        executionContext,
         transport,
         model: selectedModel,
         tools,
@@ -1931,7 +1961,6 @@ export async function runCli(options: CliOptions): Promise<number> {
     const goalWasActive = goalManager.current()?.status === "active";
     let goalLoopObservedActive = goalWasActive;
     let completedGoalTurnRecorded = false;
-    let invocationCostUsd = 0;
     let structuredOutputRetries = 0;
     const maxStructuredOutputRetries = positiveInteger(
       options.env.MAX_STRUCTURED_OUTPUT_RETRIES,
@@ -1956,6 +1985,7 @@ export async function runCli(options: CliOptions): Promise<number> {
       tools: exposedTools,
       resolveTools,
       callJournal: session.calls,
+      executionContext,
       ...(toolCatalog ? { toolCatalog } : {}),
       beforePrompt: async (prompt) => {
         const promptText = typeof prompt === "string"
@@ -2089,17 +2119,7 @@ export async function runCli(options: CliOptions): Promise<number> {
         }
       },
       onEvent(event) {
-        const reportedEvent = event.type === "usage"
-          ? { ...event, usage: { ...event.usage, costUsd: calculateCostUsd(event.usage, billingSelection.model.pricing) } }
-          : event;
-        if (reportedEvent.type === "usage" && parsed.maxBudgetUsd !== undefined) {
-          invocationCostUsd += reportedEvent.usage.costUsd ?? 0;
-          if (invocationCostUsd > parsed.maxBudgetUsd) {
-            throw new Error(
-              `Maximum budget of $${parsed.maxBudgetUsd.toFixed(2)} exceeded (current: $${invocationCostUsd.toFixed(4)})`,
-            );
-          }
-        }
+        const reportedEvent = event;
         options.onEvent?.(reportedEvent);
         if (parsed.outputFormat === "stream-json" && !options.quiet && (
           parsed.includePartialMessages || !isPartialModelEvent(reportedEvent)
@@ -2124,18 +2144,17 @@ export async function runCli(options: CliOptions): Promise<number> {
       }
       throw error;
     });
-    const currentCostUsd = calculateCostUsd(result.usage, billingSelection.model.pricing);
-    await session.appendUsage({
-      provider: billingSelection.provider.id,
-      model: billingSelection.model.id,
-      usage: result.usage,
-      costUsd: currentCostUsd,
-    });
-    const totalTokens = addUsage(restoredSession.usage ?? EMPTY_USAGE, result.usage);
-    const totalUsage = {
-      ...totalTokens,
-      costUsd: (restoredSession.usage?.costUsd ?? 0) + currentCostUsd,
-    };
+    // Session-end model hooks are still part of this invocation's spend.
+    if (ownedHooks) {
+      const endingHooks = ownedHooks;
+      ownedHooks = undefined;
+      try { await endingHooks.end("prompt_input_exit"); }
+      catch (error) { options.stderr.write(`tnb hook: ${errorMessage(error)}\n`); }
+    }
+    budget.signal.throwIfAborted();
+    await budget.finish();
+    const invocationUsage = budget.totals;
+    const totalUsage = (await session.readState()).usage ?? { ...EMPTY_USAGE };
     if (!options.quiet && parsed.outputFormat === "json") {
       options.stdout.write(`${JSON.stringify({
         type: "result",
@@ -2144,7 +2163,7 @@ export async function runCli(options: CliOptions): Promise<number> {
         stop_reason: result.stopReason,
         result: lastAssistantText(result.messages),
         ...(structuredOutput !== undefined ? { structured_output: structuredOutput } : {}),
-        usage: { ...result.usage, costUsd: currentCostUsd },
+        usage: invocationUsage,
         total_usage: totalUsage,
         total_cost_usd: totalUsage.costUsd,
       })}\n`);
@@ -2156,7 +2175,7 @@ export async function runCli(options: CliOptions): Promise<number> {
         stop_reason: result.stopReason,
         result: lastAssistantText(result.messages),
         ...(structuredOutput !== undefined ? { structured_output: structuredOutput } : {}),
-        usage: { ...result.usage, costUsd: currentCostUsd },
+        usage: invocationUsage,
         total_usage: totalUsage,
         total_cost_usd: totalUsage.costUsd,
       })}\n`);
@@ -2191,7 +2210,11 @@ export async function runCli(options: CliOptions): Promise<number> {
       await Promise.all([...lspManagers.values()].map((manager) => manager.close()));
       if (ownsShellManager) await shellManager?.close();
     } finally {
-      await releaseSession?.();
+      options.onInvocationTransport?.(undefined);
+      try {
+        if (completed) await usageBudget?.finish();
+        else await usageBudget?.close();
+      } finally { await releaseSession?.(); }
     }
   }
 }
@@ -2253,6 +2276,7 @@ export async function runInteractiveCli(options: InteractiveCliOptions): Promise
   const fallbackSelection = parsed.fallbackModel
     ? resolveInteractiveModel(providerCatalog, parsed.fallbackModel)
     : undefined;
+  let invocationTransport: ModelTransport | undefined;
   const transport = options.transport ?? createConfiguredTransportWithFallback(
     selection,
     fallbackSelection,
@@ -2327,7 +2351,10 @@ export async function runInteractiveCli(options: InteractiveCliOptions): Promise
       configDir,
       sampling: (serverName) => createMcpSamplingHandler({
         serverName,
-        transport,
+        transport: { stream(request, signal) {
+          if (!invocationTransport) throw new Error("MCP sampling requires an active invocation");
+          return invocationTransport.stream(request, signal);
+        } },
         model: selection.model.id,
         authorize: samplingPermission,
       }),
@@ -2371,6 +2398,7 @@ export async function runInteractiveCli(options: InteractiveCliOptions): Promise
             shellManager,
             workspaceState,
             transport,
+            onInvocationTransport: (value) => { invocationTransport = value; },
             mcpConnections: mcp,
             hookRunner: interactiveHooks,
             pluginToolRuntime: sharedPluginToolRuntime,
@@ -2407,6 +2435,7 @@ export type InkCliOptions = Omit<
 export async function runInkCli(options: InkCliOptions): Promise<number> {
   let shellManager: ShellSessionManager | undefined;
   let interactiveMcp: McpConnections | undefined;
+  let invocationTransport: ModelTransport | undefined;
   let interactiveTaskManager: TaskManager | undefined;
   let teamSupervisor: TeamSupervisor | undefined;
   let activeHooks: HookRunner | undefined;
@@ -2637,7 +2666,10 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
         configDir,
         sampling: (serverName) => (params, signal) => createMcpSamplingHandler({
           serverName,
-          transport: activeTransport,
+          transport: { stream(request, signal) {
+            if (!invocationTransport) throw new Error("MCP sampling requires an active invocation");
+            return invocationTransport.stream(request, signal);
+          } },
           model: activeSelection.model.id,
           authorize: samplingPermission,
         })(params, signal),
@@ -2982,6 +3014,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
             ...(teamSupervisor ? { teamSupervisor } : {}),
             ...(scheduleManager ? { scheduleManager } : {}),
             transport: activeTransport,
+            onInvocationTransport: (value) => { invocationTransport = value; },
             contextWindowOverride: activeContextWindow,
             mcpConnections: mcp,
             hookRunner: activeHooks!,
@@ -5449,6 +5482,7 @@ function createHookModelHandler(options: {
   model: string;
   tools: AgentTool[];
   authorize?: PermissionChecker;
+  executionContext?(): unknown;
   systemPrompt?: string | (() => string);
 }) {
   return async (hook: HookPrompt | HookAgent, input: Record<string, unknown>, signal?: AbortSignal) => {
@@ -5466,6 +5500,7 @@ function createHookModelHandler(options: {
     const result = await runAgentLoop({
       transport: options.transport,
       model: options.model,
+      executionContext: options.executionContext,
       prompt,
       ...(options.systemPrompt ? { systemPrompt: options.systemPrompt } : {}),
       tools,

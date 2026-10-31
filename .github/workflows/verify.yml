@@ -11,6 +11,8 @@ jobs:
   macos:
     runs-on: macos-14
     timeout-minutes: 15
+    env:
+      TNB_REQUIRE_NATIVE_SANDBOX: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
@@ -19,4 +21,25 @@ jobs:
       - run: bun install --frozen-lockfile --ignore-scripts
       - run: bun run typecheck
       - run: bun test
+      - run: bun run build
+
+  native-sandbox:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    env:
+      TNB_REQUIRE_NATIVE_SANDBOX: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.3.14
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap curl
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: bun run typecheck
+      - run: bun test tests/unit/sandbox-runtime.test.ts tests/unit/usage-budget.test.ts tests/unit/execution-binding.test.ts tests/integration/sandbox-native.test.ts
       - run: bun run build

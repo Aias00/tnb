@@ -49,6 +49,8 @@ export type AgentLoopOptions = {
   systemPrompt?: string | (() => string);
   tools: AgentTool[];
   callJournal?: ToolCallJournal;
+  /** Revision/identity snapshot of mutable session authority; compared after awaits. */
+  executionContext?(): unknown;
   resolveTools?(): AgentTool[];
   toolCatalog?: ToolCatalog;
   authorize(

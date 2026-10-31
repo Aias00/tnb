@@ -16,7 +16,7 @@ export type ModelEvent =
   | { type: "thinking-signature"; index: number; signature: string }
   | { type: "tool-start"; index: number; id: string; name: string }
   | { type: "tool-input"; index: number; json: string }
-  | { type: "usage"; usage: TokenUsage }
+  | { type: "usage"; usage: TokenUsage; billing?: import("../services/usage/budget").BillingRoute }
   | { type: "response-end"; reason: StopReason };
 
 export type ModelRequest = {
