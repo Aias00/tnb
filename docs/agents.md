@@ -62,3 +62,13 @@ a restart is rejected until that invocation settles. Each run has an independent
 attempt ID, so an old completion cannot settle its successor. Interrupted tool
 intents remain in child transcripts. Resume reuses journaled results or stops
 with an unknown-effect error when the prior action cannot be established.
+
+The managed task runtime shares permission-mode authority across foreground
+turns. An inherited mode follows the parent's current mode; a parent entering
+plan or dontAsk constrains a child even when its profile declares another
+mode. Permission changes during an approval are checked again before execution.
+
+An activation keeps its own Hook model handlers and originating budget after
+the foreground turn returns. `SubagentStop` and `TaskCompleted` are charged to
+that budget even if another foreground turn has installed new Hook handlers.
+The budget lease is released after completion callbacks and task persistence.

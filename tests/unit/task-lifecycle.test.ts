@@ -6,6 +6,19 @@ import { join } from "node:path";
 import { TaskManager } from "../../src/services/tasks/manager";
 
 describe("task lifecycle", () => {
+  test("failed resource admission leaves a completed attempt available to restart", async () => {
+    const root = await mkdtemp(join(tmpdir(), "tnb-task-admission-"));
+    const manager = new TaskManager(join(root, "tasks.json"));
+    try {
+      await manager.initialize();
+      const task = await manager.startAgent({ subject: "fixture", description: "fixture", profile: "general-purpose", run: async () => "done" });
+      for (let i = 0; i < 100 && manager.get(task.id)?.status !== "completed"; i++) await Bun.sleep(5);
+      const before = manager.get(task.id);
+      manager.setLifecycleHooks({ retain: () => { throw new Error("Budget closed"); } });
+      await expect(manager.restartAgent(task.id, async () => "must not start")).rejects.toThrow("Budget closed");
+      expect(manager.get(task.id)).toEqual(before);
+    } finally { await manager.shutdown(); await rm(root, { recursive: true, force: true }); }
+  });
   test("runs blocking lifecycle callbacks before persistence and completion", async () => {
     const directory = await mkdtemp(join(tmpdir(), "tnb-tasks-"));
     try {

@@ -100,6 +100,19 @@ Managed background agents retain their originating budget after the main turn
 returns; releasing the last activation closes it. Later usage updates the
 session ledger; an already-emitted result is a snapshot, not the eventual total
 of still-running tasks. A failed parent invocation cancels its budget.
+Each managed attempt captures its lifecycle Hook handlers and retains its
+budget through `TaskCompleted` and the final state write. A later foreground
+turn cannot replace the old attempt's model route or close its budget before
+completion callbacks finish. Child SubagentStart/Stop and permission Hooks use
+an activation-specific runner without starting duplicate file watchers.
+
+The managed TaskManager owns a shared PermissionModeState across foreground
+turns. Background children that inherit permission mode read the live state;
+plan and dontAsk also constrain explicitly configured child profiles. Switching
+the parent into plan mode therefore blocks later writes from an older child.
+Completed turns detach their UI observers. The permission checker applies
+global bypass/trusted-folder constraints even to a dynamic mode, and rechecks
+deny/plan restrictions after an asynchronous approval returns.
 
 `--max-budget-usd` refuses requests with unknown configured pricing. Reaching
 the reported-spend ceiling aborts shared requests and stops new admission.
@@ -122,8 +135,10 @@ The deterministic tests cover local file effects, journal barriers, recovery,
 task ownership, policy composition, MCP refresh, shared billing, cancellation
 and approval races. Native sandbox tests exercise workspace/forbidden writes,
 descendant inheritance, sensitive-file differences and local networking.
-macOS enforcement was run locally; Linux and Windows have dedicated CI jobs
-whose remote results must be checked separately. See [sandbox.md](sandbox.md).
+macOS enforcement was run locally, and the Linux tests ran in an isolated
+Debian arm64 container with namespace privileges. Dedicated CI jobs still need
+their remote results checked; Windows execution is not locally verified.
+See [sandbox.md](sandbox.md) for the exact platform boundary.
 External filesystem replacement races are not eliminated by an OS descriptor
 capability, and third-party tools must implement `bindExecution` when they
 capture mutable execution state. Real model task quality and external service

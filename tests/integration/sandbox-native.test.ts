@@ -40,6 +40,12 @@ describe.skipIf(!available.supported)(`native sandbox effects (${process.platfor
     await probeSandboxRuntime(runtime(), cwd, process.env);
   });
 
+  test.skipIf(process.platform !== "linux")("Linux descendants inherit no effective capabilities", async () => {
+    const result = await run(runtime(), "/bin/cat", ["/proc/self/status"]);
+    expect(result, result.stderr).toMatchObject({ code: 0 });
+    expect(result.stdout.match(/^CapEff:\s+([0-9a-f]+)$/m)?.[1]).toMatch(/^0+$/);
+  });
+
   for (const strict of [false, true]) {
     test.skipIf(process.platform === "win32")(`${strict ? "strict" : "restrictive"}: workspace writes succeed, descendant writes outside grants fail`, async () => {
       const sandbox = runtime(false, strict);

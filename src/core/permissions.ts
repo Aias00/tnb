@@ -134,7 +134,7 @@ export function evaluatePermission(
     };
   }
 
-  const mode = options.getMode?.() ?? resolvePermissionMode(options).mode;
+  const mode = resolvePermissionMode({ ...options, mode: options.getMode?.() ?? options.mode }).mode;
   if (mode === "plan" && !tool.isReadOnly(input)) {
     return { behavior: "deny", message: `${tool.name} is unavailable in plan mode` };
   }
@@ -230,20 +230,21 @@ export function createPermissionChecker(
       ...(result.rule ? { rule: result.rule } : {}),
       ...(suggestedRule ? { suggestedRule } : {}),
     };
+    const approve = (updatedInput?: unknown): PermissionDecision => {
+      const current = evaluatePermission(options, tool, updatedInput === undefined ? input : updatedInput);
+      if (current.behavior === "deny") return { behavior: "deny", message: current.message };
+      if (current.behavior === "ask" && current.rule && current.rule !== result.rule) {
+        return { behavior: "deny", message: "Updated authority requires a new approval" };
+      }
+      return { behavior: "allow", ...(updatedInput === undefined ? {} : { updatedInput }) };
+    };
     const hookDecision = await options.onPermissionRequest?.(
       request,
       signal,
     );
     signal?.throwIfAborted();
     if (hookDecision?.behavior === "allow" || hookDecision?.behavior === "deny") {
-      if (hookDecision.behavior === "allow" && hookDecision.updatedInput !== undefined) {
-        const updated = evaluatePermission(options, tool, hookDecision.updatedInput);
-        if (updated.behavior === "deny") return { behavior: "deny", message: updated.message };
-        if (updated.behavior === "ask" && updated.rule && updated.rule !== result.rule) {
-          return { behavior: "deny", message: "Updated input requires a new approval" };
-        }
-      }
-      return hookDecision;
+      return hookDecision.behavior === "allow" ? approve(hookDecision.updatedInput) : hookDecision;
     }
     if (options.onAsk) {
       const answer = await options.onAsk(
@@ -251,6 +252,9 @@ export function createPermissionChecker(
         signal,
       );
       signal?.throwIfAborted();
+      if (answer === "deny") return { behavior: "deny", message: `User denied permission to use ${tool.name}` };
+      const approved = approve();
+      if (approved.behavior === "deny") return approved;
       if (answer === "allow-session" && suggestedRule) {
         sessionAllowRules.push(suggestedRule);
         return { behavior: "allow" };
@@ -260,11 +264,11 @@ export function createPermissionChecker(
           return { behavior: "deny", message: "Persistent permission updates are unavailable" };
         }
         await options.persistPermissionRule(suggestedRule);
+        signal?.throwIfAborted();
         sessionAllowRules.push(suggestedRule);
-        return { behavior: "allow" };
+        return approve();
       }
-      return answer === "allow"
-        ? { behavior: "allow" }
+      return answer === "allow" ? approved
         : { behavior: "deny", message: `User denied permission to use ${tool.name}` };
     }
     return {

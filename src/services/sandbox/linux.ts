@@ -131,6 +131,7 @@ function buildBubblewrapArgs(options: {
     "--unshare-ipc",
     "--unshare-uts",
     "--unshare-cgroup-try",
+    "--cap-drop", "ALL",
     ...(options.network === "blocked" ? ["--unshare-net"] : []),
     "--clearenv",
     "--setenv",
@@ -147,7 +148,10 @@ function buildBubblewrapArgs(options: {
     ? buildStrictBubblewrapArgs(options)
     : buildHostBoundBubblewrapArgs(options);
   // Mount the filesystem before proc/dev so a root bind cannot replace them.
-  return [...common, ...profileArgs, "--proc", "/proc", "--dev", "/dev", "--chdir", options.cwd, "--", options.executable, ...options.executableArgs];
+  return [...common, ...profileArgs, "--proc", "/proc", "--dev", "/dev",
+    // Freeze the synthetic directory skeleton without making writable grants read-only.
+    ...(isStrictProfile(options.profile) ? ["--remount-ro", "/"] : []),
+    "--chdir", options.cwd, "--", options.executable, ...options.executableArgs];
 }
 
 function buildHostBoundBubblewrapArgs(options: {

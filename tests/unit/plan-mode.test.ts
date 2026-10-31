@@ -5,6 +5,20 @@ import { inferPlanModeState, PermissionModeState } from "../../src/core/plan-mod
 import { createPlanModeTools } from "../../src/tools/plan-mode";
 
 describe("permission plan mode state", () => {
+  test("shared authority advances revisions and detaches a finished turn's observer", () => {
+    const changes: string[] = [];
+    const state = new PermissionModeState("acceptEdits");
+    const detach = state.subscribe((mode) => changes.push(mode));
+    state.synchronize({ mode: "plan" });
+    const revision = state.revision;
+    state.synchronize({ mode: "plan" });
+    expect(state.revision).toBe(revision);
+    expect(state.snapshot().prePlanMode).toBe("acceptEdits");
+    detach();
+    expect(state.exitPlan()).toBe("acceptEdits");
+    expect(state.revision).toBeGreaterThan(revision);
+    expect(changes).toEqual(["plan"]);
+  });
   test("enters plan mode and restores the preceding permission mode", () => {
     const changes: string[] = [];
     const state = new PermissionModeState("acceptEdits", (mode) => changes.push(mode));

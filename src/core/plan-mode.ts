@@ -10,6 +10,7 @@ export class PermissionModeState {
   private mode: PermissionMode;
   private prePlanMode: PermissionMode | undefined;
   private revisionValue = 0;
+  private listeners = new Set<(mode: PermissionMode) => void>();
   get revision(): number { return this.revisionValue; }
 
   constructor(
@@ -34,6 +35,21 @@ export class PermissionModeState {
     };
   }
 
+  /** Reuse one authority object for all activations in a managed session. */
+  synchronize(state: InferredPlanModeState): void {
+    const preceding = state.mode === "plan"
+      ? state.prePlanMode ?? (this.mode === "plan" ? this.prePlanMode : this.mode) ?? "default"
+      : undefined;
+    if (state.mode === this.mode && preceding === this.prePlanMode) return;
+    this.prePlanMode = preceding;
+    this.setMode(state.mode);
+  }
+
+  subscribe(listener: (mode: PermissionMode) => void): () => void {
+    this.listeners.add(listener);
+    return () => { this.listeners.delete(listener); };
+  }
+
   enterPlan(): PermissionMode {
     if (this.mode === "plan") throw new Error("Session is already in plan mode");
     this.prePlanMode = this.mode;
@@ -51,6 +67,7 @@ export class PermissionModeState {
     this.revisionValue++;
     this.mode = mode;
     this.onChange?.(mode);
+    for (const listener of this.listeners) listener(mode);
     return mode;
   }
 }

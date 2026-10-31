@@ -89,7 +89,20 @@ CI sets `TNB_REQUIRE_NATIVE_SANDBOX=1` so a missing backend fails the job;
 ordinary local runs skip native cases if no backend is installed. The CI jobs
 install bubblewrap on Linux and use native macOS and Windows runners.
 
-The local macOS run passed. Linux and Windows enforcement results require
-their CI runs; generating those workflows locally is not evidence they passed.
+Linux strict mode remounts the synthetic root directory tree read-only after
+installing its mounts, while explicitly writable grants remain writable.
+Descendants drop all capabilities, including when the caller has privileges.
+This prevents the private tmpfs directory skeleton from becoming an implicit
+writable root.
+
+Native checks passed on macOS and in a disposable Debian arm64 container on
+the Colima Linux VM. The container run used root with `SYS_ADMIN` and allowed
+namespace setup through its container security profiles. A normal unprivileged
+launch in that environment was refused while setting up UID maps; the runtime
+probe rejected it and did not run the requested command outside the sandbox.
+These results verify the tested Linux policies under the stated privileges;
+they do not establish launch availability on every unprivileged Linux host.
+The dedicated CI jobs still need remote execution, and Windows enforcement
+has not been locally verified.
 File tools, Hook commands, plugins, MCP servers and model HTTP calls run in the
 tnb host process or their own runtimes and are outside this shell sandbox.

@@ -1,31 +1,59 @@
 import { describe, expect, test } from 'bun:test'
 import { resolve } from 'node:path'
+import { rm } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
 
 describe('custom renderer PTY lifecycle', () => {
   test('owns alternate screen, terminal events, and clean exit', async () => {
     const fixture = resolve(import.meta.dir, '../fixtures/custom-renderer-tui.tsx')
     const bunExecutable = process.execPath
     const transcript = `/tmp/tnb-custom-renderer-${process.pid}.typescript`
-    const command = `(sleep 0.2; printf '\\033[200~line one\\n界 emoji 👨‍👩‍👧‍👦\\nline three\\nline four\\033[201~'; sleep 0.1; printf '\\033[A\\033[B'; sleep 0.05; printf '\\033[<64;10;10M'; sleep 0.05; printf '\\003'; sleep 0.2; printf '\\003') | script -q ${JSON.stringify(transcript)} ${JSON.stringify(bunExecutable)} ${JSON.stringify(fixture)}`
-    const child = Bun.spawn(
-      ['sh', '-c', command],
+    const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'"
+    // BSD script rejects socketpair stdin; cat gives it a normal pipe.
+    const child = spawn(
+      'sh', ['-c', `cat | script -q -F ${quote(transcript)} ${quote(bunExecutable)} ${quote(fixture)}`],
       {
         cwd: resolve(import.meta.dir, '../..'),
         env: { ...process.env, TERM: 'xterm-256color' },
-        stdout: 'pipe',
-        stderr: 'pipe',
+        stdio: ['pipe', 'pipe', 'pipe'],
       },
     )
+    const exited = new Promise<number | null>((resolve, reject) => { child.once('error', reject); child.once('close', resolve) })
+    let output = ''
+    const waiters: Array<{ text: string; resolve(): void }> = []
+    let timeout: ReturnType<typeof setTimeout>
+    const deadline = new Promise<never>((_, reject) => {
+      timeout = setTimeout(() => reject(new Error(`PTY fixture did not become ready or exit: ${JSON.stringify(output.slice(-600))}`)), 5_000)
+    })
+    const waitForOutput = (text: string) => Promise.race([
+      output.includes(text) ? Promise.resolve() : new Promise<void>((resolve) => waiters.push({ text, resolve })),
+      deadline,
+      exited.then(async (code) => { throw new Error(`PTY exited before output (${code}): ${await errorTask}`) }),
+    ])
+    const outputTask = (async () => {
+      const decoder = new TextDecoder()
+      for await (const chunk of child.stdout) {
+        output += decoder.decode(chunk, { stream: true })
+        for (const waiter of waiters) if (output.includes(waiter.text)) waiter.resolve()
+      }
+      output += decoder.decode()
+    })()
+    const errorTask = (async () => { let error = ''; for await (const chunk of child.stderr) error += String(chunk); return error })()
+    const send = (input: string) => new Promise<void>((resolve, reject) => { child.stdin.write(input, (error) => error ? reject(error) : resolve()) })
 
     try {
-      const exitCode = await Promise.race([
-        child.exited,
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('PTY fixture did not exit')), 5_000),
-        ),
-      ])
-      const output = await new Response(child.stdout).text()
-      const error = await new Response(child.stderr).text()
+      // Input before raw mode is enabled is echoed by the PTY driver. Wait for
+      // actual terminal readiness rather than guessing an interpreter startup delay.
+      await waitForOutput('\u001b[?2004h')
+      await send('\u001b[200~line one\n界 emoji 👨‍👩‍👧‍👦\nline three\nline four\u001b[201~')
+      await waitForOutput('[Pasted text #1 +3 lines]')
+      await send('\u001b[A\u001b[B\u001b[<64;10;10M\u0003')
+      await waitForOutput('Press Ctrl+C again to exit')
+      await send('\u0003')
+      child.stdin.end()
+      const exitCode = await Promise.race([exited, deadline])
+      await outputTask
+      const error = await errorTask
 
       expect(exitCode, `stderr=${error}; output=${JSON.stringify(output.slice(-1000))}`).toBe(0)
       expect(error).toBe('')
@@ -42,9 +70,11 @@ describe('custom renderer PTY lifecycle', () => {
       expect(output).toContain('Resume this session with:')
       expect(output).toContain('tnb --resume renderer-pty-fixture')
       expect(output.lastIndexOf('\u001b[?1049l')).toBeLessThan(output.indexOf('Resume this session with:'))
-      expect(() => process.kill(child.pid, 0)).toThrow()
+      expect(() => process.kill(child.pid!, 0)).toThrow()
     } finally {
+      clearTimeout(timeout!)
       if (child.exitCode === null) child.kill()
+      await rm(transcript, { force: true })
     }
   }, 10_000)
 })

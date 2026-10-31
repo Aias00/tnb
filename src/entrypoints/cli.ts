@@ -23,7 +23,7 @@ import {
   type PermissionChecker,
   type ToolPolicy,
 } from "../core/permissions";
-import { inferPlanModeState, PermissionModeState } from "../core/plan-mode";
+import { inferPlanModeState } from "../core/plan-mode";
 import type { AgentTool } from "../core/tool";
 import { WorkspaceState, type WorkspaceRootSource } from "../core/workspace-state";
 import { buildSystemPrompt } from "../constants/prompts";
@@ -394,6 +394,7 @@ export async function runStreamJsonCli(options: StreamJsonCliOptions): Promise<n
     }
     if (record.subtype === "set_permission_mode") {
       selectedPermissionMode = record.mode;
+      sharedTaskManager?.permissionModeState.synchronize({ mode: record.mode });
       return { permissionMode: selectedPermissionMode };
     }
     if (record.subtype === "context_usage") {
@@ -548,6 +549,10 @@ export async function runStreamJsonCli(options: StreamJsonCliOptions): Promise<n
       ],
       sessionIdFactory: () => sessionId!,
       permissionSessionRules,
+      onPermissionModeChange(mode) {
+        selectedPermissionMode = mode;
+        options.onPermissionModeChange?.(mode);
+      },
       ...(sharedTaskManager ? { taskManager: sharedTaskManager } : {}),
       signal: activeController.signal,
       permissionPrompt: (request) => inputClosed
@@ -978,6 +983,7 @@ function stripGoalLoopOptions(argv: string[]): string[] {
 export async function runCli(options: CliOptions): Promise<number> {
   let releaseSession: (() => Promise<void>) | undefined;
   let usageBudget: UsageBudget | undefined;
+  let releasePermissionObserver: (() => void) | undefined;
   let teamSupervisor = options.teamSupervisor;
   let ownsTeamSupervisor = false;
   let mcp: McpConnections | undefined;
@@ -1164,7 +1170,7 @@ export async function runCli(options: CliOptions): Promise<number> {
       teamStatePath(configDir, session.sessionId),
     );
     if (!options.teamManager) await teamManager.initialize();
-    attachTaskHooks(taskManager, () => hooks, options.signal);
+    attachTaskHooks(taskManager, () => hooks, options.signal, budget);
     const goalManager = new GoalManager(goalStatePath(configDir, session.sessionId));
     await goalManager.initialize();
     shellManager = options.shellManager ?? new ShellSessionManager({
@@ -1220,11 +1226,11 @@ export async function runCli(options: CliOptions): Promise<number> {
       restoredSession.permissionMode ?? resolvedPermissionMode.mode,
       restoredSession.prePlanMode,
     );
-    const permissionModeState = new PermissionModeState(
-      inferredPlanMode.mode,
-      options.onPermissionModeChange,
-      inferredPlanMode.prePlanMode,
-    );
+    const permissionModeState = taskManager.permissionModeState;
+    permissionModeState.synchronize(inferredPlanMode);
+    if (options.onPermissionModeChange) {
+      releasePermissionObserver = permissionModeState.subscribe(options.onPermissionModeChange);
+    }
     if (inferredPlanMode.mode !== resolvedPermissionMode.mode) {
       options.onPermissionModeChange?.(inferredPlanMode.mode);
     }
@@ -1514,10 +1520,20 @@ export async function runCli(options: CliOptions): Promise<number> {
           ...permissionBaseOptions,
           mode: requestedAgentMode,
         });
+        const agentHooks = hooks.fork();
         const authorizeAgent = createPermissionChecker({
           ...permissionBaseOptions,
           mode: resolvedAgentMode.mode,
-          onPermissionRequest: permissionRequestHook,
+          getMode: () => permissionModeState.current === "plan" || permissionModeState.current === "dontAsk"
+            ? permissionModeState.current : profile.permissionMode ? resolvedAgentMode.mode : permissionModeState.current,
+          onPermissionRequest: (request, hookSignal) => requestPermissionThroughHooks(agentHooks, request, hookSignal),
+        });
+        agentHooks.setModelHandlers({
+          prompt: createHookModelHandler({ transport, model: nestedModel, tools: [] }),
+          agent: createHookModelHandler({ transport, model: nestedModel, tools: nestedTools,
+            executionContext, authorize: withPermissionDeniedHooks(authorizeAgent, () => agentHooks),
+            systemPrompt: () => systemPromptFor(nestedTools, nestedModel),
+          }),
         });
         const executeAgentWork = async (agentSignal: AbortSignal) => {
           agentSignal = AbortSignal.any([agentSignal, budget.signal]);
@@ -1527,7 +1543,7 @@ export async function runCli(options: CliOptions): Promise<number> {
             agentId,
           });
           const restoredMessages = shouldRestoreTranscript || runtimeTaskId ? await transcript.read() : [];
-          const start = await hooks.run("SubagentStart", {
+          const start = await agentHooks.run("SubagentStart", {
             agent_id: agentId,
             agent_type: profile.name,
           }, agentSignal);
@@ -1559,7 +1575,7 @@ export async function runCli(options: CliOptions): Promise<number> {
                   const inbox = await drainTeamContext(teamManager, teamName, teammateName);
                   if (inbox.length) return { feedback: inbox.join("\n\n") };
                 }
-                const stopped = await hooks.run("SubagentStop", {
+                const stopped = await agentHooks.run("SubagentStop", {
                   agent_id: agentId,
                   agent_type: profile.name,
                   agent_transcript_path: transcript.filePath,
@@ -1575,7 +1591,7 @@ export async function runCli(options: CliOptions): Promise<number> {
                 return {};
               },
               authorize: (tool, input, { toolUseId, preApproved }) =>
-                authorizeToolWithDeniedHook(authorizeAgent, hooks, tool, input, toolUseId, agentSignal, preApproved),
+                authorizeToolWithDeniedHook(authorizeAgent, agentHooks, tool, input, toolUseId, agentSignal, preApproved),
               signal: agentSignal,
               maxTurns: profile.maxTurns ?? DEFAULT_SUBAGENT_MAX_TURNS,
             });
@@ -1591,7 +1607,7 @@ export async function runCli(options: CliOptions): Promise<number> {
                   kind: "idle_notification",
                   text: `Teammate ${teammateName} is idle and available for more work.`,
                 });
-                await hooks.run("TeammateIdle", { teammate_name: teammateName, team_name: teamName }, agentSignal);
+                await agentHooks.run("TeammateIdle", { teammate_name: teammateName, team_name: teamName }, agentSignal);
               }
             }
             return finalAssistantText(result.messages);
@@ -2210,6 +2226,7 @@ export async function runCli(options: CliOptions): Promise<number> {
       await Promise.all([...lspManagers.values()].map((manager) => manager.close()));
       if (ownsShellManager) await shellManager?.close();
     } finally {
+      releasePermissionObserver?.();
       options.onInvocationTransport?.(undefined);
       try {
         if (completed) await usageBudget?.finish();
@@ -2892,6 +2909,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
                 : {}),
             });
             activePermissionMode = resolved.mode;
+            taskManager.permissionModeState.synchronize({ mode: resolved.mode });
             return resolved;
           },
           updateSecurityPolicy(update) {
@@ -2907,6 +2925,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
                 ...(activeTrustedFolders.length ? { trustedFolders: activeTrustedFolders } : {}),
               });
               activePermissionMode = resolved.mode;
+              taskManager.permissionModeState.synchronize({ mode: resolved.mode });
             }
           },
           async updateUiSettings(update) {
@@ -5703,16 +5722,22 @@ function attachTaskHooks(
   taskManager: TaskManager,
   hooks: () => HookRunner,
   signal?: AbortSignal,
+  budget?: UsageBudget,
 ): void {
-  const runTaskHook = (event: "TaskCreated" | "TaskCompleted", task: TaskRecord) =>
-    runBlockingHook(hooks(), event, {
+  const handlers = (runner: HookRunner) => ({
+    ...(budget ? { retain: () => budget.retain() } : {}),
+    beforeCreate: (task: TaskRecord) => runTaskHook(runner, "TaskCreated", task),
+    beforeComplete: (task: TaskRecord) => runTaskHook(runner, "TaskCompleted", task),
+  });
+  const runTaskHook = (runner: HookRunner, event: "TaskCreated" | "TaskCompleted", task: TaskRecord) =>
+    runBlockingHook(runner, event, {
       task_id: task.id,
       task_subject: task.subject,
       ...(task.description ? { task_description: task.description } : {}),
     }, signal);
   taskManager.setLifecycleHooks({
-    beforeCreate: (task) => runTaskHook("TaskCreated", task),
-    beforeComplete: (task) => runTaskHook("TaskCompleted", task),
+    ...handlers(hooks()),
+    capture: () => handlers(hooks().fork()),
   });
 }
 
