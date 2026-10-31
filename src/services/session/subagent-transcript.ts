@@ -1,8 +1,9 @@
-import { appendFile, mkdir, readFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 
 import type { ConversationMessage } from "../../core/message";
 import { CallJournal } from "./call-journal";
+import { appendJsonl } from "../../utils/jsonl-append";
 
 export class SubagentTranscript {
   readonly filePath: string;
@@ -19,16 +20,7 @@ export class SubagentTranscript {
   }
 
   async append(message: ConversationMessage): Promise<void> {
-    await mkdir(dirname(this.filePath), { recursive: true });
-    await appendFile(
-      this.filePath,
-      `${JSON.stringify({
-        version: 1,
-        timestamp: new Date().toISOString(),
-        message,
-      })}\n`,
-      { encoding: "utf8", mode: 0o600 },
-    );
+    await appendJsonl(this.filePath, [{ version: 1, timestamp: new Date().toISOString(), message }]);
   }
 
   async read(): Promise<ConversationMessage[]> {

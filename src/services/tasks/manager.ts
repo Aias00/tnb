@@ -73,6 +73,10 @@ export class TaskManager {
   private writeQueue: Promise<void> = Promise.resolve();
   private generation = 0;
   private draining = false;
+  private closed = false;
+  private pendingSwitches = 0;
+  private transitionQueue: Promise<void> = Promise.resolve();
+  private shutdownTask: Promise<void> | undefined;
   private lifecycleHooks: TaskLifecycleHooks = {};
 
   constructor(filePath: string) {
@@ -95,21 +99,44 @@ export class TaskManager {
   }
 
   async switchStorage(filePath: string): Promise<void> {
+    if (this.closed) throw new Error("Task runtime is closed; session switching is unavailable");
+    this.pendingSwitches++;
     this.draining = true;
-    this.stopAll("Task was stopped because the active session changed", false);
-    await Promise.allSettled([...this.running.values()]);
-    await this.commit();
-    this.generation += 1;
-    this.filePath = filePath;
-    await this.load(filePath);
-    this.draining = false;
+    const switching = this.transitionQueue.catch(() => undefined).then(async () => {
+      if (this.closed) throw new Error("Task runtime is closed; session switching is unavailable");
+      this.stopAll("Task was stopped because the active session changed", false);
+      await Promise.allSettled([...this.running.values()]);
+      await this.commit();
+      this.generation += 1;
+      const previous = { filePath: this.filePath, nextWorkItemId: this.nextWorkItemId, tasks: this.tasks, deletedTasks: this.deletedTasks };
+      this.filePath = filePath;
+      try { await this.load(filePath); }
+      catch (error) {
+        this.filePath = previous.filePath;
+        this.nextWorkItemId = previous.nextWorkItemId;
+        this.tasks = previous.tasks;
+        this.deletedTasks = previous.deletedTasks;
+        this.publish();
+        throw error;
+      }
+    });
+    this.transitionQueue = switching;
+    try { await switching; }
+    finally { this.pendingSwitches--; this.draining = this.closed || this.pendingSwitches > 0; }
   }
 
-  async shutdown(): Promise<void> {
+  shutdown(): Promise<void> {
+    if (this.shutdownTask) return this.shutdownTask;
+    this.closed = true;
     this.draining = true;
     this.stopAll("Task was stopped because tnb exited", true);
-    await Promise.allSettled([...this.running.values()]);
-    await this.commit();
+    this.shutdownTask = this.transitionQueue.catch(() => undefined).then(async () => {
+      this.stopAll("Task was stopped because tnb exited", true);
+      await Promise.allSettled([...this.running.values()]);
+      await this.commit();
+    });
+    this.transitionQueue = this.shutdownTask;
+    return this.shutdownTask;
   }
 
   recoverableAgents(): TaskRecord[] {
@@ -170,7 +197,10 @@ export class TaskManager {
     activeForm?: string;
     metadata?: Record<string, unknown>;
   }): Promise<TaskRecord> {
-    const id = await this.reserveWorkItemId();
+    this.assertAdmitting();
+    const generation = this.generation;
+    const id = await this.reserveWorkItemId(generation);
+    this.assertMutationGeneration(generation);
     const now = new Date().toISOString();
     const task: TaskRecord = {
       id,
@@ -186,6 +216,7 @@ export class TaskManager {
       ...(input.metadata ? { metadata: structuredClone(input.metadata) } : {}),
     };
     await this.lifecycleHooks.beforeCreate?.(structuredClone(task));
+    this.assertMutationGeneration(generation);
     this.tasks.set(task.id, task);
     this.deletedTasks.delete(task.id);
     await this.commit();
@@ -202,6 +233,8 @@ export class TaskManager {
   }
 
   async update(taskId: string, update: TaskUpdate): Promise<TaskRecord | undefined> {
+    this.assertAdmitting();
+    const generation = this.generation;
     const current = this.tasks.get(taskId);
     if (!current) return undefined;
     if (current.type !== "work-item") {
@@ -243,6 +276,7 @@ export class TaskManager {
     if (current.status !== "completed" && next.status === "completed") {
       await this.lifecycleHooks.beforeComplete?.(structuredClone(next));
     }
+    this.assertMutationGeneration(generation);
     this.tasks.set(taskId, next);
     await this.commit();
     return structuredClone(next);
@@ -447,14 +481,15 @@ export class TaskManager {
     }
   }
 
-  private async reserveWorkItemId(): Promise<string> {
+  private async reserveWorkItemId(generation: number): Promise<string> {
     const filePath = this.filePath;
+    const localNext = this.nextWorkItemId;
     return withFileLock(filePath, async () => {
       const persisted = await readPersistedTaskState(filePath);
-      const next = Math.max(this.nextWorkItemId, persisted.nextWorkItemId);
+      const next = Math.max(localNext, persisted.nextWorkItemId);
       persisted.nextWorkItemId = next + 1;
       await writeTaskState(filePath, persisted);
-      this.nextWorkItemId = next + 1;
+      if (this.generation === generation && this.filePath === filePath) this.nextWorkItemId = next + 1;
       return String(next);
     });
   }
@@ -462,6 +497,11 @@ export class TaskManager {
   private publish(): void {
     this.snapshot = [...this.tasks.values()].map((task) => structuredClone(task));
     for (const listener of this.listeners) listener();
+  }
+
+  private assertMutationGeneration(generation: number): void {
+    this.assertAdmitting();
+    if (generation !== this.generation) throw new Error("Task session changed while mutating a work item");
   }
 
   private assertAdmitting(): void {

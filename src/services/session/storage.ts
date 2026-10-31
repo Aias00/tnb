@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { appendFile, mkdir, open, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 
 import type { ConversationMessage } from "../../core/message";
@@ -10,6 +10,7 @@ import { addUsage, EMPTY_USAGE, type UsageTotals } from "../usage/cost";
 import { PERMISSION_MODES, type PermissionMode } from "../../core/permissions";
 import { registerCleanup } from "../../utils/cleanup-registry";
 import { parseJsonl } from "../../utils/jsonl";
+import { appendJsonl } from "../../utils/jsonl-append";
 import { lock, withFileLock } from "../../utils/lockfile";
 import type { PersistedPromptInput, PromptHistoryEntry, StoredPastedContent } from "../../core/prompt-input";
 import { PromptPasteStore } from "./prompt-paste-store";
@@ -384,12 +385,8 @@ export class SessionStore {
   }
 
   private async appendRecords(records: SessionRecord[]): Promise<void> {
-    const payload = `${records.map((record) => JSON.stringify(record)).join("\n")}\n`;
     await queueSessionWrite(this.filePath, async () => {
-      await mkdir(this.projectDir, { recursive: true });
-      await withFileLock(this.filePath, () =>
-        appendFile(this.filePath, payload, { encoding: "utf8", mode: 0o600 })
-      );
+      await appendJsonl(this.filePath, records);
       this.revision += records.length;
     });
   }

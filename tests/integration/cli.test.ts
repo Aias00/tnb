@@ -1465,7 +1465,7 @@ describe("tnb print mode", () => {
     expect(await readFile(hookLog, "utf8")).toBe("startstop");
     const parentSession = new SessionStore({ configDir, cwd, sessionId: "main-session" });
     const transcriptDirectory = join(parentSession.projectDir, "main-session", "subagents");
-    const transcripts = await readdir(transcriptDirectory);
+    const transcripts = (await readdir(transcriptDirectory)).filter((name) => name.endsWith(".jsonl"));
     expect(transcripts).toHaveLength(1);
     expect(await readFile(join(transcriptDirectory, transcripts[0]!), "utf8")).toContain(
       "Find the provider registry",

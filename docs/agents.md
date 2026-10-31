@@ -79,3 +79,14 @@ runtime, even though their Agent callback has not started. Cancellation is
 checked after startup I/O, so closing the runtime cannot dispatch a late Agent
 or move an old-session task into the new session. Creation/completion Hooks
 also receive the attempt's cancellation signal.
+
+Session switching and shutdown are serialized. Closing a runtime permanently
+rejects new activations, work-item mutations and session switches. Work-item
+creation/completion that awaited a Hook before the session changed is rejected
+before its final write. A failed session load restores the preceding storage.
+
+Transcript and journal appends preserve a torn final record in a private
+`.torn-<uuid>` sidecar before restoring the newline boundary. This lets a saved
+tool result repair an interrupted transcript without merging it into broken
+JSON. Journal lifecycle or result-ID corruption blocks recovery and further
+execution; an interrupted effect still requires reconciliation.

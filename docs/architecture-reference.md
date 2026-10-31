@@ -75,6 +75,21 @@ including an interrupted legacy transcript with no journal, blocks automatic
 resume and retains the original call for effect reconciliation. This does not
 provide external exactly-once transactions or a general reconciliation UI.
 
+Main/child transcripts and call journals append through one locked JSONL
+boundary. An unterminated but valid final JSON record receives a newline.
+A syntactically torn tail is copied byte-for-byte to a private `.torn-<uuid>`
+sidecar and synced before truncation to the preceding newline. New records
+then remain independently readable, including recovered tool results; the
+original tail is available for inspection. This repairs append framing, not
+the unknown outcome of an interrupted tool.
+
+The call journal validates lifecycle transitions, tool-result IDs, and result
+attachment structure before accepting recovery or a new execution barrier.
+Complete malformed records and semantically invalid final records block further
+calls. Append validation consumes newly appended bytes under the file lock;
+recovery scans the full journal. Ordinary conversation JSONL retains its
+existing policy of recovering independently valid records.
+
 File replacement provides atomic visibility for one file and preserves its
 ordinary mode bits. It does not preserve every ACL, extended attribute or hard
 link relationship, serialize non-cooperating editors, or provide a multi-file
@@ -112,6 +127,10 @@ startup and execution. After a pending write completes, cancellation is checked
 again before the Agent callback is dispatched. Lifecycle Hooks receive the
 attempt signal together with the originating invocation signal. A callback
 which ignores cancellation must settle before the task runtime finishes draining.
+Session switches are serialized, and shutdown permanently seals admission even
+when a switch is already pending. A failed destination load restores the old
+task storage. Work-item writes check the session generation after awaited
+Hooks, so late creation/completion cannot enter the next session.
 
 The shell manager also seals admission at `close()`. It owns foreground calls
 and pending background/PTY startups before their first await, cancels an active
