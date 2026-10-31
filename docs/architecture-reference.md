@@ -106,6 +106,20 @@ turn cannot replace the old attempt's model route or close its budget before
 completion callbacks finish. Child SubagentStart/Stop and permission Hooks use
 an activation-specific runner without starting duplicate file watchers.
 
+Runtime attempts register ownership before `TaskCreated` and the initial state
+write can yield. Shutdown and session switching seal admission and join both
+startup and execution. After a pending write completes, cancellation is checked
+again before the Agent callback is dispatched. Lifecycle Hooks receive the
+attempt signal together with the originating invocation signal. A callback
+which ignores cancellation must settle before the task runtime finishes draining.
+
+The shell manager also seals admission at `close()`. It owns foreground calls
+and pending background/PTY startups before their first await, cancels an active
+sandbox launch probe, and joins managed process exits. PTY bridge shutdown is
+observed through its process-close event. Unix command groups first receive
+SIGTERM and escalate to SIGKILL after 250 ms if still running. Tests execute
+these paths with real macOS foreground, background, and Seatbelt PTY processes.
+
 The managed TaskManager owns a shared PermissionModeState across foreground
 turns. Background children that inherit permission mode read the live state;
 plan and dontAsk also constrain explicitly configured child profiles. Switching

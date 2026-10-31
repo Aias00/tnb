@@ -72,3 +72,10 @@ An activation keeps its own Hook model handlers and originating budget after
 the foreground turn returns. `SubagentStop` and `TaskCompleted` are charged to
 that budget even if another foreground turn has installed new Hook handlers.
 The budget lease is released after completion callbacks and task persistence.
+
+Shutdown and session switching wait for attempts still inside a creation Hook
+or their first persistence write. Those attempts already belong to the task
+runtime, even though their Agent callback has not started. Cancellation is
+checked after startup I/O, so closing the runtime cannot dispatch a late Agent
+or move an old-session task into the new session. Creation/completion Hooks
+also receive the attempt's cancellation signal.

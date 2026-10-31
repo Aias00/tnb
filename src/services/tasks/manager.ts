@@ -53,8 +53,8 @@ export type TaskLifecycleHooks = {
   /** Capture model/policy callbacks and retain resources for one runtime attempt. */
   capture?(): TaskLifecycleHooks;
   retain?(): () => void;
-  beforeCreate?(task: TaskRecord): Promise<void>;
-  beforeComplete?(task: TaskRecord): Promise<void>;
+  beforeCreate?(task: TaskRecord, signal?: AbortSignal): Promise<void>;
+  beforeComplete?(task: TaskRecord, signal?: AbortSignal): Promise<void>;
 };
 
 type TaskActivationScope = { hooks: TaskLifecycleHooks; release?: () => void };
@@ -342,22 +342,29 @@ export class TaskManager {
     const controller = new AbortController();
     const generation = this.generation;
     const attemptId = task.attemptId!;
-    try {
-      if (creating) await hooks.beforeCreate?.(structuredClone(task));
+    const assertActive = () => {
       this.assertAdmitting();
+      controller.signal.throwIfAborted();
+      if (generation !== this.generation) throw new Error("Task session changed before activation dispatch");
+    };
+    // Register ownership synchronously, before Hooks or persistence can yield.
+    this.controllers.set(task.id, controller);
+    const startup = Promise.resolve().then(async () => {
+      assertActive();
+      if (creating) await hooks.beforeCreate?.(structuredClone(task), controller.signal);
+      assertActive();
       this.tasks.set(task.id, task);
-      this.controllers.set(task.id, controller);
       await this.commit();
-      this.track(task.id, attemptId, Promise.resolve().then(() => run(controller.signal)).then(
-        (output) => this.finishRuntimeTask(task.id, generation, attemptId, controller.signal.aborted ? "stopped" : "completed", { output }, hooks),
-        (error: unknown) => this.finishRuntimeTask(task.id, generation, attemptId, controller.signal.aborted ? "stopped" : "failed", {
-          error: controller.signal.aborted ? "Task was stopped" : error instanceof Error ? error.message : String(error),
-        }, hooks),
-      ).finally(release));
-    } catch (error) {
-      release?.();
-      throw error;
-    }
+      assertActive();
+    });
+    const running = startup.then(() => { assertActive(); return run(controller.signal); }).then(
+      (output) => this.finishRuntimeTask(task.id, generation, attemptId, controller.signal.aborted ? "stopped" : "completed", { output }, hooks, controller.signal),
+      (error: unknown) => this.finishRuntimeTask(task.id, generation, attemptId, controller.signal.aborted ? "stopped" : "failed", {
+        error: controller.signal.aborted ? "Task was stopped" : error instanceof Error ? error.message : String(error),
+      }, hooks, controller.signal),
+    ).finally(release);
+    this.track(task.id, attemptId, running, controller);
+    await startup;
   }
 
   private async finishRuntimeTask(
@@ -367,6 +374,7 @@ export class TaskManager {
     status: "completed" | "failed" | "stopped",
     result: { output?: string; error?: string },
     hooks: TaskLifecycleHooks,
+    signal: AbortSignal,
   ): Promise<void> {
     if (generation !== this.generation) return;
     let task = this.tasks.get(taskId);
@@ -378,7 +386,7 @@ export class TaskManager {
           ...task,
           status,
           ...(result.output !== undefined ? { output: result.output } : {}),
-        }));
+        }), signal);
       } catch (error) {
         status = "failed";
         result = { error: error instanceof Error ? error.message : String(error) };
@@ -397,13 +405,13 @@ export class TaskManager {
     await this.commit();
   }
 
-  private track(taskId: string, attemptId: string, promise: Promise<void>): void {
+  private track(taskId: string, attemptId: string, promise: Promise<void>, controller: AbortController): void {
     this.running.set(attemptId, promise);
     void promise.catch(() => {
       // Keep an unsettled persisted attempt recoverable if storage fails.
     }).finally(() => {
       this.running.delete(attemptId);
-      if (this.tasks.get(taskId)?.attemptId === attemptId) this.controllers.delete(taskId);
+      if (this.controllers.get(taskId) === controller) this.controllers.delete(taskId);
     });
   }
 

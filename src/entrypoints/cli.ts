@@ -5726,15 +5726,15 @@ function attachTaskHooks(
 ): void {
   const handlers = (runner: HookRunner) => ({
     ...(budget ? { retain: () => budget.retain() } : {}),
-    beforeCreate: (task: TaskRecord) => runTaskHook(runner, "TaskCreated", task),
-    beforeComplete: (task: TaskRecord) => runTaskHook(runner, "TaskCompleted", task),
+    beforeCreate: (task: TaskRecord, taskSignal?: AbortSignal) => runTaskHook(runner, "TaskCreated", task, taskSignal),
+    beforeComplete: (task: TaskRecord, taskSignal?: AbortSignal) => runTaskHook(runner, "TaskCompleted", task, taskSignal),
   });
-  const runTaskHook = (runner: HookRunner, event: "TaskCreated" | "TaskCompleted", task: TaskRecord) =>
+  const runTaskHook = (runner: HookRunner, event: "TaskCreated" | "TaskCompleted", task: TaskRecord, taskSignal?: AbortSignal) =>
     runBlockingHook(runner, event, {
       task_id: task.id,
       task_subject: task.subject,
       ...(task.description ? { task_description: task.description } : {}),
-    }, signal);
+    }, signal && taskSignal ? AbortSignal.any([signal, taskSignal]) : taskSignal ?? signal);
   taskManager.setLifecycleHooks({
     ...handlers(hooks()),
     capture: () => handlers(hooks().fork()),

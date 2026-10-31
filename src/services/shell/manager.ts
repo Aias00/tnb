@@ -80,10 +80,29 @@ type PtySession = {
   disposables: Array<{ dispose(): void }>;
 };
 
+type BackgroundOptions = {
+  cwd?: string;
+  signal?: AbortSignal;
+  kind?: "bash" | "monitor";
+  onStdoutLine?(line: string): void;
+  onExit?(status: ShellTaskStatus, exitCode: number): void;
+};
+
+type PtyStartOptions = {
+  cwd?: string;
+  signal?: AbortSignal;
+  command: string;
+  cols?: number;
+  rows?: number;
+  waitMs?: number;
+  idleMs?: number;
+};
+
 type Disposable = { dispose(): void };
 
 type PtyBridge = {
   readonly pid: number;
+  readonly closed: Promise<void>;
   onData(listener: (data: string) => void): Disposable;
   onExit(listener: (event: { exitCode: number }) => void): Disposable;
   write(data: string): void;
@@ -100,6 +119,11 @@ export class ShellSessionManager {
   readonly #taskIdsByPid = new Map<number, string>();
   readonly #ptySessions = new Map<number, PtySession>();
   readonly #sandboxProbes = new Map<string, Promise<void>>();
+  readonly #lifetime = new AbortController();
+  readonly #operations = new Set<Promise<unknown>>();
+  readonly #closingPtys = new Set<Promise<void>>();
+  #closing: Promise<void> | undefined;
+  #pendingPtys = 0;
   #targetRevision = 0;
   get targetRevision(): number { return this.#targetRevision; }
 
@@ -134,6 +158,12 @@ export class ShellSessionManager {
     onProgress?: ToolProgressReporter,
     cwd = this.#cwd,
   ): Promise<string> {
+    return this.#own(() => this.#runForeground(command, timeoutMs,
+      AbortSignal.any([signal, this.#lifetime.signal]), onProgress, cwd));
+  }
+
+  async #runForeground(command: string, timeoutMs: number, signal: AbortSignal,
+    onProgress: ToolProgressReporter | undefined, cwd: string): Promise<string> {
     signal.throwIfAborted();
     await this.#ensureSandbox(cwd);
     signal.throwIfAborted();
@@ -172,6 +202,7 @@ export class ShellSessionManager {
     }, timeoutMs);
     const abort = () => killChildTree(child);
     signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
     try {
       const exitCode = await childExit(child);
       if (signal.aborted) throw signal.reason ?? new Error("Command was interrupted");
@@ -186,14 +217,15 @@ export class ShellSessionManager {
     }
   }
 
-  async runBackground(command: string, options: {
-    cwd?: string;
-    signal?: AbortSignal;
-    kind?: "bash" | "monitor";
-    onStdoutLine?(line: string): void;
-    onExit?(status: ShellTaskStatus, exitCode: number): void;
-  } = {}): Promise<ShellTaskSnapshot> {
-    const cwd = options.cwd ?? this.#cwd;
+  async runBackground(command: string, options: BackgroundOptions = {}): Promise<ShellTaskSnapshot> {
+    const bound = { ...options, cwd: options.cwd ?? this.#cwd,
+      signal: options.signal ? AbortSignal.any([options.signal, this.#lifetime.signal]) : this.#lifetime.signal };
+    return this.#own(() => this.#runBackground(command, bound));
+  }
+
+  async #runBackground(command: string, options: BackgroundOptions): Promise<ShellTaskSnapshot> {
+    const cwd = options.cwd!;
+    options.signal?.throwIfAborted();
     await mkdir(this.#outputDir, { recursive: true });
     await this.#ensureSandbox(cwd);
     options.signal?.throwIfAborted();
@@ -249,15 +281,18 @@ export class ShellSessionManager {
     ];
   }
 
-  async startPty(options: {
-    cwd?: string;
-    signal?: AbortSignal;
-    command: string;
-    cols?: number;
-    rows?: number;
-    waitMs?: number;
-    idleMs?: number;
-  }): Promise<PtySnapshot> {
+  async startPty(options: PtyStartOptions): Promise<PtySnapshot> {
+    const bound = { ...options, cwd: options.cwd ?? this.#cwd,
+      signal: options.signal ? AbortSignal.any([options.signal, this.#lifetime.signal]) : this.#lifetime.signal };
+    if (this.#ptySessions.size + this.#pendingPtys >= MAX_PTY_SESSIONS) {
+      throw new Error(`At most ${MAX_PTY_SESSIONS} PTY sessions may be active`);
+    }
+    this.#pendingPtys++;
+    try { return await this.#own(() => this.#startPty(bound)); }
+    finally { this.#pendingPtys--; }
+  }
+
+  async #startPty(options: PtyStartOptions): Promise<PtySnapshot> {
     if (this.#ptySessions.size >= MAX_PTY_SESSIONS) {
       throw new Error(`At most ${MAX_PTY_SESSIONS} PTY sessions may be active`);
     }
@@ -275,8 +310,9 @@ export class ShellSessionManager {
       rows,
       cwd,
       env: this.#env,
+      signal: options.signal,
     });
-    if (options.signal?.aborted) { process.kill(); options.signal.throwIfAborted(); }
+    if (options.signal?.aborted) { process.kill(); await process.closed; options.signal.throwIfAborted(); }
     const terminal = new Terminal({ cols, rows, scrollback: 10_000, allowProposedApi: true });
     const session: PtySession = {
       pid: process.pid,
@@ -308,6 +344,7 @@ export class ShellSessionManager {
     this.#ptySessions.set(session.pid, session);
     this.#targetRevision++;
     await this.#waitForPty(session, options.waitMs, options.idleMs, initialActivity);
+    options.signal?.throwIfAborted();
     return this.#snapshotPty(session);
   }
 
@@ -374,6 +411,8 @@ export class ShellSessionManager {
     const session = this.#ptySessions.get(pid);
     if (!session) return;
     clearTimeout(session.expires);
+    this.#closingPtys.add(session.process.closed);
+    void session.process.closed.finally(() => { this.#closingPtys.delete(session.process.closed); });
     if (session.alive) {
       try {
         session.process.kill();
@@ -387,15 +426,28 @@ export class ShellSessionManager {
     this.#targetRevision++;
   }
 
-  async close(): Promise<void> {
-    for (const task of this.#tasks.values()) {
-      if (task.status === "running") {
-        task.status = "killed";
-        killChildTree(task.process);
+  close(): Promise<void> {
+    if (this.#closing) return this.#closing;
+    this.#lifetime.abort(new Error("Shell runtime is closing; new commands are not admitted"));
+    this.#closing = (async () => {
+      for (const task of this.#tasks.values()) {
+        if (task.status === "running") { task.status = "killed"; killChildTree(task.process); }
       }
-    }
-    for (const pid of [...this.#ptySessions.keys()]) this.closePty(pid);
-    await Promise.allSettled([...this.#tasks.values()].map((task) => task.result));
+      for (const pid of [...this.#ptySessions.keys()]) this.closePty(pid);
+      await Promise.allSettled([...this.#operations]);
+      for (const pid of [...this.#ptySessions.keys()]) this.closePty(pid);
+      await Promise.allSettled([...this.#tasks.values()].map((task) => task.result));
+      await Promise.all([...this.#closingPtys]);
+    })();
+    return this.#closing;
+  }
+
+  #own<T>(operation: () => Promise<T>): Promise<T> {
+    this.#lifetime.signal.throwIfAborted();
+    const pending = Promise.resolve().then(() => { this.#lifetime.signal.throwIfAborted(); return operation(); });
+    this.#operations.add(pending);
+    void pending.finally(() => { this.#operations.delete(pending); }).catch(() => undefined);
+    return pending;
   }
 
   #spawnChild(command: string, cwd: string): ChildProcessWithoutNullStreams {
@@ -413,7 +465,7 @@ export class ShellSessionManager {
     if (!this.#sandbox) return;
     let probe = this.#sandboxProbes.get(cwd);
     if (!probe) {
-      probe = probeSandboxRuntime(this.#sandbox, cwd, this.#env);
+      probe = probeSandboxRuntime(this.#sandbox, cwd, this.#env, this.#lifetime.signal);
       this.#sandboxProbes.set(cwd, probe);
     }
     await probe;
@@ -515,7 +567,9 @@ async function spawnPtyBridge(options: {
   rows: number;
   cwd: string;
   env: Record<string, string | undefined>;
+  signal?: AbortSignal;
 }): Promise<PtyBridge> {
+  options.signal?.throwIfAborted();
   const moduleUrl = import.meta.resolve("@lydell/node-pty");
   const modulePath = moduleUrl.startsWith("file:") ? fileURLToPath(moduleUrl) : moduleUrl;
   const node = options.env.TNB_NODE_PATH ?? "node";
@@ -530,8 +584,11 @@ async function spawnPtyBridge(options: {
       TNB_PTY_ROWS: String(options.rows),
       TNB_PTY_CWD: options.cwd,
     } as NodeJS.ProcessEnv,
+    detached: platform() !== "win32",
     stdio: ["pipe", "pipe", "pipe"],
   });
+  const closed = new Promise<void>((resolve) => { host.once("close", () => resolve()); });
+  const terminateHost = () => killChildTree(host);
   host.stdout.setEncoding("utf8");
   host.stderr.setEncoding("utf8");
   let stderr = "";
@@ -594,11 +651,21 @@ async function spawnPtyBridge(options: {
       for (const listener of exitListeners) listener({ exitCode: code ?? 1 });
     }
   });
+  const abortStartup = () => {
+    rejectStarted(options.signal?.reason ?? new Error("PTY startup cancelled"));
+    terminateHost();
+  };
+  options.signal?.addEventListener("abort", abortStartup, { once: true });
+  if (options.signal?.aborted) abortStartup();
   try {
     await started;
   } catch (error) {
-    host.kill();
+    terminateHost();
+    await closed;
     throw error;
+  } finally {
+    clearTimeout(startupTimeout);
+    options.signal?.removeEventListener("abort", abortStartup);
   }
 
   const send = (message: Record<string, unknown>) => {
@@ -606,6 +673,7 @@ async function spawnPtyBridge(options: {
   };
   return {
     pid: ptyPid,
+    closed,
     onData(listener) {
       dataListeners.add(listener);
       for (const data of pendingData.splice(0)) listener(data);
@@ -625,7 +693,7 @@ async function spawnPtyBridge(options: {
     kill() {
       send({ type: "kill" });
       setTimeout(() => {
-        if (!host.killed) host.kill();
+        if (host.exitCode === null && host.signalCode === null) terminateHost();
       }, 250).unref();
     },
   };
@@ -648,6 +716,8 @@ const reserved = new Set([
 const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !reserved.has(key)));
 const emit = (event) => process.stdout.write(JSON.stringify(event) + "\n");
 let terminal;
+process.on("exit", () => { try { terminal?.kill("SIGKILL"); } catch {} });
+process.on("SIGTERM", () => { try { terminal?.kill("SIGKILL"); } catch {} process.exit(0); });
 try {
   terminal = spawn(process.env.TNB_PTY_FILE, args, {
     name: "xterm-256color",
@@ -666,12 +736,15 @@ terminal.onExit(({ exitCode }) => {
   emit({ type: "exit", exitCode });
   setTimeout(() => process.exit(0), 20);
 });
-readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", (line) => {
+readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("close", () => {
+  try { terminal.kill("SIGKILL"); } catch {}
+  setTimeout(() => process.exit(0), 100);
+}).on("line", (line) => {
   try {
     const message = JSON.parse(line);
     if (message.type === "write") terminal.write(Buffer.from(message.data, "base64").toString("utf8"));
     else if (message.type === "resize") terminal.resize(message.cols, message.rows);
-    else if (message.type === "kill") terminal.kill();
+    else if (message.type === "kill") terminal.kill("SIGKILL");
   } catch (error) {
     emit({ type: "error", message: error instanceof Error ? error.message : String(error) });
   }
@@ -704,12 +777,27 @@ function formatCommandOutput(stdout: string, stderr: string): string {
 function childExit(child: ChildProcessWithoutNullStreams): Promise<number> {
   return new Promise((resolve, reject) => {
     child.once("error", reject);
-    child.once("exit", (code, signal) => resolve(code ?? (signal === "SIGTERM" ? 143 : 1)));
+    child.once("close", (code, signal) => resolve(code ?? (signal === "SIGTERM" ? 143 : 1)));
   });
 }
 
 function killChildTree(child: ChildProcessWithoutNullStreams): void {
   if (!child.pid) return;
+  if (!terminations.has(child)) {
+    const timer = setTimeout(() => {
+      terminations.delete(child);
+      // A group member can keep inherited pipes open after the leader exits.
+      // On Unix, close (which clears this timer) is the drain boundary.
+      if (platform() === "win32" && (child.exitCode !== null || child.signalCode !== null)) return;
+      try {
+        if (platform() === "win32") child.kill("SIGKILL");
+        else process.kill(-child.pid!, "SIGKILL");
+      } catch { try { child.kill("SIGKILL"); } catch { /* Already gone. */ } }
+    }, 250);
+    timer.unref();
+    terminations.set(child, timer);
+    child.once("close", () => { clearTimeout(timer); terminations.delete(child); });
+  }
   try {
     if (platform() === "win32") child.kill();
     else process.kill(-child.pid, "SIGTERM");
@@ -721,6 +809,8 @@ function killChildTree(child: ChildProcessWithoutNullStreams): void {
     }
   }
 }
+
+const terminations = new WeakMap<ChildProcessWithoutNullStreams, ReturnType<typeof setTimeout>>();
 
 function positiveDimension(value: number | undefined, fallback: number | undefined, name: string): number {
   const resolved = value ?? fallback;

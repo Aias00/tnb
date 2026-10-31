@@ -79,6 +79,17 @@ discovery in `getSandboxAvailability` describes the backend, not proof that
 host namespace/OS policy permits it to launch. A launch probe alone also does
 not prove confinement.
 
+Closing the shell runtime cancels pending probes and startups, blocks new
+commands, and waits for managed foreground/background processes and PTY
+bridges to exit. Probe cancellation waits for process close. Commands that
+ignore SIGTERM are forcefully stopped after a 250 ms grace period. PTY helper
+exit or input EOF also terminates its terminal child.
+
+`tests/integration/macos-shell-lifecycle.test.ts` checks these lifecycle paths
+on macOS, including real Seatbelt file restrictions for foreground, background
+and PTY execution, cancellation of a live launch probe, terminal exit, and
+commands that ignore SIGTERM. Current local verification targets macOS.
+
 `tests/integration/sandbox-native.test.ts` executes real processes. It checks
 successful workspace writes, denied writes by a descendant outside grants,
 the platform's `.env` behavior, and an open-versus-blocked loopback connection.
