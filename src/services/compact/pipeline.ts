@@ -6,6 +6,7 @@ import {
   type CompactConversationResult,
 } from "./compact";
 import type { SessionMemoryStore } from "./session-memory";
+import { findSafeHistoryBoundary } from "../../core/history";
 
 const PRUNED_RESULT = "[Earlier tool result pruned from active context]";
 
@@ -22,6 +23,7 @@ export async function compactConversationPipeline(options: CompactConversationOp
   keepRecentToolResults?: number;
   minimumToolResultChars?: number;
   force?: boolean;
+  historyRevision?: number;
 }): Promise<CompactPipelineResult> {
   const original = structuredClone(options.messages);
   const preTokens = estimateConversationTokens(original);
@@ -33,7 +35,7 @@ export async function compactConversationPipeline(options: CompactConversationOp
   let workingTokens = estimateConversationTokens(working);
 
   if (workingTokens < options.thresholdTokens && options.sessionMemory?.shouldRefresh(working, workingTokens)) {
-    options.sessionMemory.refreshInBackground(working, workingTokens, options.summarize);
+    options.sessionMemory.refreshInBackground(working, workingTokens, options.summarize, options.historyRevision, options.signal);
   }
 
   if (!options.force && (workingTokens < options.thresholdTokens || working.length < 3)) {
@@ -66,7 +68,7 @@ export async function compactConversationPipeline(options: CompactConversationOp
     if (full.compacted) {
       const summary = full.messages[0]?.content[0];
       if (options.sessionMemory && summary?.type === "text") {
-        await options.sessionMemory.save(summary.text.replace(/^Conversation summary:\s*/i, ""), working, workingTokens);
+        await options.sessionMemory.save(summary.text.replace(/^Conversation summary:\s*/i, ""), working, workingTokens, options.historyRevision);
       }
       await options.sessionMemory?.recordCompactionAttempt("full", true);
       return {
@@ -161,7 +163,7 @@ export function collapseOldRounds(
   keepRecentMessages = 8,
 ): { messages: ConversationMessage[]; collapsed: boolean; removed: number } {
   if (messages.length <= keepRecentMessages + 2) return { messages: structuredClone(messages), collapsed: false, removed: 0 };
-  const keepFrom = findSafeUserBoundary(messages, messages.length - keepRecentMessages);
+  const keepFrom = findSafeHistoryBoundary(messages, messages.length - keepRecentMessages);
   if (keepFrom <= 2) return { messages: structuredClone(messages), collapsed: false, removed: 0 };
   const targetTokens = Math.max(1, Math.floor(thresholdTokens * 0.9));
   for (let removeThrough = 2; removeThrough <= keepFrom; removeThrough += 1) {
@@ -192,12 +194,4 @@ function collapsedHistory(messages: ConversationMessage[], removeThrough: number
     { role: "assistant", content: [{ type: "text", text: "I will continue from the retained context." }] },
     ...structuredClone(messages.slice(removeThrough)),
   ];
-}
-
-function findSafeUserBoundary(messages: ConversationMessage[], preferredIndex: number): number {
-  for (let index = Math.max(1, preferredIndex); index < messages.length; index += 1) {
-    const message = messages[index];
-    if (message?.role === "user" && message.content.every((block) => block.type !== "tool-result")) return index;
-  }
-  return messages.length;
 }

@@ -17,6 +17,8 @@ export type SessionMemorySnapshot = {
   toolCallCount: number;
   messageCount: number;
   updatedAt: string;
+  /** Monotonic session-log revision, independent of context size after compaction. */
+  sourceRevision?: number;
   compaction: {
     consecutiveFailures: number;
     lastAttemptAt?: string;
@@ -53,7 +55,7 @@ export class SessionMemoryStore {
       toolCallCount - this.snapshot.toolCallCount >= TOOL_CALLS_BETWEEN_UPDATES;
   }
 
-  async save(summary: string, messages: ConversationMessage[], tokenCount: number): Promise<SessionMemorySnapshot> {
+  async save(summary: string, messages: ConversationMessage[], tokenCount: number, sourceRevision?: number): Promise<SessionMemorySnapshot> {
     const normalized = summary.trim().slice(0, MAX_SNAPSHOT_CHARS);
     if (!normalized) throw new Error("Session Memory summary must not be empty");
     const snapshot: SessionMemorySnapshot = {
@@ -63,6 +65,7 @@ export class SessionMemoryStore {
       toolCallCount: countToolCalls(messages),
       messageCount: messages.length,
       updatedAt: new Date().toISOString(),
+      ...(sourceRevision === undefined ? {} : { sourceRevision }),
       compaction: this.snapshot?.compaction ?? { consecutiveFailures: 0 },
     };
     await this.update((current) => {
@@ -76,11 +79,13 @@ export class SessionMemoryStore {
     messages: ConversationMessage[],
     tokenCount: number,
     summarize: (messages: ConversationMessage[], signal?: AbortSignal) => Promise<string>,
+    sourceRevision?: number,
+    signal?: AbortSignal,
   ): void {
     if (this.refreshTask || !this.shouldRefresh(messages, tokenCount)) return;
     const snapshotMessages = structuredClone(messages);
-    this.refreshTask = summarize(snapshotMessages)
-      .then((summary) => this.save(summary, snapshotMessages, tokenCount))
+    this.refreshTask = summarize(snapshotMessages, signal)
+      .then((summary) => { signal?.throwIfAborted(); return this.save(summary, snapshotMessages, tokenCount, sourceRevision); })
       .then(() => undefined)
       .catch(() => undefined)
       .finally(() => { this.refreshTask = undefined; });
@@ -156,6 +161,9 @@ async function readSnapshot(path: string): Promise<SessionMemorySnapshot | undef
 }
 
 function compareSnapshotProgress(left: SessionMemorySnapshot, right: SessionMemorySnapshot): number {
+  if (left.sourceRevision !== undefined || right.sourceRevision !== undefined) {
+    return (left.sourceRevision ?? -1) - (right.sourceRevision ?? -1);
+  }
   return left.tokenCount - right.tokenCount || left.toolCallCount - right.toolCallCount || left.messageCount - right.messageCount;
 }
 

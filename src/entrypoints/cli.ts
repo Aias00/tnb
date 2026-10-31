@@ -124,6 +124,7 @@ import {
 } from "../services/commands/loader";
 import {
   createEditTool,
+  isolateFileToolReads,
   createGlobTool,
   createGrepTool,
   createReadTool,
@@ -971,6 +972,7 @@ function stripGoalLoopOptions(argv: string[]): string[] {
 }
 
 export async function runCli(options: CliOptions): Promise<number> {
+  let releaseSession: (() => Promise<void>) | undefined;
   let teamSupervisor = options.teamSupervisor;
   let ownsTeamSupervisor = false;
   let mcp: McpConnections | undefined;
@@ -1092,6 +1094,7 @@ export async function runCli(options: CliOptions): Promise<number> {
       });
       if (parsed.sessionId) await assertSessionIdAvailable(configDir, options.cwd, parsed.sessionId);
     }
+    releaseSession = await session.acquireRun();
     if (parsed.sessionName) await session.setTitle(parsed.sessionName);
     pluginToolRuntime = options.pluginToolRuntime ?? new PluginToolRuntimeManager(options.env);
     ownsPluginToolRuntime = options.pluginToolRuntime === undefined;
@@ -1195,7 +1198,7 @@ export async function runCli(options: CliOptions): Promise<number> {
       shellManager.setCwd(workspace.current());
       hooks.setCwd(workspace.current());
     }
-    const history = restoredSession.messages;
+    const history = await session.calls.recover(restoredSession.messages, (message) => session.append([message]));
     const permissionRequestHook = (request: PermissionAskRequest, signal?: AbortSignal) =>
       requestPermissionThroughHooks(hooks, request, signal);
     const hookedAskUser: AskUser | undefined = options.askUser
@@ -1466,7 +1469,11 @@ export async function runCli(options: CliOptions): Promise<number> {
           agentId = member.agentId;
           if (taskId) await taskManager.update(taskId, { status: "in_progress", owner: teammateName });
         }
-        const ordinaryTools = selectAgentTools(baseTools.filter((tool) => !isTeamTool(tool.name)), profile);
+        const ordinaryTools = isolateFileToolReads(
+          selectAgentTools(baseTools.filter((tool) => !isTeamTool(tool.name)), profile), workspace.current,
+          { supportsVision: selection.model.supportsVision, supportsPdf: selection.model.supportsPdf },
+          () => [...workspace.additionalRoots(), ...(memory.enabled ? [memory.directory] : [])],
+        );
         const nestedTools = teamName && teammateName
           ? [
               ...ordinaryTools,
@@ -1524,6 +1531,7 @@ export async function runCli(options: CliOptions): Promise<number> {
                 }),
               } : {}),
               onMessage: (message) => transcript.append(message),
+              callJournal: transcript.calls,
               onStop: async ({ stopHookActive: active, lastAssistantMessage }) => {
                 if (teamName && teammateName) {
                   const inbox = await drainTeamContext(teamManager, teamName, teammateName);
@@ -1544,8 +1552,8 @@ export async function runCli(options: CliOptions): Promise<number> {
                 }
                 return {};
               },
-              authorize: (tool, input, { toolUseId }) =>
-                authorizeToolWithDeniedHook(authorizeAgent, hooks, tool, input, toolUseId, agentSignal),
+              authorize: (tool, input, { toolUseId, preApproved }) =>
+                authorizeToolWithDeniedHook(authorizeAgent, hooks, tool, input, toolUseId, agentSignal, preApproved),
               signal: agentSignal,
               maxTurns: profile.maxTurns ?? DEFAULT_SUBAGENT_MAX_TURNS,
             });
@@ -1629,9 +1637,12 @@ export async function runCli(options: CliOptions): Promise<number> {
               ? agentProfiles.find((profile) => profile.name.toLowerCase() === skill.agent!.toLowerCase())
               : undefined;
             if (skill.agent && !requestedProfile) throw new Error(`Skill ${skill.name} requests unknown agent profile: ${skill.agent}`);
-            const nestedTools = requestedProfile
-              ? selectAgentTools(selectSkillTools(baseTools, skill.allowedTools), requestedProfile)
-              : selectSkillTools(baseTools, skill.allowedTools);
+            const nestedTools = isolateFileToolReads(
+              requestedProfile ? selectAgentTools(selectSkillTools(baseTools, skill.allowedTools), requestedProfile)
+                : selectSkillTools(baseTools, skill.allowedTools), workspace.current,
+              { supportsVision: selection.model.supportsVision, supportsPdf: selection.model.supportsPdf },
+              () => [...workspace.additionalRoots(), ...(memory.enabled ? [memory.directory] : [])],
+            );
             const skillSelection = skill.model
               ? resolveInteractiveModel(providerCatalog, skill.model)
               : selection;
@@ -1699,6 +1710,7 @@ export async function runCli(options: CliOptions): Promise<number> {
                 ].filter(Boolean).join("\n\n"),
                 tools: nestedTools,
                 onMessage: (message) => transcript.append(message),
+                callJournal: transcript.calls,
                 ...(skillHooks ? { beforePrompt: async (submittedPrompt: string | Array<TextBlock | MediaBlock>) => {
                       const text = typeof submittedPrompt === "string"
                         ? submittedPrompt
@@ -1745,7 +1757,7 @@ export async function runCli(options: CliOptions): Promise<number> {
                     ? { feedback: blocked.reason ?? "A SubagentStop hook requested that the skill agent continue." }
                     : {};
                 },
-                authorize: (tool, input, { toolUseId }) =>
+                authorize: (tool, input, { toolUseId, preApproved }) =>
                   authorizeToolWithDeniedHooks(
                     skillPermission,
                     skillHooks ? [skillHooks, hooks] : [hooks],
@@ -1753,6 +1765,7 @@ export async function runCli(options: CliOptions): Promise<number> {
                     input,
                     toolUseId,
                     signal,
+                    preApproved,
                   ),
                 signal,
                 maxTurns: requestedProfile?.maxTurns ?? DEFAULT_SUBAGENT_MAX_TURNS,
@@ -1865,6 +1878,13 @@ export async function runCli(options: CliOptions): Promise<number> {
     if (toolCatalog) {
       toolCatalog.setAuxiliaryTools([createToolSearchTool(toolCatalog)]);
     }
+    const resolveTools = () => {
+      const current = [...availableTools.filter((tool) => !tool.name.startsWith("mcp__")), ...mcp!.tools];
+      const profiled = mainAgentProfile && parsed.tools === undefined
+        ? selectAgentTools(current, mainAgentProfile, { mainThread: true }) : current;
+      const selected = filterCliTools(selectCliTools(profiled, parsed.tools), parsed.allowedTools, parsed.disallowedTools);
+      return parsed.jsonSchema ? [...selected, ...tools.filter((tool) => tool.name === "structured_output")] : selected;
+    };
     const exposedTools = toolCatalog?.listTools() ?? tools;
     hooks.setModelHandlers({
       prompt: createHookModelHandler({ transport, model: selectedModel, tools: [] }),
@@ -1931,9 +1951,11 @@ export async function runCli(options: CliOptions): Promise<number> {
       model: selectedModel,
       prompt: explicitPromptContent ?? expandedCommand?.prompt ?? parsed.prompt,
       ...(options.promptInput ? { promptInput: options.promptInput } : {}),
-      systemPrompt: () => systemPromptFor(toolCatalog?.listTools() ?? exposedTools),
+      systemPrompt: () => systemPromptFor(toolCatalog?.listTools() ?? resolveTools()),
       messages: history,
       tools: exposedTools,
+      resolveTools,
+      callJournal: session.calls,
       ...(toolCatalog ? { toolCatalog } : {}),
       beforePrompt: async (prompt) => {
         const promptText = typeof prompt === "string"
@@ -2017,6 +2039,7 @@ export async function runCli(options: CliOptions): Promise<number> {
           messages,
           thresholdTokens: compactThresholdTokens,
           sessionMemory,
+          historyRevision: session.revision,
           summarize: async (summaryMessages, summarySignal) => {
             await hooks.run("PreCompact", {
               trigger: "auto",
@@ -2055,8 +2078,8 @@ export async function runCli(options: CliOptions): Promise<number> {
           ...(mode.prePlanMode ? { prePlanMode: mode.prePlanMode } : {}),
         });
       },
-      authorize: (tool, input, { toolUseId }) =>
-        authorizeToolWithDeniedHook(checkPermission, hooks, tool, input, toolUseId, options.signal),
+      authorize: (tool, input, { toolUseId, preApproved }) =>
+        authorizeToolWithDeniedHook(checkPermission, hooks, tool, input, toolUseId, options.signal, preApproved),
       ...(mainMaxTurns ? { maxTurns: mainMaxTurns } : {}),
       ...(options.signal ? { signal: options.signal } : {}),
       onToolEvent(event) {
@@ -2148,24 +2171,28 @@ export async function runCli(options: CliOptions): Promise<number> {
     options.stderr.write(`tnb: ${message}\n`);
     return 1;
   } finally {
-    if (ownsTeamSupervisor) await teamSupervisor?.close();
-    if (pluginLifecycle) {
-      try {
-        await pluginLifecycle.stop(activePlugins, ownsPluginToolRuntime);
-      } catch (error) {
-        options.stderr.write(`tnb plugin lifecycle: ${error instanceof Error ? error.message : String(error)}\n`);
+    try {
+      if (ownsTeamSupervisor) await teamSupervisor?.close();
+      if (pluginLifecycle) {
+        try {
+          await pluginLifecycle.stop(activePlugins, ownsPluginToolRuntime);
+        } catch (error) {
+          options.stderr.write(`tnb plugin lifecycle: ${error instanceof Error ? error.message : String(error)}\n`);
+        }
       }
-    }
-    if (ownedHooks) {
-      try {
-        await ownedHooks.end(completed ? "prompt_input_exit" : "other");
-      } catch (error) {
-        options.stderr.write(`tnb hook: ${error instanceof Error ? error.message : String(error)}\n`);
+      if (ownedHooks) {
+        try {
+          await ownedHooks.end(completed ? "prompt_input_exit" : "other");
+        } catch (error) {
+          options.stderr.write(`tnb hook: ${error instanceof Error ? error.message : String(error)}\n`);
+        }
       }
+      if (ownsMcp) await mcp?.close();
+      await Promise.all([...lspManagers.values()].map((manager) => manager.close()));
+      if (ownsShellManager) await shellManager?.close();
+    } finally {
+      await releaseSession?.();
     }
-    if (ownsMcp) await mcp?.close();
-    await Promise.all([...lspManagers.values()].map((manager) => manager.close()));
-    if (ownsShellManager) await shellManager?.close();
   }
 }
 
@@ -5671,8 +5698,8 @@ function withPermissionDeniedHooks(
   checker: PermissionChecker,
   hooks: () => HookRunner,
 ): PermissionChecker {
-  return async (tool, input, signal) => {
-    const decision = await checker(tool, input, signal);
+  return async (tool, input, signal, context) => {
+    const decision = await checker(tool, input, signal, context);
     if (decision.behavior === "deny") {
       await hooks().run("PermissionDenied", {
         tool_name: tool.name,
@@ -5692,9 +5719,10 @@ async function authorizeToolWithDeniedHook(
   input: unknown,
   toolUseId: string,
   signal?: AbortSignal,
+  preApproved?: boolean,
 ) {
   const policy = policyForTool(tool);
-  const decision = await checker(policy, input, signal);
+  const decision = await checker(policy, input, signal, { preApproved });
   if (decision.behavior === "deny") {
     await hooks.run("PermissionDenied", {
       tool_name: tool.name,
@@ -5713,9 +5741,10 @@ async function authorizeToolWithDeniedHooks(
   input: unknown,
   toolUseId: string,
   signal?: AbortSignal,
+  preApproved?: boolean,
 ) {
   const policy = policyForTool(tool);
-  const decision = await checker(policy, input, signal);
+  const decision = await checker(policy, input, signal, { preApproved });
   if (decision.behavior === "deny") {
     await Promise.all(hookRunners.map((runner) => runner.run("PermissionDenied", {
       tool_name: tool.name,

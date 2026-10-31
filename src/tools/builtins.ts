@@ -1,6 +1,7 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
+import { withFileMutation, atomicWriteText } from "../utils/file-mutation";
 import { defineTool } from "../core/tool";
 import { currentWorkspaceRoot, type WorkspaceRootSource } from "../core/workspace-state";
 import {
@@ -19,6 +20,22 @@ import { isImagePath, isPdfPath, readImage, readPdf } from "./read-media";
 
 export { createGlobTool, createGrepTool } from "./search";
 export { createWebFetchTool } from "./web-fetch";
+
+/** Share execution coordination, but never another agent's read-before-edit receipt. */
+export function isolateFileToolReads(
+  tools: import("../core/tool").AgentTool[],
+  workspaceRoot: WorkspaceRootSource,
+  capabilities: { supportsVision: boolean; supportsPdf: boolean },
+  additionalRoots: () => string[],
+): import("../core/tool").AgentTool[] {
+  const reads = createFileStateCacheWithSizeLimit(READ_FILE_STATE_CACHE_SIZE);
+  const replacements = new Map([
+    ["read", createReadTool(workspaceRoot, capabilities, additionalRoots, reads)],
+    ["write", createWriteTool(workspaceRoot, additionalRoots, reads)],
+    ["edit", createEditTool(workspaceRoot, additionalRoots, reads)],
+  ]);
+  return tools.map((tool) => replacements.get(tool.name) ?? tool);
+}
 
 export function createReadTool(
   workspaceRoot: WorkspaceRootSource,
@@ -122,18 +139,22 @@ export function createWriteTool(
       const root = resolveWorkspaceRoot(currentWorkspaceRoot(workspaceRoot));
       await assertToolPathInsideAllowedRoots(root, path, "write", additionalRoots());
       const target = resolve(root, path);
-      await mkdir(dirname(target), { recursive: true });
-      const existing = await readExistingTextFile(target, signal);
-      if (existing !== undefined) assertFileUnchangedSinceRead(target, existing, readFileState);
-      await writeFile(target, content, { encoding: "utf8", signal });
-      const metadata = await stat(target);
-      readFileState.set(target, {
-        content,
-        timestamp: Math.floor(metadata.mtimeMs),
-        offset: undefined,
-        limit: undefined,
+      return withFileMutation(target, async () => {
+        signal.throwIfAborted();
+        await assertToolPathInsideAllowedRoots(root, path, "write", additionalRoots());
+        await mkdir(dirname(target), { recursive: true });
+        const existing = await readExistingTextFile(target, signal);
+        if (existing !== undefined) assertFileUnchangedSinceRead(target, existing, readFileState);
+        await atomicWriteText(target, content, signal);
+        const metadata = await stat(target);
+        readFileState.set(target, {
+          content,
+          timestamp: Math.floor(metadata.mtimeMs),
+          offset: undefined,
+          limit: undefined,
+        });
+        return `Wrote ${Buffer.byteLength(content, "utf8")} bytes to ${path}`;
       });
-      return `Wrote ${Buffer.byteLength(content, "utf8")} bytes to ${path}`;
     },
   });
 }
@@ -187,30 +208,31 @@ export function createEditTool(
       const root = resolveWorkspaceRoot(currentWorkspaceRoot(workspaceRoot));
       await assertToolPathInsideAllowedRoots(root, path, "write", additionalRoots());
       const target = resolve(root, path);
-      const content = await readFile(target, { encoding: "utf8", signal });
-      assertFileUnchangedSinceRead(target, content, readFileState);
-      const first = content.indexOf(oldText);
-      if (first < 0) throw new Error("edit target text was not found");
-      const second = content.indexOf(oldText, first + oldText.length);
-      if (!replaceAll && second >= 0) {
-        throw new Error("edit target text is not unique");
-      }
-      const matches = replaceAll ? countOccurrences(content, oldText) : 1;
-      const updated = replaceAll
-        ? content.split(oldText).join(newText)
-        : `${content.slice(0, first)}${newText}${content.slice(first + oldText.length)}`;
-      await writeFile(target, updated, {
-        encoding: "utf8",
-        signal,
+      return withFileMutation(target, async () => {
+        signal.throwIfAborted();
+        await assertToolPathInsideAllowedRoots(root, path, "write", additionalRoots());
+        const content = await readFile(target, { encoding: "utf8", signal });
+        assertFileUnchangedSinceRead(target, content, readFileState);
+        const first = content.indexOf(oldText);
+        if (first < 0) throw new Error("edit target text was not found");
+        const second = content.indexOf(oldText, first + oldText.length);
+        if (!replaceAll && second >= 0) {
+          throw new Error("edit target text is not unique");
+        }
+        const matches = replaceAll ? countOccurrences(content, oldText) : 1;
+        const updated = replaceAll
+          ? content.split(oldText).join(newText)
+          : `${content.slice(0, first)}${newText}${content.slice(first + oldText.length)}`;
+        await atomicWriteText(target, updated, signal);
+        const metadata = await stat(target);
+        readFileState.set(target, {
+          content: updated,
+          timestamp: Math.floor(metadata.mtimeMs),
+          offset: undefined,
+          limit: undefined,
+        });
+        return replaceAll ? `Edited ${path}: replaced ${matches} occurrences` : `Edited ${path}`;
       });
-      const metadata = await stat(target);
-      readFileState.set(target, {
-        content: updated,
-        timestamp: Math.floor(metadata.mtimeMs),
-        offset: undefined,
-        limit: undefined,
-      });
-      return replaceAll ? `Edited ${path}: replaced ${matches} occurrences` : `Edited ${path}`;
     },
   });
 }

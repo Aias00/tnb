@@ -59,7 +59,10 @@ an explicit `false` disables sandboxing for the process.
 The default policy follows Qoder's process-sandbox model: commands can read and
 write the active workspace, temporary files, and common Bun/npm cache paths;
 system executables and libraries are readable; writes elsewhere are denied.
-Workspace `.env` files remain unreadable and unwritable by sandboxed commands.
+The macOS Seatbelt backend explicitly denies workspace `.env` files. The Linux
+workspace bind does not currently implement the same filename-based exclusion;
+Windows reports best-effort confinement. These are separate platform guarantees,
+not interchangeable implementations of sensitive-file protection.
 Set `networkAccess` to `false` to deny network access from tools while retaining
 normal Provider connectivity in tnb itself.
 

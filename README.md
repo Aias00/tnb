@@ -6,6 +6,14 @@ This repository uses public documentation and authorized implementation referenc
 
 The implementation selectively studies mature coding-agent implementations, including the MIT-licensed [Pi](https://github.com/earendil-works/pi), without taking a runtime dependency on an entire agent framework. Only the small capabilities required by tnb are implemented in this repository. See [docs/architecture-reference.md](docs/architecture-reference.md) for the boundary.
 
+## Runtime hardening
+
+The local runtime adds mandatory permission checks after hooks, balanced
+compaction and truncation handling, coordinated file edits, request-owned tool
+snapshots, per-run task identities, and conservative journal-based recovery.
+See [runtime lifecycle and recovery](docs/architecture-reference.md#runtime-lifecycle-and-recovery)
+for the source comparison, behavior changes and implementation boundaries.
+
 ## Current milestone
 
 The current vertical slice includes:

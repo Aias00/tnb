@@ -48,6 +48,7 @@ export type PermissionChecker = (
   tool: ToolPolicy,
   input: unknown,
   signal?: AbortSignal,
+  context?: { preApproved?: boolean },
 ) => Promise<PermissionDecision>;
 
 export type PermissionOptions = {
@@ -133,6 +134,11 @@ export function evaluatePermission(
     };
   }
 
+  const mode = options.getMode?.() ?? resolvePermissionMode(options).mode;
+  if (mode === "plan" && !tool.isReadOnly(input)) {
+    return { behavior: "deny", message: `${tool.name} is unavailable in plan mode` };
+  }
+
   const askedBy = findMatchingRule(options.rules?.ask, tool.name, content, "ask");
   if (askedBy) {
     return {
@@ -142,14 +148,13 @@ export function evaluatePermission(
     };
   }
 
-  const mode = options.getMode?.() ?? resolvePermissionMode(options).mode;
   const effectiveMode = mode;
   if (tool.requiresApproval?.(input)) {
     return { behavior: "ask", message: `${tool.name} requires approval` };
   }
   if (effectiveMode === "bypassPermissions") return { behavior: "allow" };
 
-  if (tool.isReadOnly(input) && effectiveMode !== "plan") {
+  if (tool.isReadOnly(input)) {
     return { behavior: "allow" };
   }
 
@@ -192,18 +197,22 @@ export function createPermissionChecker(
   options: PermissionOptions,
 ): PermissionChecker {
   const sessionAllowRules = options.sessionAllowRules ?? [];
-  return async (tool, input, signal) => {
+  return async (tool, input, signal, context) => {
     signal?.throwIfAborted();
     const result = evaluatePermission(options, tool, input);
     if (result.behavior === "allow") return { behavior: "allow" };
     if (result.behavior === "deny") {
       return { behavior: "deny", message: result.message };
     }
+    if (context?.preApproved && !result.rule && !tool.requiresApproval?.(input) &&
+      !isDangerousAutoEditPath(options, tool, input)) return { behavior: "allow" };
     const suggestedRule = result.rule || tool.requiresApproval?.(input)
       ? undefined
       : permissionRuleFor(tool, input);
     if (
       !result.rule &&
+      !tool.requiresApproval?.(input) &&
+      !isDangerousAutoEditPath(options, tool, input) &&
       sessionAllowRules.length > 0 &&
       findMatchingRule(
         sessionAllowRules,
@@ -227,6 +236,13 @@ export function createPermissionChecker(
     );
     signal?.throwIfAborted();
     if (hookDecision?.behavior === "allow" || hookDecision?.behavior === "deny") {
+      if (hookDecision.behavior === "allow" && hookDecision.updatedInput !== undefined) {
+        const updated = evaluatePermission(options, tool, hookDecision.updatedInput);
+        if (updated.behavior === "deny") return { behavior: "deny", message: updated.message };
+        if (updated.behavior === "ask" && updated.rule && updated.rule !== result.rule) {
+          return { behavior: "deny", message: "Updated input requires a new approval" };
+        }
+      }
       return hookDecision;
     }
     if (options.onAsk) {

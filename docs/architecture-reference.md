@@ -44,13 +44,63 @@ These are candidates, not commitments. Event subscriptions, RPC mode, tree sessi
 4. Add tree branching only if it becomes a concrete product requirement.
 5. Keep Write, Edit, and Bash behind tnb permission and workspace policies.
 
+## Runtime lifecycle and recovery
+
+The local runtime hardening follows the fixed source comparison used in
+[AI Coding Agent 设计与实现](https://aias00.github.io/coding-agent-book/):
+
+| Reference mechanism | tnb adaptation |
+| --- | --- |
+| DeepSeek ordered policy and monotonic restrictions | PreToolUse approval is a hint to the ordinary permission checker; deny, explicit ask and mandatory approvals remain effective. |
+| Codex request-owned tool context | Capture executable tools per model request; refresh MCP definitions at the next request boundary. |
+| Pi Durable intent before execution | Persist intended/dispatched/settled call records; recover saved outcomes and block unresolved effects. |
+| Pi file mutation queue | Coordinate canonical file writes across cooperating processes, recheck read receipts under the lock, then atomically replace one file. |
+| DeepSeek activation identity | Give each background task run its own attempt ID and retain a stopping state until its Promise settles. |
+
+`core/tool-runtime.ts` is the shared tool execution boundary used by the main
+loop, Skills and delegated agents. A post-hook or progress observer cannot
+rewrite a successful execution into a failed action. The call journal saves
+the execution result before running the post-hook, then can save its finalized
+model-facing content. Storage-barrier failures stop the loop.
+
+Main sessions have a separate whole-run lock in addition to short append
+locks. Calls are journaled under the project `calls/` directory; subagent
+journals sit beside their transcript with a `.calls` suffix. Invocation UUIDs
+and a normalized history digest distinguish repeated provider tool IDs. The
+records include original and normalized arguments, so they use private file
+permissions. A completed journal outcome can repair a missing transcript
+result without executing the action again. A dispatched call with no outcome,
+including an interrupted legacy transcript with no journal, blocks automatic
+resume and retains the original call for effect reconciliation. This does not
+provide external exactly-once transactions or a general reconciliation UI.
+
+File replacement provides atomic visibility for one file and preserves its
+ordinary mode bits. It does not preserve every ACL, extended attribute or hard
+link relationship, serialize non-cooperating editors, or provide a multi-file
+transaction. Each delegated agent has independent read-before-edit receipts.
+
+Full compaction validates paired tool history, successful summary termination
+and a smaller complete replacement. Truncated model output retains safe text
+but never parses or dispatches unfinished tool arguments. Session Memory uses
+session-log source revisions when provided by the runtime, so a newer compact
+history is not rejected merely because its token count decreased; late
+background summaries cannot replace a newer revision.
+
+The deterministic hardening tests cover actual local file effects, journal
+failure barriers, lost transcript results, stop/restart ownership, policy
+composition and MCP refresh during a model request. Real model task quality,
+platform sandbox enforcement, shared cross-agent billing ceilings and complete
+execution-target authorization remain separate work; this change does not
+claim those guarantees.
+
 ## Session storage
 
 Session persistence uses one JSON record per conversation message under a
 project-scoped directory. Project IDs are derived from the canonical workspace
-path, so symlinked paths resolve to the same session directory. Reads reject
-malformed complete records; only an unterminated final record is ignored,
-because it is the recoverable failure mode produced by an interrupted append.
+path, so symlinked paths resolve to the same session directory. Conversation JSONL recovery retains independently valid records; the tool
+call journal rejects malformed complete lifecycle records. Missing results are
+reconciled against the journal before model execution, rather than deleting
+possibly executed tool intents.
 
 Compaction is represented by a `compact_boundary` record containing the full
 replacement message state and pre/post rough token estimates. Session reads

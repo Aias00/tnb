@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
-import { appendFile, mkdir, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, open, readFile, readdir, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 
 import type { ConversationMessage } from "../../core/message";
@@ -10,9 +10,10 @@ import { addUsage, EMPTY_USAGE, type UsageTotals } from "../usage/cost";
 import { PERMISSION_MODES, type PermissionMode } from "../../core/permissions";
 import { registerCleanup } from "../../utils/cleanup-registry";
 import { parseJsonl } from "../../utils/jsonl";
-import { withFileLock } from "../../utils/lockfile";
+import { lock, withFileLock } from "../../utils/lockfile";
 import type { PersistedPromptInput, PromptHistoryEntry, StoredPastedContent } from "../../core/prompt-input";
 import { PromptPasteStore } from "./prompt-paste-store";
+import { CallJournal } from "./call-journal";
 
 const sessionWriteQueues = new Map<string, Promise<void>>();
 const pendingSessionWrites = new Set<Promise<void>>();
@@ -103,14 +104,27 @@ export type SessionInfo = {
 };
 
 export class SessionStore {
+  revision = 0;
   readonly sessionId: string;
   readonly projectDir: string;
   readonly filePath: string;
+  readonly calls: CallJournal;
 
   constructor(options: SessionStoreOptions) {
     this.sessionId = validateSessionId(options.sessionId);
     this.projectDir = options.projectDir ?? projectSessionDirectory(options.configDir, options.cwd);
     this.filePath = join(this.projectDir, `${this.sessionId}.jsonl`);
+    this.calls = new CallJournal(join(this.projectDir, "calls", `${this.sessionId}.jsonl`));
+  }
+
+  /** Whole-run ownership is separate from short append locks. */
+  async acquireRun(): Promise<() => Promise<void>> {
+    await mkdir(this.projectDir, { recursive: true });
+    const target = `${this.filePath}.owner`;
+    const file = await open(target, "a", 0o600);
+    await file.close();
+    try { return await lock(target, { realpath: false, retries: 0 }); }
+    catch (error) { throw new Error(`Session ${this.sessionId} already has an active runner`, { cause: error }); }
   }
 
   async append(messages: ConversationMessage[]): Promise<void> {
@@ -248,7 +262,9 @@ export class SessionStore {
     let strategicIntent: string | undefined;
     let parentSessionId: string | undefined;
 
-    for (const value of parseJsonl<unknown>(text)) {
+    const records = parseJsonl<unknown>(text);
+    this.revision = records.length;
+    for (const value of records) {
       if (!isSessionRecord(value) || value.sessionId !== this.sessionId) continue;
       if (value.type === "compact_boundary") {
         messages.splice(0, messages.length, ...structuredClone(value.messages));
@@ -374,6 +390,7 @@ export class SessionStore {
       await withFileLock(this.filePath, () =>
         appendFile(this.filePath, payload, { encoding: "utf8", mode: 0o600 })
       );
+      this.revision += records.length;
     });
   }
 

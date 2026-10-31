@@ -1,5 +1,6 @@
 import type { ConversationMessage } from "../../core/message";
 import type { ModelTransport } from "../../providers/types";
+import { assertBalancedToolHistory, findSafeHistoryBoundary } from "../../core/history";
 
 export type CompactConversationOptions = {
   messages: ConversationMessage[];
@@ -43,6 +44,7 @@ export function createTransportSummarizer(options: {
       ],
     };
     let text = "";
+    let completed = false;
     for await (const event of options.transport.stream(
       {
         model: options.model,
@@ -52,10 +54,12 @@ export function createTransportSummarizer(options: {
       signal,
     )) {
       if (event.type === "text") text += event.text;
+      if (event.type === "response-end") completed = event.reason === "end-turn" || event.reason === "stop-sequence";
       if (event.type === "tool-start" || event.type === "tool-input") {
         throw new Error("Conversation summarizer attempted to call a tool");
       }
     }
+    if (!completed) throw new Error("Conversation summarizer did not complete successfully");
     if (!text.trim()) throw new Error("Conversation summarizer returned empty text");
     return text.trim();
   };
@@ -70,7 +74,8 @@ export async function compactConversation(
     return { compacted: false, messages: original, preTokens, postTokens: preTokens };
   }
 
-  const keepFrom = findRecentTurnStart(
+  assertBalancedToolHistory(original);
+  const keepFrom = findSafeHistoryBoundary(
     original,
     Math.max(0, original.length - (options.keepRecentMessages ?? 4)),
   );
@@ -94,20 +99,13 @@ export async function compactConversation(
     },
     ...original.slice(keepFrom),
   ];
+  assertBalancedToolHistory(messages);
+  const postTokens = estimateConversationTokens(messages);
+  if (postTokens >= preTokens) throw new Error("Compaction replacement must be smaller than its source history");
   return {
     compacted: true,
     messages,
     preTokens,
-    postTokens: estimateConversationTokens(messages),
+    postTokens,
   };
-}
-
-function findRecentTurnStart(
-  messages: ConversationMessage[],
-  preferredIndex: number,
-): number {
-  for (let index = preferredIndex; index < messages.length; index += 1) {
-    if (messages[index]?.role === "user") return index;
-  }
-  return messages.length;
 }

@@ -56,3 +56,9 @@ agent ID and restores its isolated transcript.
 Run `/agents` to inspect all active definitions and parse failures. Run
 `/agents <name>` for one definition's resolved settings. The main model invokes
 the selected profile through the `agent` tool's `subagent_type` field.
+
+Background task cancellation reports `stopping` while the old invocation drains;
+a restart is rejected until that invocation settles. Each run has an independent
+attempt ID, so an old completion cannot settle its successor. Interrupted tool
+intents remain in child transcripts. Resume reuses journaled results or stops
+with an unknown-effect error when the prior action cannot be established.

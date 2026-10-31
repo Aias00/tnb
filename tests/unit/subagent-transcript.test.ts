@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { appendFile, mkdtemp, rm } from "node:fs/promises";
+import { appendFile, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -9,7 +9,7 @@ const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
 
 describe("subagent transcript recovery", () => {
-  test("restores completed history and removes an interrupted trailing tool call", async () => {
+  test("preserves an interrupted tool intent and blocks unsafe transcript recovery", async () => {
     const root = await mkdtemp(join(tmpdir(), "tnb-subagent-"));
     roots.push(root);
     const transcript = new SubagentTranscript({ projectDir: root, sessionId: "session", agentId: "agent" });
@@ -19,10 +19,8 @@ describe("subagent transcript recovery", () => {
       { type: "tool-use", id: "tool-1", name: "read", input: { path: "src/main.ts" } },
     ] });
 
-    expect(await transcript.read()).toEqual([
-      { role: "user", content: [{ type: "text", text: "inspect the project" }] },
-      { role: "assistant", content: [{ type: "text", text: "I found the target." }] },
-    ]);
+    await expect(transcript.read()).rejects.toThrow("outcome unknown");
+    expect(await readFile(transcript.filePath, "utf8")).toContain('"tool-use"');
   });
 
   test("ignores only an unterminated crash tail and rejects malformed complete records", async () => {
