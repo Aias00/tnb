@@ -1120,6 +1120,7 @@ export async function runCli(options: CliOptions): Promise<number> {
     await pluginLifecycle.start(activePlugins);
     usageBudget = new UsageBudget({
       ...(parsed.maxBudgetUsd !== undefined ? { maxCostUsd: parsed.maxBudgetUsd } : {}),
+      maxConcurrentRequests: positiveInteger(options.env.TNB_MAX_CONCURRENT_MODEL_REQUESTS, "TNB_MAX_CONCURRENT_MODEL_REQUESTS"),
       onUsage: (record) => session.appendUsage(record),
     });
     const budget = usageBudget;

@@ -84,7 +84,7 @@ for (const delegated of ["agent", "skill"] as const) {
     } };
     let error = "";
     expect(await runCli({ argv: ["-p", "review", "--max-budget-usd", "0.01", "--yolo"],
-      cwd, configDir, env: {}, sessionIdFactory: () => "budget-fixture", transport,
+      cwd, configDir, env: { TNB_MAX_CONCURRENT_MODEL_REQUESTS: "1" }, sessionIdFactory: () => "budget-fixture", transport,
       stdout: { write() {} }, stderr: { write(value) { error += value; } },
     })).toBe(1);
     expect(requests).toBe(2);

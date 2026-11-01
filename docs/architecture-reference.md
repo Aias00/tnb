@@ -159,6 +159,16 @@ This is not a prepaid hard cap: concurrent requests already sent can overshoot,
 Providers may omit final usage after cancellation, and configured prices may
 differ from an invoice. No paid Provider calls are required by the tests.
 
+The same `UsageBudget` admits at most four model streams concurrently and
+queues at most 64 more in FIFO order. `TNB_MAX_CONCURRENT_MODEL_REQUESTS`
+overrides the active-stream limit. All wrapped routes share admission, including
+children, Skills, Hooks, compaction, memory, and MCP sampling. Stream completion,
+failure, or consumer return releases the slot before tool execution, preventing
+delegation from waiting on a slot held by its parent. Caller and invocation
+cancellation remove queued requests without dispatch; close joins queued and
+running calls. Background leases retain the original invocation's limiter.
+This is an invocation limit, not an account-wide or process-wide rate limit.
+
 ToolRuntime passes a clone to authorization and executes only normalized
 arguments or an explicit validated `updatedInput`. Built-in read/write/edit
 tools bind canonical workspace and approved roots before approval; shell
@@ -315,12 +325,29 @@ files are removed before the tool returns.
 
 ## Shell execution boundary
 
+Text reads use bounded positional I/O: 64 KiB by default, at most 1 MiB plus
+three bytes to finish a UTF-8 character. Byte offsets avoid scanning a large
+prefix to locate a line. A partial result includes continuation metadata and
+cannot become a whole-file read receipt; pages are not automatically combined
+across potentially changing versions. Complete reads retain exact content for
+read-before-edit validation. Existing-file mutation rechecks through the same
+bounded reader and refuses files over 1 MiB, including files enlarged after a
+valid receipt. Binary/invalid UTF-8 pages are refused.
+
 Shell execution follows the mature split between blocking commands,
 non-interactive background tasks, and persistent PTY sessions. Foreground
 commands use the two-minute default and ten-minute maximum timeout. Background
 tasks return a stable task id, retain the latest 160,000 characters for model
-inspection, and stream the complete output to a session-owned log with a 5 GiB
-hard cap. The manager terminates unfinished tasks when its CLI/TUI owner exits.
+inspection. Foreground stdout, stderr and progress buffers each keep at most
+160,000 characters. Both modes write a capped prefix to a private session-owned
+log (8 MiB per command, 64 MiB per manager lifetime); disk backpressure pauses
+the corresponding pipe. Quota exhaustion continues draining the process and
+reports a truncated log, preserving the command's actual exit status. Disk
+errors are reported without presenting a completed effect as a logging failure
+that should be retried. Background line buffers are bounded even without newlines.
+The manager terminates unfinished tasks when its CLI/TUI owner exits. Limits
+are per manager lifetime; retained logs from earlier runs are not automatically
+deleted. PTY screen rendering uses its existing independent limits.
 
 PTY sessions use the established defaults of 160 columns, 50 rows, an 800 ms
 maximum wait, a 120 ms idle window, at most ten sessions, and a 30-minute

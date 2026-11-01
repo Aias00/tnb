@@ -1,8 +1,9 @@
-import { createWriteStream, realpathSync, type WriteStream } from "node:fs";
+import { realpathSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { platform } from "node:os";
 import { join } from "node:path";
 import { spawn as spawnChild, type ChildProcessWithoutNullStreams } from "node:child_process";
+import type { Readable } from "node:stream";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
@@ -11,6 +12,7 @@ import { resolveShellInvocation } from "../../core/shell-permissions";
 import type { SandboxRuntime } from "../sandbox/macos";
 import { probeSandboxRuntime } from "../sandbox/probe";
 import type { ToolProgressReporter } from "../../core/tool";
+import { MAX_RUNTIME_LOG_BYTES, ShellOutputLog } from "./output";
 
 export const DEFAULT_BASH_TIMEOUT_MS = 120_000;
 export const MAX_BASH_TIMEOUT_MS = 600_000;
@@ -22,7 +24,6 @@ export const MAX_PTY_SESSIONS = 10;
 export const PTY_SESSION_TTL_MS = 1_800_000;
 
 const TASK_OUTPUT_CHARS = 160_000;
-const MAX_TASK_OUTPUT_BYTES = 5 * 1024 * 1024 * 1024;
 
 export type ShellTaskStatus = "running" | "completed" | "failed" | "killed";
 
@@ -34,6 +35,9 @@ export type ShellTaskSnapshot = {
   exitCode?: number;
   output: string;
   outputPath: string;
+  outputTruncated?: boolean;
+  logTruncated?: boolean;
+  logError?: string;
 };
 
 export type PtySnapshot = {
@@ -60,7 +64,7 @@ type BackgroundTask = {
   output: string;
   outputBytes: number;
   outputPath: string;
-  writer: WriteStream;
+  log: ShellOutputLog;
   result: Promise<void>;
   lineBuffer: string;
   onStdoutLine?: (line: string) => void;
@@ -125,6 +129,7 @@ export class ShellSessionManager {
   #closing: Promise<void> | undefined;
   #pendingPtys = 0;
   #targetRevision = 0;
+  #logBytes = 0;
   get targetRevision(): number { return this.#targetRevision; }
 
   constructor(options: {
@@ -167,31 +172,46 @@ export class ShellSessionManager {
     signal.throwIfAborted();
     await this.#ensureSandbox(cwd);
     signal.throwIfAborted();
-    const child = this.#spawnChild(command, cwd);
+    await mkdir(this.#outputDir, { recursive: true });
+    const log = await this.#createLog(`foreground_${randomUUID()}`);
+    if (signal.aborted) { await log.finish(); signal.throwIfAborted(); }
+    let child: ChildProcessWithoutNullStreams;
+    try { child = this.#spawnChild(command, cwd); }
+    catch (error) { await log.finish(); throw error; }
     let stdout = "";
     let stderr = "";
     let liveOutput = "";
+    let totalBytes = 0;
+    let totalLines = 0;
+    let truncated = false;
     const startedAt = Date.now();
     const report = () => onProgress?.({
       output: liveOutput,
       fullOutput: liveOutput,
       elapsedTimeSeconds: Math.max(0, Math.floor((Date.now() - startedAt) / 1000)),
-      totalLines: countOutputLines(liveOutput),
-      totalBytes: Buffer.byteLength(liveOutput, "utf8"),
+      totalLines: totalLines + (liveOutput && !liveOutput.endsWith("\n") ? 1 : 0),
+      totalBytes,
       timeoutMs,
     });
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
-      liveOutput += chunk;
+      stdout = (stdout + chunk).slice(-TASK_OUTPUT_CHARS);
+      append(chunk, child.stdout);
       report();
     });
     child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-      liveOutput += chunk;
+      stderr = (stderr + chunk).slice(-TASK_OUTPUT_CHARS);
+      append(chunk, child.stderr);
       report();
     });
+    function append(chunk: string, source: Readable) {
+      totalBytes += Buffer.byteLength(chunk, "utf8");
+      totalLines += (chunk.match(/\n/g) ?? []).length;
+      truncated ||= liveOutput.length + chunk.length > TASK_OUTPUT_CHARS;
+      liveOutput = (liveOutput + chunk).slice(-TASK_OUTPUT_CHARS);
+      log.append(chunk, source);
+    }
     const progressTimer = onProgress ? setInterval(report, 1_000) : undefined;
     progressTimer?.unref?.();
 
@@ -205,15 +225,19 @@ export class ShellSessionManager {
     if (signal.aborted) abort();
     try {
       const exitCode = await childExit(child);
+      await log.finish();
       if (signal.aborted) throw signal.reason ?? new Error("Command was interrupted");
       if (timedOut) throw new Error(`Command timed out after ${timeoutMs}ms`);
-      const output = formatCommandOutput(stdout, stderr);
+      const notice = truncated || log.truncated || log.error
+        ? `\n[Output preview truncated: ${truncated}. Log: ${log.path}. ${log.error ? `Log write failed: ${log.error}.` : log.truncated ? "Log quota reached; only a prefix was saved." : "Complete output saved."}]` : "";
+      const output = formatCommandOutput(stdout, stderr) + notice;
       if (exitCode !== 0) throw new Error(output || `Command exited with code ${exitCode}`);
       return output || "Command completed successfully with no output";
     } finally {
       clearTimeout(timeout);
       if (progressTimer) clearInterval(progressTimer);
       signal.removeEventListener("abort", abort);
+      await log.finish();
     }
   }
 
@@ -230,9 +254,12 @@ export class ShellSessionManager {
     await this.#ensureSandbox(cwd);
     options.signal?.throwIfAborted();
     const id = `${options.kind ?? "bash"}_${randomUUID().slice(0, 8)}`;
-    const outputPath = join(this.#outputDir, `${id}.log`);
-    const writer = createWriteStream(outputPath, { flags: "a", encoding: "utf8" });
-    const child = this.#spawnChild(command, cwd);
+    const log = await this.#createLog(id);
+    if (options.signal?.aborted) { await log.finish(); options.signal.throwIfAborted(); }
+    let child: ChildProcessWithoutNullStreams;
+    try { child = this.#spawnChild(command, cwd); }
+    catch (error) { await log.finish(); throw error; }
+    const exited = childExit(child);
     const task: BackgroundTask = {
       id,
       pid: child.pid ?? 0,
@@ -241,15 +268,15 @@ export class ShellSessionManager {
       status: "running",
       output: "",
       outputBytes: 0,
-      outputPath,
-      writer,
+      outputPath: log.path,
+      log,
       result: Promise.resolve(),
       lineBuffer: "",
       ...(options.onStdoutLine ? { onStdoutLine: options.onStdoutLine } : {}),
       ...(options.onExit ? { onExit: options.onExit } : {}),
     };
     if (!task.pid) {
-      writer.end();
+      await exited.finally(() => log.finish());
       throw new Error("Background command did not expose a process id");
     }
     this.#tasks.set(id, task);
@@ -259,13 +286,22 @@ export class ShellSessionManager {
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => this.#appendTaskOutput(task, chunk, true));
     child.stderr.on("data", (chunk: string) => this.#appendTaskOutput(task, chunk));
-    task.result = childExit(child).then((exitCode) => {
-      if (task.lineBuffer) task.onStdoutLine?.(task.lineBuffer);
-      task.lineBuffer = "";
+    task.result = exited.then(async (exitCode) => {
+      await log.finish();
       task.exitCode = exitCode;
       task.status = task.status === "killed" ? "killed" : exitCode === 0 ? "completed" : "failed";
-      task.onExit?.(task.status, exitCode);
-      writer.end();
+      const reportObserverError = (error: unknown) => {
+        task.output = `${task.output}\n[Task observer failed: ${error instanceof Error ? error.message : String(error)}]`.slice(-TASK_OUTPUT_CHARS);
+      };
+      try { if (task.lineBuffer) task.onStdoutLine?.(task.lineBuffer); }
+      catch (error) { reportObserverError(error); }
+      task.lineBuffer = "";
+      try { task.onExit?.(task.status, exitCode); }
+      catch (error) { reportObserverError(error); }
+    }).catch(async (error: Error) => {
+      await log.finish();
+      task.status = "failed";
+      task.output = `${task.output}\n${error.message}`.slice(-TASK_OUTPUT_CHARS);
     });
     return snapshotTask(task);
   }
@@ -477,18 +513,21 @@ export class ShellSessionManager {
 
   #appendTaskOutput(task: BackgroundTask, chunk: string, notify = false): void {
     task.outputBytes += Buffer.byteLength(chunk, "utf8");
-    if (task.outputBytes > MAX_TASK_OUTPUT_BYTES) {
-      task.status = "killed";
-      killChildTree(task.process);
-      return;
-    }
-    task.writer.write(chunk);
+    task.log.append(chunk, notify ? task.process.stdout : task.process.stderr);
     task.output = `${task.output}${chunk}`.slice(-TASK_OUTPUT_CHARS);
     if (notify && task.onStdoutLine) {
       const lines = `${task.lineBuffer}${chunk}`.split(/\r?\n/);
-      task.lineBuffer = lines.pop() ?? "";
+      task.lineBuffer = (lines.pop() ?? "").slice(-TASK_OUTPUT_CHARS);
       for (const line of lines) if (line.trim()) task.onStdoutLine(line);
     }
+  }
+
+  async #createLog(id: string): Promise<ShellOutputLog> {
+    return ShellOutputLog.create(join(this.#outputDir, `${id}.log`), (requested) => {
+      const bytes = Math.min(requested, MAX_RUNTIME_LOG_BYTES - this.#logBytes);
+      this.#logBytes += bytes;
+      return bytes;
+    });
   }
 
   #requireTask(idOrPid: string | number): BackgroundTask {
@@ -552,12 +591,6 @@ export class ShellSessionManager {
       screen: screen.join("\n"),
     };
   }
-}
-
-function countOutputLines(output: string): number {
-  if (!output) return 0;
-  const lines = output.split(/\r?\n/);
-  return output.endsWith("\n") ? lines.length - 1 : lines.length;
 }
 
 async function spawnPtyBridge(options: {
@@ -767,6 +800,9 @@ function snapshotTask(task: BackgroundTask): ShellTaskSnapshot {
     ...(task.exitCode === undefined ? {} : { exitCode: task.exitCode }),
     output: task.output,
     outputPath: task.outputPath,
+    outputTruncated: task.outputBytes > Buffer.byteLength(task.output, "utf8"),
+    logTruncated: task.log.truncated,
+    ...(task.log.error ? { logError: task.log.error } : {}),
   };
 }
 

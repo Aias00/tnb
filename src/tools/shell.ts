@@ -305,6 +305,9 @@ function formatTask(task: ShellTaskSnapshot): string {
     `status: ${task.status}`,
     ...(task.exitCode === undefined ? [] : [`exit_code: ${task.exitCode}`]),
     `output_file: ${task.outputPath}`,
+    ...(task.outputTruncated ? ["output_truncated: true (showing recent output)"] : []),
+    ...(task.logTruncated ? ["log_truncated: true (log quota reached; only a prefix was saved)"] : []),
+    ...(task.logError ? [`log_error: ${task.logError}`] : []),
   ];
   return `${header.join("\n")}\n\n${task.output.trim() || "(no output yet)"}`;
 }

@@ -370,15 +370,35 @@ The `grep` and `glob` tools call the local `rg` executable, respect workspace
 ignore files, and cap returned results. Install [ripgrep](https://github.com/BurntSushi/ripgrep)
 and ensure `rg` is available on `PATH` before using them.
 
+Text `read` defaults to 64 KiB per call. Use `offset` (UTF-8 byte offset) and
+`limit` (up to 1 MiB) to continue; follow the returned next offset to avoid
+splitting characters. Partial pages do not authorize mutation. Existing files
+need one complete read from offset 0 before `edit`/`write`; these tools refuse
+existing files larger than 1 MiB rather than loading them without a bound.
+Use an explicitly authorized alternative workflow for larger edits.
+
 The `bash` tool supports three execution modes. Foreground commands default to
 a two-minute timeout and may request up to ten minutes. `run_in_background`
 returns a task id that can be inspected with `bash_output` or stopped with
-`bash_kill`; full output is persisted under the current session's task
-directory while the model receives the latest 160,000 characters. `pty=true`
+`bash_kill`. Foreground and background output use bounded previews and logs
+under the current session's task directory. Background previews retain the
+latest 160,000 characters; foreground stdout/stderr previews each retain at
+most that many. Logs save up to 8 MiB per command and 64 MiB per shell manager
+lifetime. Further output is drained and discarded from the log without killing
+the command; truncation and log errors are reported with the log path. Earlier
+logs remain on disk across restarts; this is not a disk retention policy. `pty=true`
 starts a persistent 160x50 terminal for interactive commands. Use
 `bash_input`, `bash_output`, and `bash_resize` with the returned PID. A CLI or
 TUI session owns these processes and terminates any still running when the
 session exits.
+
+Main, delegated, Skill, Hook, compaction, memory, and MCP sampling model
+requests share an invocation limit of four active streams and 64 queued
+requests. Set `TNB_MAX_CONCURRENT_MODEL_REQUESTS` to a positive integer to
+change the active limit. Queued requests cancel with their caller; the slot
+is released when the model stream ends, before executing tools. Background
+activations retain their originating invocation's limit. Separate invocations
+and processes have independent limits.
 
 PTY mode requires a `node` executable on `PATH` (or `TNB_NODE_PATH`) for
 the native `@lydell/node-pty` host. tnb uses this small host because the

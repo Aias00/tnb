@@ -3,6 +3,8 @@ import { addUsage, calculateCostUsd, EMPTY_USAGE, type ModelPricing, type UsageT
 
 export type BillingRoute = { provider: string; model: string; pricing?: ModelPricing };
 export type UsageRecord = { provider: string; model: string; usage: TokenUsage; costUsd: number };
+export const DEFAULT_MAX_CONCURRENT_MODEL_REQUESTS = 4;
+const MAX_PENDING_MODEL_REQUESTS = 64;
 
 /** One invocation owns this ledger, including all delegated and maintenance requests.
  * The ceiling stops admission on reported spend, not on estimated/prepaid spend.
@@ -14,13 +16,19 @@ export class UsageBudget {
   #totals: UsageTotals = { ...EMPTY_USAGE };
   #closed = false;
   #finished = false;
+  #running = 0;
+  readonly #waiting = new Set<() => void>();
 
   constructor(readonly options: {
     maxCostUsd?: number;
+    maxConcurrentRequests?: number;
     onUsage?(record: UsageRecord): Promise<void>;
   } = {}) {
     if (options.maxCostUsd !== undefined && (!Number.isFinite(options.maxCostUsd) || options.maxCostUsd <= 0)) {
       throw new Error("Budget must be a positive finite dollar amount");
+    }
+    if (options.maxConcurrentRequests !== undefined && (!Number.isSafeInteger(options.maxConcurrentRequests) || options.maxConcurrentRequests <= 0)) {
+      throw new Error("Model request concurrency must be a positive integer");
     }
   }
 
@@ -57,7 +65,11 @@ export class UsageBudget {
         let finish!: () => void;
         const active = new Promise<void>((resolve) => { finish = resolve; });
         budget.#active.add(active);
+        let release: (() => void) | undefined;
         try {
+          const admission = budget.#admit(combined);
+          release = typeof admission === "function" ? admission : await admission;
+          combined.throwIfAborted();
           for await (const event of transport.stream(request, combined)) {
             if (event.type !== "usage") { combined.throwIfAborted(); yield event; continue; }
             // Factory attribution is per physical route, including concurrent fallback calls.
@@ -78,6 +90,7 @@ export class UsageBudget {
           }
           combined.throwIfAborted();
         } finally {
+          release?.();
           budget.#active.delete(active);
           finish();
         }
@@ -95,5 +108,41 @@ export class UsageBudget {
     if (this.options.maxCostUsd !== undefined && !route.pricing) {
       throw new Error(`--max-budget-usd requires pricing for ${route.provider}/${route.model}`);
     }
+  }
+
+  // Slots cover stream lifetime, never tool execution or the surrounding agent run.
+  // Every wrapped route shares this queue, including maintenance and background work.
+  #admit(signal: AbortSignal): (() => void) | Promise<() => void> {
+    signal.throwIfAborted();
+    if (this.#running < (this.options.maxConcurrentRequests ?? DEFAULT_MAX_CONCURRENT_MODEL_REQUESTS)) {
+      return this.#takeSlot();
+    }
+    if (this.#waiting.size >= MAX_PENDING_MODEL_REQUESTS) throw new Error("Model request queue is full (64 pending requests)");
+    return new Promise((resolve, reject) => {
+      const grant = () => {
+        this.#waiting.delete(grant);
+        signal.removeEventListener("abort", cancel);
+        resolve(this.#takeSlot());
+      };
+      const cancel = () => {
+        this.#waiting.delete(grant);
+        signal.removeEventListener("abort", cancel);
+        reject(signal.reason);
+      };
+      this.#waiting.add(grant);
+      signal.addEventListener("abort", cancel, { once: true });
+      if (signal.aborted) cancel();
+    });
+  }
+
+  #takeSlot(): () => void {
+    this.#running++;
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.#running--;
+      this.#waiting.values().next().value?.();
+    };
   }
 }

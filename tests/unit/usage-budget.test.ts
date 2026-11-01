@@ -11,6 +11,63 @@ const route = { provider: "fixture", model: "primary", pricing: { input: 1, outp
 async function drain(transport: ModelTransport) { for await (const _ of transport.stream(request)) {} }
 const response = (...events: ModelEvent[]): ModelTransport => ({ async *stream() { yield* events; } });
 
+test("root, child and maintenance routes share FIFO request slots, released on return and failure", async () => {
+  const budget = new UsageBudget({ maxConcurrentRequests: 1 });
+  const entered: string[] = [];
+  const transport = (name: string, fail = false) => budget.wrap({ async *stream() {
+    entered.push(name);
+    yield { type: "text", index: 0, text: name };
+    if (fail) throw new Error("fixture stream failure");
+  } }, () => route);
+  const root = transport("root").stream(request);
+  await root.next();
+  const child = transport("child", true).stream(request);
+  const childNext = child.next();
+  const summary = transport("summary").stream(request);
+  const summaryNext = summary.next();
+  expect(entered).toEqual(["root"]);
+  await root.return(undefined);
+  await childNext;
+  expect(entered).toEqual(["root", "child"]);
+  await expect(child.next()).rejects.toThrow("fixture stream failure");
+  await summaryNext;
+  expect(entered).toEqual(["root", "child", "summary"]);
+  await summary.return(undefined);
+  await drain(transport("next turn"));
+  await budget.close();
+});
+
+test("queued requests cancel before dispatch and close drains pending requests", async () => {
+  const budget = new UsageBudget({ maxConcurrentRequests: 1 });
+  let dispatched = 0;
+  const transport = budget.wrap({ async *stream(_, signal) {
+    dispatched++;
+    await new Promise<void>((resolve) => signal!.addEventListener("abort", () => resolve(), { once: true }));
+  } }, () => route);
+  const active = drain(transport).catch((e: Error) => e.message);
+  const abort = new AbortController();
+  const queued = (async () => { for await (const _ of transport.stream(request, abort.signal)) {} })().catch((e: Error) => e.message);
+  abort.abort(new Error("cancel queued"));
+  expect(await queued).toBe("cancel queued");
+  const remaining = drain(transport).catch((e: Error) => e.message);
+  await budget.close();
+  expect(await active).toBe("Invocation ended");
+  expect(await remaining).toBe("Invocation ended");
+  expect(dispatched).toBe(1);
+});
+
+test("request admission bounds the waiting queue and rejects invalid concurrency", async () => {
+  expect(() => new UsageBudget({ maxConcurrentRequests: 0 })).toThrow("positive integer");
+  const budget = new UsageBudget({ maxConcurrentRequests: 1 });
+  const transport = budget.wrap({ async *stream(_, signal) {
+    await new Promise<void>((resolve) => signal!.addEventListener("abort", () => resolve(), { once: true }));
+  } }, () => route);
+  const pending = Array.from({ length: 65 }, () => drain(transport).catch(() => undefined));
+  await expect(drain(transport)).rejects.toThrow("queue is full");
+  await budget.close();
+  await Promise.all(pending);
+});
+
 test("shared ledger stops new child and summary requests and persists the crossing usage", async () => {
   const records: UsageRecord[] = [];
   const budget = new UsageBudget({ maxCostUsd: 2, onUsage: async (record) => { records.push(record); } });

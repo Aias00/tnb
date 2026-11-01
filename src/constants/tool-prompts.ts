@@ -5,6 +5,7 @@ Usage:
 - The path may be absolute or relative to the workspace, but it must resolve inside the workspace after symlinks are evaluated.
 - Read a file before proposing or applying changes to it. Do not guess at code you have not inspected.
 - This tool reads files, not directories. Use glob to discover files or bash for directory metadata when necessary.
+- UTF-8 text defaults to a 64 KiB page. Set offset (zero-based byte offset) and limit (1 to 1048576 bytes) to page through large files. Use the returned next offset to preserve UTF-8 boundaries; a page may extend by up to 3 bytes to finish a character. Partial views are labeled and do not grant read-before-edit/write permission. A complete read from byte 0 is required for mutation; files larger than 1 MiB need another explicitly authorized editing workflow.
 - Supported images are PNG, JPEG, GIF, and WebP. Image bytes are validated and delivered to the model as an image rather than encoded text.
 - PDFs of up to 10 pages and 20 MiB can be read directly. For a larger or targeted PDF, pass pages as a page number or inclusive range such as "1-5". A range may contain at most 20 pages and requires Poppler's pdftoppm executable.
 - Empty files return empty content. Missing files, directories, unsupported binary data, malformed media, and paths outside the workspace return errors.
@@ -58,6 +59,7 @@ Instructions:
 - Quote paths containing spaces. Prefer workspace-relative paths and avoid unnecessary cd commands.
 - Use && when later commands depend on earlier success. Use separate tool calls for independent commands.
 - Foreground commands default to a two-minute timeout and may request up to ten minutes. Background commands keep running until completion, bash_kill, or CLI shutdown.
+- Large output returns a bounded preview and a local log path. Logs retain up to 8 MiB per command and 64 MiB across this shell runtime. Quota exhaustion discards further log bytes while the command continues; truncation or logging errors are explicitly reported. Do not rerun an already completed command merely to recover truncated output.
 - run_in_background returns a task_id. Use bash_output to inspect it and bash_kill to stop it; do not add a trailing &.
 - pty=true returns a PID and an initial rendered screen. Use bash_input, bash_output, and bash_resize for subsequent interaction.
 - For ordinary PTY text submission, send chars and submit=true in one bash_input call. Use escaped key sequences only for navigation or control keys.

@@ -1,4 +1,4 @@
-import { mkdir, readFile, stat } from "node:fs/promises";
+import { mkdir, stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
 import { withFileMutation, atomicWriteText } from "../utils/file-mutation";
@@ -17,6 +17,8 @@ import {
   type FileStateCache,
 } from "../utils/file-state-cache";
 import { isImagePath, isPdfPath, readImage, readPdf } from "./read-media";
+import { DEFAULT_TEXT_READ_BYTES, MAX_TEXT_READ_BYTES, readTextPage } from "./read-text";
+import { DEFAULT_BASH_TIMEOUT_MS, ShellSessionManager } from "../services/shell/manager";
 
 export { createGlobTool, createGrepTool } from "./search";
 export { createWebFetchTool } from "./web-fetch";
@@ -64,6 +66,8 @@ export function createReadTool(
           type: "string",
           description: "Optional PDF page number or inclusive range such as 1-5; maximum 20 pages.",
         },
+        offset: { type: "integer", minimum: 0, description: "UTF-8 byte offset for text (default 0). Use the returned next offset." },
+        limit: { type: "integer", minimum: 1, maximum: MAX_TEXT_READ_BYTES, description: "Text page bytes (default 65536; maximum 1048576). May extend by up to 3 bytes to finish a UTF-8 character." },
       },
       ["path"],
     ),
@@ -79,15 +83,27 @@ export function createReadTool(
       if (value.pages !== undefined && (typeof value.pages !== "string" || !value.pages.trim())) {
         throw new Error("read pages must be a non-empty string");
       }
+      for (const name of ["offset", "limit"] as const) {
+        const number = value[name];
+        if (number !== undefined && (typeof number !== "number" || !Number.isSafeInteger(number) || number < (name === "offset" ? 0 : 1)
+          || number > (name === "offset" ? Number.MAX_SAFE_INTEGER - MAX_TEXT_READ_BYTES - 4 : MAX_TEXT_READ_BYTES))) {
+          throw new Error(`read ${name} must be a valid ${name === "offset" ? "non-negative byte offset" : "page size between 1 and 1048576"}`);
+        }
+      }
       return {
         path: value.path,
         ...(typeof value.pages === "string" ? { pages: value.pages } : {}),
+        ...(typeof value.offset === "number" ? { offset: value.offset } : {}),
+        ...(typeof value.limit === "number" ? { limit: value.limit } : {}),
       };
     },
-    async execute({ path, pages }, signal) {
+    async execute({ path, pages, offset, limit }, signal) {
       const root = resolveWorkspaceRoot(currentWorkspaceRoot(workspaceRoot));
       await assertToolPathInsideAllowedRoots(root, path, "read", additionalRoots());
       const target = resolve(root, path);
+      if ((isImagePath(target) || isPdfPath(target)) && (offset !== undefined || limit !== undefined)) {
+        throw new Error("read offset and limit are only valid for text files");
+      }
       if (isImagePath(target)) {
         if (pages !== undefined) throw new Error("read pages is only valid for PDF files");
         if (!capabilities.supportsVision) {
@@ -97,15 +113,17 @@ export function createReadTool(
       }
       if (isPdfPath(target)) return readPdf(target, path, pages, signal, capabilities);
       if (pages !== undefined) throw new Error("read pages is only valid for PDF files");
-      const content = await readFile(target, { encoding: "utf8", signal });
-      const metadata = await stat(target);
+      const page = await readTextPage(target, offset ?? 0, limit ?? DEFAULT_TEXT_READ_BYTES, signal);
       readFileState.set(target, {
-        content,
-        timestamp: Math.floor(metadata.mtimeMs),
-        offset: undefined,
-        limit: undefined,
+        content: page.content,
+        timestamp: page.timestamp,
+        offset: page.complete ? undefined : offset ?? 0,
+        limit: page.complete ? undefined : limit ?? DEFAULT_TEXT_READ_BYTES,
+        isPartialView: !page.complete,
       });
-      return content;
+      if (page.complete) return page.content;
+      const continuation = page.nextOffset < page.size ? `Next offset: ${page.nextOffset}.` : "End of file.";
+      return `[Partial file view: bytes ${offset ?? 0}-${page.nextOffset} of ${page.size}. ${continuation} Partial reads do not authorize edit/write.]\n${page.content}`;
     },
   });
 }
@@ -226,7 +244,8 @@ export function createEditTool(
       return withFileMutation(target, async () => {
         signal.throwIfAborted();
         await assertToolPathInsideAllowedRoots(root, path, "write", additionalRoots());
-        const content = await readFile(target, { encoding: "utf8", signal });
+        const content = await readExistingTextFile(target, signal);
+        if (content === undefined) throw new Error("edit target file does not exist");
         assertFileUnchangedSinceRead(target, content, readFileState);
         const first = content.indexOf(oldText);
         if (first < 0) throw new Error("edit target text was not found");
@@ -254,7 +273,9 @@ export function createEditTool(
 
 async function readExistingTextFile(target: string, signal: AbortSignal): Promise<string | undefined> {
   try {
-    return await readFile(target, { encoding: "utf8", signal });
+    const page = await readTextPage(target, 0, MAX_TEXT_READ_BYTES, signal);
+    if (!page.complete || page.size > MAX_TEXT_READ_BYTES) throw new Error("File exceeds the 1 MiB mutation limit; use an explicitly authorized editing workflow");
+    return page.content;
   } catch (error) {
     if (isMissingFile(error)) return undefined;
     throw error;
@@ -309,20 +330,9 @@ export function createBashTool(workspaceRoot: string) {
       return { command: value.command };
     },
     async execute({ command }, signal) {
-      const process = Bun.spawn(["/bin/sh", "-lc", command], {
-        cwd: root,
-        stdout: "pipe",
-        stderr: "pipe",
-        signal,
-      });
-      const [stdout, stderr, exitCode] = await Promise.all([
-        new Response(process.stdout).text(),
-        new Response(process.stderr).text(),
-        process.exited,
-      ]);
-      const output = [stdout, stderr].filter(Boolean).join("");
-      if (exitCode !== 0) throw new Error(output || `Command exited with code ${exitCode}`);
-      return output || "Command completed successfully";
+      const manager = new ShellSessionManager({ cwd: root, outputDir: resolve(root, ".tnb", "shell") });
+      try { return await manager.runForeground(command, DEFAULT_BASH_TIMEOUT_MS, signal); }
+      finally { await manager.close(); }
     },
   });
 }
