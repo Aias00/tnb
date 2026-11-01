@@ -90,3 +90,9 @@ Transcript and journal appends preserve a torn final record in a private
 tool result repair an interrupted transcript without merging it into broken
 JSON. Journal lifecycle or result-ID corruption blocks recovery and further
 execution; an interrupted effect still requires reconciliation.
+
+Automatic recovery also requires the exact history scope written by the Agent
+loop. Unscoped legacy records are preserved but do not authorize replaying an
+old result for a current call. Reused Provider IDs across completed rounds
+remain supported; duplicate IDs within an unfinished round are rejected before
+any recovery result is written.

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 import type { ConversationMessage } from "../../core/message";
@@ -55,7 +55,8 @@ export class SessionMemoryStore {
       toolCallCount - this.snapshot.toolCallCount >= TOOL_CALLS_BETWEEN_UPDATES;
   }
 
-  async save(summary: string, messages: ConversationMessage[], tokenCount: number, sourceRevision?: number): Promise<SessionMemorySnapshot> {
+  async save(summary: string, messages: ConversationMessage[], tokenCount: number, sourceRevision?: number, signal?: AbortSignal): Promise<SessionMemorySnapshot> {
+    signal?.throwIfAborted();
     const normalized = summary.trim().slice(0, MAX_SNAPSHOT_CHARS);
     if (!normalized) throw new Error("Session Memory summary must not be empty");
     const snapshot: SessionMemorySnapshot = {
@@ -71,7 +72,7 @@ export class SessionMemoryStore {
     await this.update((current) => {
       if (current && compareSnapshotProgress(current, snapshot) > 0) return current;
       return { ...snapshot, compaction: current?.compaction ?? snapshot.compaction };
-    });
+    }, signal);
     return this.current()!;
   }
 
@@ -85,7 +86,7 @@ export class SessionMemoryStore {
     if (this.refreshTask || !this.shouldRefresh(messages, tokenCount)) return;
     const snapshotMessages = structuredClone(messages);
     this.refreshTask = summarize(snapshotMessages, signal)
-      .then((summary) => { signal?.throwIfAborted(); return this.save(summary, snapshotMessages, tokenCount, sourceRevision); })
+      .then((summary) => { signal?.throwIfAborted(); return this.save(summary, snapshotMessages, tokenCount, sourceRevision, signal); })
       .then(() => undefined)
       .catch(() => undefined)
       .finally(() => { this.refreshTask = undefined; });
@@ -126,14 +127,22 @@ export class SessionMemoryStore {
     ].join("\n");
   }
 
-  private async update(operation: (current: SessionMemorySnapshot | undefined) => SessionMemorySnapshot): Promise<void> {
+  private async update(operation: (current: SessionMemorySnapshot | undefined) => SessionMemorySnapshot, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     await withFileLock(this.filePath, async () => {
+      signal?.throwIfAborted();
       const current = await readSnapshot(this.filePath);
+      signal?.throwIfAborted();
       const snapshot = operation(current);
       await mkdir(dirname(this.filePath), { recursive: true });
       const temporary = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
-      await writeFile(temporary, `${JSON.stringify(snapshot, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-      await rename(temporary, this.filePath);
+      try {
+        await writeFile(temporary, `${JSON.stringify(snapshot, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx", signal });
+        signal?.throwIfAborted();
+        await rename(temporary, this.filePath);
+      } finally {
+        await unlink(temporary).catch((error) => { if (!isMissing(error)) throw error; });
+      }
       this.snapshot = snapshot;
     });
   }

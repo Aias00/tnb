@@ -1212,7 +1212,7 @@ describe("tnb print mode", () => {
     const exitCode = await runCli({
       argv: ["-p", "Say hello", "--model", "test-model"],
       env: {},
-      cwd: process.cwd(),
+      cwd: await workspace(),
       configDir: await workspace(),
       stdout: { write: (text) => void (stdout += text) },
       stderr: { write: () => undefined },
@@ -1548,7 +1548,7 @@ describe("tnb print mode", () => {
       await runCli({
         argv: ["-p", "search", "--model", "test"],
         env: { BRAVE_SEARCH_API_KEY: "search-key" },
-        cwd: process.cwd(),
+        cwd: await workspace(),
         configDir: await workspace(),
         stdout: { write: () => undefined },
         stderr: { write: () => undefined },
@@ -1563,7 +1563,7 @@ describe("tnb print mode", () => {
     const exitCode = await runCli({
       argv: ["-p", "hello"],
       env: {},
-      cwd: process.cwd(),
+      cwd: await workspace(),
       configDir: await workspace(),
       stdout: { write: () => undefined },
       stderr: { write: (text) => void (stderr += text) },

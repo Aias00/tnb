@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { open, type FileHandle } from "node:fs/promises";
 import type { JournalOutcome, ToolCallJournal } from "../../core/call-journal";
 import { toolCallScope } from "../../core/call-journal";
+import { assertBalancedToolHistory } from "../../core/history";
 import type { ConversationMessage, ToolUseBlock } from "../../core/message";
 import { withFileLock } from "../../utils/lockfile";
 import { appendJsonl, readExactly } from "../../utils/jsonl-append";
@@ -45,11 +46,17 @@ export class CallJournal implements ToolCallJournal {
     if (tail?.role !== "assistant") return messages;
     const calls = tail.content.filter((block): block is ToolUseBlock => block.type === "tool-use");
     if (!calls.length) return messages;
+    assertBalancedToolHistory(messages.slice(0, -1));
+    const ids = new Set<string>();
+    for (const call of calls) {
+      if (!call.id || ids.has(call.id)) throw new Error(`Duplicate or empty recovered tool call ID: ${call.id}`);
+      ids.add(call.id);
+    }
     const intents = new Map<string, CallRecord>();
     const states = new Map<string, CallRecord>();
     const scope = toolCallScope(messages);
     for (const record of records) {
-      if (record.call && (record.scope === undefined || record.scope === scope)) intents.set(record.call.id, record);
+      if (record.call && record.scope === scope) intents.set(record.call.id, record);
       states.set(record.invocationId, record);
     }
     const content: Extract<ConversationMessage, { role: "user" }>["content"] = [];
@@ -65,8 +72,10 @@ export class CallJournal implements ToolCallJournal {
       content.push(state.outcome.result, ...state.outcome.attachments);
     }
     const recovered: ConversationMessage = { role: "user", content: structuredClone(content) };
+    const result = [...messages, recovered];
+    assertBalancedToolHistory(result);
     await append(recovered);
-    return [...messages, recovered];
+    return result;
   }
 
   private async read(): Promise<CallRecord[]> {

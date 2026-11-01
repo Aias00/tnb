@@ -90,6 +90,12 @@ calls. Append validation consumes newly appended bytes under the file lock;
 recovery scans the full journal. Ordinary conversation JSONL retains its
 existing policy of recovering independently valid records.
 
+Automatic result recovery requires an exact match to the persisted history
+scope. Legacy unscoped intents remain readable for inspection but cannot
+establish the outcome of a current call, even when its Provider ID and arguments
+match. Duplicate IDs in a pending round and invalid recovered history are
+rejected before appending anything to the transcript.
+
 File replacement provides atomic visibility for one file and preserves its
 ordinary mode bits. It does not preserve every ACL, extended attribute or hard
 link relationship, serialize non-cooperating editors, or provide a multi-file
@@ -228,6 +234,14 @@ replacement, context-collapse removes complete old rounds at safe user-message
 boundaries and leaves an explicit marker rather than retrying an unbounded
 compactor.
 
+Microcompact retains the newest result occurrences rather than treating a
+Provider call ID as globally unique. Pruning thresholds use the tool name
+from that occurrence's round; already pruned markers remain unchanged. Neither
+microcompact nor context-collapse accepts a larger replacement. All pipeline
+paths first validate balanced tool history. When there is no safe retained
+suffix, collapse refuses to erase the entire ongoing task; an unusable full
+summary then produces a bounded error instead of dropping the task context.
+
 The pipeline persists consecutive summarizer failures. Three failures suspend
 full summarization for five minutes while safe context-collapse remains
 available. Provider context-window errors trigger forced compaction inside the
@@ -241,6 +255,11 @@ loaded into the system prompt on later turns and is refreshed from successful
 full compaction summaries. Compact boundaries continue to store the exact
 post-pipeline message state, so resume remains deterministic regardless of the
 strategy selected.
+
+Session Memory carries cancellation through the save operation. It checks
+again after acquiring the file lock and before the rename that commits the
+snapshot, and cleans up temporary files. Cancelling a background summary while
+it waits for another writer cannot make it overwrite the current memory later.
 
 The default threshold follows the model context budget: context window minus up
 to 20,000 summary-output tokens and a 13,000-token automatic-compaction buffer.

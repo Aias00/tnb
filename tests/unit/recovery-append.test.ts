@@ -55,9 +55,11 @@ test("a torn optional final outcome cannot corrupt the next journal invocation",
   const root = await directory(); const journal = new CallJournal(join(root, "calls.jsonl"));
   const id = await journal.intend(call, call.input); await journal.dispatch(id); await journal.settle(id, outcome);
   await appendFile(journal.filePath, '{"version":1,"state":"settled"');
-  const second = { ...call, id: "call-2" }; const next = await journal.intend(second, second.input);
+  const second = { ...call, id: "call-2" };
+  const pending: ConversationMessage[] = [...history.slice(0, -1), { role: "assistant", content: [second] }];
+  const next = await journal.intend(second, second.input, toolCallScope(pending));
   await journal.dispatch(next); await journal.settle(next, { ...outcome, result: { ...outcome.result, toolUseId: second.id } });
-  const restored = await new CallJournal(journal.filePath).recover([...history.slice(0, -1), { role: "assistant", content: [second] }], async () => {});
+  const restored = await new CallJournal(journal.filePath).recover(pending, async () => {});
   expect(restored.at(-1)?.content[0]).toMatchObject({ toolUseId: second.id, content: "saved" });
 });
 
@@ -93,13 +95,14 @@ test("concurrent journal instances share valid append boundaries after a torn ta
   const root = await directory(); const file = join(root, "calls.jsonl");
   await writeFile(file, '{"version":1,"partial":"');
   const journals = [new CallJournal(file), new CallJournal(file)];
+  const pending: ConversationMessage[] = [{ role: "assistant", content: journals.map((_, index) => ({ ...call, id: `call-${index}` })) }];
   await Promise.all(journals.map(async (journal, index) => {
     const invocation = { ...call, id: `call-${index}` };
-    const id = await journal.intend(invocation, invocation.input);
+    const id = await journal.intend(invocation, invocation.input, toolCallScope(pending));
     await journal.dispatch(id);
     await journal.settle(id, { ...outcome, result: { ...outcome.result, toolUseId: invocation.id } });
   }));
-  const restored = await new CallJournal(file).recover([{ role: "assistant", content: journals.map((_, index) => ({ ...call, id: `call-${index}` })) }], async () => {});
+  const restored = await new CallJournal(file).recover(pending, async () => {});
   expect(restored.at(-1)?.content).toHaveLength(2);
   expect((await readdir(root)).filter((name) => name.includes(".torn-"))).toHaveLength(1);
 });
