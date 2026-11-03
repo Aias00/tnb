@@ -1,6 +1,6 @@
 # tnb 长任务运行时与按需 Agent 协作设计
 
-日期：2026-11-03。版本：1.0。状态：已完成文档级审阅与修订，可按 P0 开始实现；实现验收尚未开始。
+日期：2026-11-03。版本：1.1。状态：已完成文档级审阅及层级恢复补充，可按 P0 开始实现；实现验收尚未开始。
 
 审阅基线为 `844f7744c3c8a1961efcbf539b2bc8e155c2d096`，问题与修订见[设计审阅记录](2026-11-03-durable-task-runtime-review.md)。
 
@@ -85,6 +85,7 @@ flowchart TD
 | Task | task_id、run_id、parent_task_id、plan_revision、input_digest、status、current_attempt_id、result_ref | 有明确输入与验收条件的工作 |
 | Attempt | attempt_id、task_id、owner_id、lease_epoch、lease_expires_at、checkpoint_ref、status | 一次可中断的执行；不是业务任务 |
 | AgentSession | agent_session_id、workspace_id、transcript_ref、task 关联 | 可复用上下文；不充当授权或业务状态 |
+| Delegation | parent_task_id、parent_revision、delegation_key、child_task_id、input_digest、created_by_attempt_id | 持久分工关系与找回依据，不以父进程存活为条件 |
 | PlanRevision | run_id、revision、base_revision、tasks、edges、reason、decision_ref | 可审计的 DAG 变更 |
 | Operation | operation_id、task_id、semantic_key、arguments_digest、attempt_id、journal_ref、state、replay_policy | 一个外部效果意图 |
 | Artifact | artifact_id、content_hash、manifest_ref、input_digest、producer_attempt、verification_refs | patch、报告、日志与验收证据 |
@@ -97,6 +98,8 @@ flowchart TD
 所有身份使用 UUID。Provider tool call ID 只做关联，不能当全局主键。operation 的 semantic_key 在同一逻辑操作重试中保持不变；输入变化必须创建新意图，相同 key 不同 arguments_digest 返回冲突。两个合法的相同参数操作也可以有不同业务身份，不能只用参数哈希去重。
 
 核心唯一约束为 `(run_id, task_id)`、`(run_id, sequence)`、`(task_id, semantic_key)`、`(source, external_id)`、`(effect kind, key)`。任务最多有一个非终态 attempt，通过事务内条件更新约束，不能依赖进程内 Map。
+
+委派另有唯一约束 `(parent_task_id, parent_revision, delegation_key)`，在创建子 Task 的同一事务提交；相同 key 不同 input_digest 拒绝。业务归属绑定父 Task revision，created_by_attempt_id 仅记录创建来源，父 attempt 更替不能使原子任务失去归属。
 
 ## 6 任务状态与控制语义
 
@@ -233,6 +236,27 @@ replay_policy 分为 safe、reconcile、never。safe 还需检查当前工具声
 
 旧格式导入尚无充分 evidence 的对象只进入 paused/reconciling，并展示原因。自动导入本身不启动模型或工具；用户显式恢复且相应兼容适配器通过验收后才准入。历史 succeeded 的过期验证不就地改写，而是为新输入建立新 task revision。
 
+### 10.3 各级 Agent 的统一恢复协议
+
+根 Agent、获准的子 Agent、孙级 Agent、fork Skill 的业务执行与跨工作区委派均需关联 Run、Task、Delegation、Attempt、操作日志、上下文 revision 和预算。层级不改变恢复协议，支持的深度受 policy 与 capability 双重约束；不支持的层级或外部执行器明确拒绝，不能接纳后再依赖纯内存状态。维护模型请求按请求级预算/结果记录恢复，不将每次摘要伪装成一个业务子 Agent。
+
+1. 在一个一致性视图中读取任务归属和依赖，检查循环、缺失父节点、Task revision 与输入摘要；异常对象隔离并阻塞，不推测父子关系。
+2. 检查 Root Run 及祖先任务的取消、暂停、授权和 deadline，关闭不再有效的派发。不能因子任务会话还能加载就继续执行已取消业务。
+3. 校验每个 attempt 的实际进程与租约。仍存活且拥有有效执行权的子任务只重新关联，不创建第二 attempt；失效者先排空或隔离，再核对自己的操作和产物。创建新 attempt 前结束已失效的旧 attempt，保留其检查点和证据。
+4. 父恢复时按 Delegation 的稳定 key 找回子 Task：已成功且证据有效则接纳；仍运行则恢复 waiting；已完成但父未消费则补齐结果消费；unknown 则显示核对阻塞。禁止仅因父 attempt_id 改变就重新 spawn。
+5. 子结果消费以 `(parent_task_id, parent_revision, child_task_id, child_result_revision)` 去重，在同一事务记录消费与父等待条件变化。旧父 revision 的结果可以保留，但不得直接满足新输入的依赖；不能因父重启而清空子预算或重新累计旧 usage。
+6. 从仍有效的叶任务开始恢复就绪工作，按已接纳结果唤醒父依赖。父进程自身无须保持运行；调度器负责推进整个持久任务图。多个兄弟任务各自提交，某个分支 unknown 不阻塞与其无依赖关系的分支，但 Run 不能越过必需分支验收。
+
+| 重启范围 | 必须保留的业务状态 | 恢复后的处理 |
+| --- | --- | --- |
+| 仅根/协调执行者重启 | 子任务身份、结果、预算与委派关系 | 找回原子任务及结果，恢复等待或验收 |
+| 仅中间 Agent 重启 | 自己的上级关系、下级关系与未结算操作 | 同时恢复对父的结果提交和对子任务的等待，避免上下两侧重复 |
+| 仅叶 Agent 重启 | 原任务、意图、工作区、输入与调用证据 | 核对后继续、安全重试或阻塞；父保持可解释等待 |
+| 本机 daemon/主机重启 | 整个 Run 的归属、控制意图、队列与账本 | 分类核对所有在途 attempt，已完成分支不重做 |
+| 跨工作区一侧重启 | 双侧 Task 关联、message_id、结果 revision 与接收回执 | 按持久消息与结果协议重投/去重，不把接收 ACK 当任务完成 |
+
+未知副作用、证据损坏、权限撤回或不兼容版本导致的暂停/核对阻塞属于正确恢复结果，不保证无条件自动继续或业务一定成功。P0 验证根/单 Agent，P1 验证获准只读子任务；孙级递归委派只有 capability 启用并通过对应场景后才开放，P3 再验证跨工作区。
+
 ## 11 所有权与容量
 
 第一版单本机 daemon 是唯一调度者；内部异步完成仍可能过期，所以每次结果提交必须校验 task revision、attempt_id 和 lease_epoch。租约只负责控制面所有权，不能阻止任意旧 Shell 写入。
@@ -327,7 +351,7 @@ SQLite 备份使用一致性备份接口，文件产物同步引用清单与内�
 | 阶段 | 交付 | 进入下一阶段的必要条件 |
 | --- | --- | --- |
 | P0 单 Agent 持久执行 | 数据模型、命令、单所有者、独立任务提交、现有 journal bridge、pause/cancel/recovery、产物验收、Run 预算 | macOS 强杀与重启矩阵通过；single 无业务委派；未知效果正确阻塞 |
-| P1 按需只读委派 | 策略提案与准入、子任务身份、上下文压缩一致性、父等待释放执行槽 | 同一任务预算比较；取消后代无泄漏；自动模式可解释且能退回单 Agent |
+| P1 按需只读委派 | 策略提案与准入、子任务身份、上下文压缩一致性、父等待释放执行槽 | T25/T27 的父子恢复通过；开放递归前通过 T26；同一任务预算比较；取消后代无泄漏；自动模式可解释且能退回单 Agent |
 | P2 隔离实现与整合 | worktree、输入版本、资源分配、单一整合、集成验证 | 旧 attempt 不能写入整合工作区；冲突和过期证据正确拒绝 |
 | P3 跨工作区协作 | 持久 inbox/outbox、已授权 workspace 注册、消息唤醒与回复关联 | ACK 前后崩溃不丢已接收工作；重复投递不重复业务效果 |
 
@@ -377,11 +401,14 @@ P0 内部实现顺序：存储与状态机 → journal bridge → 单 worker 恢
 | T22 | 用量重复、累计报告、fallback 与账本提交前后强杀 | 每个物理请求按序计量一次；未知消耗保留，父子不产生双预算 |
 | T23 | Shell/动态工具尝试访问控制 socket、状态库或冒充用户提权 | 控制能力校验与沙箱拒绝；日志不泄漏控制凭据 |
 | T24 | 备份与 GC 并发、日志配额达到阈值、磁盘真实写入失败 | 备份只发布完整 manifest；固定证据不回收；失败不伪报持久成功 |
+| T25 | 父 Agent 单独重启，子任务分别为运行中、成功未消费、unknown | 找回同一 child_task_id；结果只消费一次；不重复 spawn；未知分支保持阻塞 |
+| T26 | 获准的根→子→孙任务图中，仅中间 Agent 或叶 Agent 重启，再整机重启 | 各层关联、预算与检查点保持；已接纳任务不重做；实际深度能力未开放时拒绝该委派 |
+| T27 | 根取消/暂停后子或孙任务延迟提交，或父计划 revision 改变后旧结果到达 | 控制意图逐层生效；旧结果隔离；不唤醒已取消任务或满足新版本依赖 |
 
 每阶段运行必要的类型检查、目标回归、完整 macOS 测试和构建；本轮设计文档本身不构成实现通过。P1 还需要同一任务、相近预算的 single/auto 对比，记录耗时、费用、验收成功率、重复工作和整合失败；不预设多 Agent 一定更优。
 
 ## 20 设计审阅要求
 
-按 I01–I12 和 T01–T24 进行场景审阅。阻断级问题必须修订后才进入相应阶段；不能用“模型会注意”代替状态、事务或准入协议。审阅报告记录基线、问题、影响、修订位置和复查结果；代码实现后仍需独立验证。
+按 I01–I12 和 T01–T27 进行场景审阅。阻断级问题必须修订后才进入相应阶段；不能用“模型会注意”代替状态、事务或准入协议。审阅报告记录基线、问题、影响、修订位置和复查结果；代码实现后仍需独立验证。
 
 首个实施决策采用单机 SQLite、显式持久运行入口和禁止自动并行写入。默认额度等运营参数可在实现评测后调整，不能绕开硬性不变量。跨机器运行与自动发布不在本设计承诺范围内。
