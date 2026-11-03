@@ -124,11 +124,15 @@ export function defaultReadableRoots(
   env: Record<string, string | undefined>,
   host: SandboxHost,
 ): string[] {
-  const roots = new Set<string>([cwd, host.canonicalize(dirname(dirname(host.execPath)))]);
+  const executableDirectory = dirname(host.execPath); const runtimeDirectory = dirname(executableDirectory);
+  const roots = new Set<string>([cwd, host.canonicalize(dirname(runtimeDirectory) === runtimeDirectory ? executableDirectory : runtimeDirectory)]);
   for (const entry of splitPathEntries(env.PATH)) {
     if (!entry.trim()) continue;
     const canonical = host.canonicalize(entry);
-    roots.add(canonical.endsWith("/bin") ? dirname(canonical) : canonical);
+    if (dirname(canonical) === canonical) continue;
+    const parent = dirname(canonical);
+    // /bin must never turn strict read access into a grant for the filesystem root.
+    roots.add(canonical.endsWith("/bin") && parent !== "/" ? parent : canonical);
   }
   for (const path of writableRoots) roots.add(host.canonicalize(path));
   return [...roots];

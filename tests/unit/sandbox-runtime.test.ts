@@ -6,6 +6,7 @@ import {
   createSandboxRuntime,
   getSandboxAvailability,
 } from "../../src/services/sandbox/macos";
+import { defaultReadableRoots } from "../../src/services/sandbox/shared";
 
 function host(overrides: Partial<ReturnType<typeof createSandboxHost>>) {
   const base = createSandboxHost({ PATH: "/usr/bin:/bin" });
@@ -23,6 +24,10 @@ function host(overrides: Partial<ReturnType<typeof createSandboxHost>>) {
 }
 
 describe("sandbox runtime factory", () => {
+  test("system bin paths never expand strict read access to the entire filesystem", () => {
+    const roots = defaultReadableRoots("/workspace", [], { PATH: "/bin:/usr/bin:/" }, host({ execPath: "/bin/bun" }));
+    expect(roots).not.toContain("/"); expect(roots).toContain("/bin"); expect(roots).toContain("/workspace");
+  });
   test("returns undefined when sandbox is disabled", () => {
     expect(createSandboxRuntime({ requested: false, env: {} }, host({ platform: "darwin" }))).toBeUndefined();
   });
