@@ -28,8 +28,8 @@ export function encodeJson(value: unknown, maxBytes = 256 * 1024): string {
   return encoded;
 }
 
-export function digestJson(value: unknown): string {
-  return createHash("sha256").update(encodeJson(value)).digest("hex");
+export function digestJson(value: unknown, maxBytes = 4 * 1024 * 1024): string {
+  return createHash("sha256").update(encodeJson(value, maxBytes)).digest("hex");
 }
 
 export function text(value: string, name: string, maximum = 4096): string {

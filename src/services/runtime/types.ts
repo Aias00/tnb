@@ -33,6 +33,7 @@ export type DurableTask = {
   resumeState?: "ready" | "waiting" | "validating" | "reconciling";
   checkpointRef?: string;
   candidateRef?: string;
+  resultRef?: string;
   error?: string;
   createdAt: number;
   updatedAt: number;
@@ -47,7 +48,9 @@ export type DurableAttempt = {
   status: "active" | "ended";
   createdAt: number;
   endedAt?: number;
+  suspended?: boolean;
 };
+export type RuntimeRecord<T = unknown> = { kind: string; id: string; runId: string; taskId?: string; revision: number; value: T };
 
 export type WorkerIdentity = { attemptId: string; ownerId: string; epoch: number };
 export type RuntimeEvent = { eventId: string; runId: string; sequence: number; commandId: string; type: string; taskId?: string; at: number; data: unknown };
@@ -74,7 +77,7 @@ const TRANSITIONS: Record<TaskStatus, readonly TaskStatus[]> = {
   pending: ["ready", "waiting", "paused", "cancelled"],
   ready: ["running", "waiting", "paused", "cancelled"],
   running: ["waiting", "reconciling", "validating", "paused", "failed"],
-  waiting: ["ready", "validating", "paused", "cancelled", "reconciling"],
+  waiting: ["ready", "running", "validating", "paused", "cancelled", "reconciling"],
   reconciling: ["ready", "validating", "waiting", "paused", "failed", "cancelled"],
   validating: ["succeeded", "ready", "failed", "paused", "reconciling"],
   paused: ["ready", "waiting", "validating", "reconciling", "cancelled"],

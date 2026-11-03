@@ -9,11 +9,11 @@ type Command = { commandId: string };
 type TaskCommand = Command & { taskId: string; expectedRevision: number };
 type RunCommand = Command & { runId: string; expectedRevision: number };
 
-/** Trusted in-process command handlers. IPC authentication and real execution belong to later P0 slices. */
+/** Trusted in-process business commands; the owner supplies authenticated IPC and execution. */
 export class RuntimeCommands {
   constructor(readonly store: RuntimeStore, private readonly clock: () => number = Date.now) {}
 
-  createRun(input: Command & { objective: string; tasks?: TaskDefinition[]; policy?: Partial<ExecutionPolicy>; deadline?: number }): { run: DurableRun; tasks: DurableTask[] } {
+  createRun(input: Command & { objective: string; tasks?: TaskDefinition[]; policy?: Partial<ExecutionPolicy>; deadline?: number; configuration?: unknown }): { run: DurableRun; tasks: DurableTask[] } {
     return this.#command(input, "run.create", (tx) => {
       text(input.objective, "run objective");
       if (input.deadline !== undefined) integer(input.deadline, "run deadline", tx.now + 1);
@@ -21,8 +21,9 @@ export class RuntimeCommands {
       const definitions = input.tasks ?? [{ key: "main", objective: input.objective, inputDigest: digestJson({ objective: input.objective }) }];
       validateGraph(definitions);
       const run: DurableRun = { runId: randomUUID(), objective: input.objective, revision: 1, status: "active", policy,
-        createdAt: tx.now, updatedAt: tx.now, ...(input.deadline === undefined ? {} : { deadline: input.deadline }) };
+        createdAt: tx.now, updatedAt: tx.now, deadline: input.deadline ?? tx.now + 24 * 60 * 60_000 };
       tx.insertRun(run);
+      if (input.configuration !== undefined) tx.saveRecord({ kind: "configuration", id: run.runId, runId: run.runId, value: input.configuration }, 0);
       tx.event(run.runId, "run.created", run);
       const ids = new Map(definitions.map((definition) => [definition.key, randomUUID()]));
       const tasks: DurableTask[] = definitions.map((definition) => ({
@@ -48,8 +49,7 @@ export class RuntimeCommands {
       const run = requireRun(tx, task.runId);
       requireActive(run, tx.now);
       if (task.status !== "ready" || !dependenciesSatisfied(tx, task)) throw new Error("Task is not ready");
-      // P0 supports one business worker per Run, even when a future collaboration preference was saved.
-      if (tx.activeAttempts(run.runId).length >= 1) throw new Error("Single-agent runtime capacity is occupied");
+      if (tx.activeAttempts(run.runId).filter((attempt) => !attempt.suspended).length >= run.policy.maxActiveAgents) throw new Error("Run agent capacity is occupied");
       text(input.ownerId, "attempt owner", 128); integer(input.leaseMs, "attempt lease", 1, 600_000);
       const attempt: DurableAttempt = { attemptId: randomUUID(), taskId: task.taskId, ownerId: input.ownerId,
         epoch: task.epoch + 1, status: "active", leaseExpiresAt: integer(tx.now + input.leaseMs, "attempt expiry"), createdAt: tx.now };
@@ -233,11 +233,12 @@ function schedule(tx: RuntimeTransaction, task: DurableTask): void {
 function control(tx: RuntimeTransaction, run: DurableRun, action: string): void {
   tx.enqueue({ runId: run.runId, kind: "control", key: "run-control", dueAt: tx.now, data: { runId: run.runId, revision: run.revision, action } });
 }
-function wakeWaiting(tx: RuntimeTransaction, run: DurableRun): string[] {
+export function wakeWaiting(tx: RuntimeTransaction, run: DurableRun): string[] {
   if (run.status !== "active" || run.cancelRequestedAt !== undefined || (run.deadline !== undefined && run.deadline <= tx.now)) return [];
   const woken: string[] = [];
   for (const task of tx.tasks(run.runId)) {
     if (task.status !== "waiting" || !dependenciesSatisfied(tx, task)) continue;
+    if (task.currentAttemptId && tx.getAttempt(task.currentAttemptId)?.status === "active") continue;
     const signal = task.wait && tx.getSignal(run.runId, task.wait.kind, task.wait.key);
     if (task.wait ? !signal || signal.generation <= task.wait.afterGeneration : !task.dependsOn.length) continue;
     const previous = task.revision;

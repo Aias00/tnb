@@ -2,6 +2,12 @@ import type { TranscriptEntry } from "./transcript/model";
 
 export const SLASH_COMMANDS = [
   {
+    name: "runtime",
+    aliases: [] as const,
+    usage: "/runtime [list|status|result|events|pause|resume|cancel|storage] [run-id]",
+    description: "Inspect and control durable tasks owned by the local background service.",
+  },
+  {
     name: "help",
     aliases: ["?"] as const,
     usage: "/help",

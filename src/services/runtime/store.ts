@@ -4,7 +4,7 @@ import { chmodSync, closeSync, constants, fstatSync, mkdirSync, openSync } from 
 import { dirname, resolve } from "node:path";
 import { digestJson, encodeJson, integer, text } from "./json";
 import { migrateRuntime } from "./schema";
-import { assertTaskTransition, type DurableAttempt, type DurableRun, type DurableTask, type RuntimeEffect, type RuntimeEvent, type RuntimeSignal } from "./types";
+import { assertTaskTransition, type DurableAttempt, type DurableRun, type DurableTask, type RuntimeEffect, type RuntimeEvent, type RuntimeSignal, type RuntimeRecord } from "./types";
 
 type DataRow = { data: string };
 type EffectRow = {
@@ -43,11 +43,49 @@ export class RuntimeStore {
   }
 
   close(): void { if (!this.#closed) { this.#db.close(); this.#closed = true; } }
+  snapshot(): Uint8Array {
+    return this.#write(() => {
+      // serialize includes committed WAL pages. The standalone image has no WAL/SHM;
+      // use rollback-journal read/write header versions so SQLite can open it independently.
+      const bytes = Buffer.from(this.#db.serialize()); bytes[18] = 1; bytes[19] = 1; return bytes;
+    });
+  }
+  deleteTerminalRun(runId: string): string[] {
+    return this.#write(() => {
+      const run = this.getRun(runId);
+      if (!run || !["succeeded", "failed", "cancelled"].includes(run.status)) throw new Error("Only terminal Runs can be pruned");
+      if (this.#reader().activeAttempts(runId).length || this.operationHeaders(runId).some((row) => row.effectOutcome === "unknown" || row.state === "dispatched")) throw new Error("Run still has unreconciled execution evidence");
+      const taskIds = this.tasks(runId).map((task) => task.taskId);
+      this.#db.query("DELETE FROM task_dependencies WHERE task_id IN (SELECT task_id FROM tasks WHERE run_id = ?)").run(runId);
+      this.#db.query("DELETE FROM attempts WHERE task_id IN (SELECT task_id FROM tasks WHERE run_id = ?)").run(runId);
+      for (const table of ["runtime_records", "effects", "events", "signals"]) this.#db.query(`DELETE FROM ${table} WHERE run_id = ?`).run(runId);
+      // Self-referencing task edges are checked at statement end, so deleting the complete Run is atomic.
+      this.#db.query("DELETE FROM tasks WHERE run_id = ?").run(runId);
+      this.#db.query("DELETE FROM runs WHERE run_id = ?").run(runId);
+      return taskIds;
+    });
+  }
 
   getRun(runId: string): DurableRun | undefined { return this.#reader().getRun(runId); }
+  runs(): DurableRun[] {
+    this.#assertOpen();
+    return (this.#db.query("SELECT data FROM runs ORDER BY rowid").all() as DataRow[]).map((row) => JSON.parse(row.data));
+  }
+  record<T>(kind: string, id: string): RuntimeRecord<T> | undefined { return this.#reader().record<T>(kind, id); }
+  records<T>(kind: string, runId: string, taskId?: string): RuntimeRecord<T>[] { return this.#reader().records<T>(kind, runId, taskId); }
+  operationHeaders(runId: string, taskId?: string): Array<{ id: string; taskId: string; state: string; effectOutcome?: string; name: string }> {
+    this.#assertOpen();
+    const rows = (this.#db.query(`SELECT record_id AS id, task_id AS taskId, json_extract(value,'$.state') AS state,
+      json_extract(value,'$.effectOutcome') AS effectOutcome, json_extract(value,'$.call.name') AS name
+      FROM runtime_records WHERE kind = 'operation' AND run_id = ? AND (? IS NULL OR task_id = ?) ORDER BY rowid LIMIT 10001`)
+      .all(runId, taskId ?? null, taskId ?? null) as Array<{ id: string; taskId: string; state: string; effectOutcome?: string; name: string }>);
+    if (rows.length > 10000) throw new Error("Runtime operation inventory exceeds supported limit");
+    return rows;
+  }
   getTask(taskId: string): DurableTask | undefined { return this.#reader().getTask(taskId); }
   tasks(runId: string): DurableTask[] { return this.#reader().tasks(runId); }
   getAttempt(attemptId: string): DurableAttempt | undefined { return this.#reader().getAttempt(attemptId); }
+  activeAttempts(runId: string): DurableAttempt[] { return this.#reader().activeAttempts(runId); }
   getSignal(runId: string, kind: RuntimeSignal["kind"], key: string): RuntimeSignal | undefined {
     return this.#reader().getSignal(runId, kind, key);
   }
@@ -64,11 +102,27 @@ export class RuntimeStore {
     this.#assertOpen();
     return (this.#db.query("SELECT * FROM effects WHERE run_id = ? ORDER BY sequence").all(runId) as EffectRow[]).map(effectFromRow);
   }
+  /** Only the exclusive service owner may reclaim dispatch leases left by a dead owner. */
+  reclaimEffects(ownerId: string): void {
+    this.#write(() => this.#db.query("UPDATE effects SET lease_token = NULL, lease_owner = NULL, lease_generation = NULL, lease_expires_at = NULL WHERE lease_owner IS NOT NULL AND lease_owner <> ?").run(ownerId));
+  }
+  artifactReferences(): Set<string> {
+    this.#assertOpen(); const references = new Set<string>();
+    for (const query of ["SELECT data AS value FROM tasks", "SELECT data AS value FROM events", "SELECT value FROM runtime_records"]) {
+      for (const row of this.#db.query(query).iterate() as Iterable<{ value: string }>) {
+        for (const match of row.value.matchAll(/[a-f0-9]{64}/g)) references.add(match[0]);
+      }
+    }
+    return references;
+  }
+  compact(): void {
+    this.#assertOpen(); this.#db.exec("PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);");
+  }
 
   /** A successful receipt, state, events and effects commit together. Failed commands have no receipt. */
   command<T>(commandId: string, input: unknown, now: number, apply: (tx: RuntimeTransaction) => T): T {
     text(commandId, "command ID", 128); integer(now, "command time");
-    const digest = digestJson({ version: 1, input });
+    const digest = digestJson({ version: 1, input }, 256 * 1024);
     return this.#write(() => {
       const receipt = this.#db.query("SELECT digest, result FROM commands WHERE command_id = ?").get(commandId) as { digest: string; result: string } | null;
       if (receipt) {
@@ -143,6 +197,36 @@ export class RuntimeTransaction {
   getRun(id: string): DurableRun | undefined { return this.#read<DurableRun>("SELECT data FROM runs WHERE run_id = ?", id); }
   getTask(id: string): DurableTask | undefined { return this.#read<DurableTask>("SELECT data FROM tasks WHERE task_id = ?", id); }
   getAttempt(id: string): DurableAttempt | undefined { return this.#read<DurableAttempt>("SELECT data FROM attempts WHERE attempt_id = ?", id); }
+  record<T>(kind: string, id: string): RuntimeRecord<T> | undefined {
+    const row = this.db.query("SELECT * FROM runtime_records WHERE kind = ? AND record_id = ?").get(kind, id) as RecordRow | null;
+    return row ? recordFromRow<T>(row) : undefined;
+  }
+  records<T>(kind: string, runId: string, taskId?: string): RuntimeRecord<T>[] {
+    const rows = this.db.query("SELECT * FROM runtime_records WHERE kind = ? AND run_id = ? AND (? IS NULL OR task_id = ?) ORDER BY rowid LIMIT 10001")
+      .all(kind, runId, taskId ?? null, taskId ?? null) as RecordRow[];
+    if (rows.length > 10000) throw new Error("Runtime record collection exceeds page limit");
+    return rows.map((row) => recordFromRow<T>(row));
+  }
+  saveRecord<T>(record: Omit<RuntimeRecord<T>, "revision">, previousRevision: number): RuntimeRecord<T> {
+    this.#mutable(); integer(previousRevision, "record revision");
+    text(record.kind, "record kind", 64); text(record.id, "record ID", 512);
+    const value = encodeJson(record.value, 1024 * 1024);
+    const revision = previousRevision + 1;
+    if (previousRevision === 0) this.db.query("INSERT INTO runtime_records(kind, record_id, run_id, task_id, revision, value) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(record.kind, record.id, record.runId, record.taskId ?? null, revision, value);
+    else {
+      const result = this.db.query("UPDATE runtime_records SET revision = ?, value = ? WHERE kind = ? AND record_id = ? AND run_id = ? AND task_id IS ? AND revision = ?")
+        .run(revision, value, record.kind, record.id, record.runId, record.taskId ?? null, previousRevision);
+      if (result.changes !== 1) throw new Error("Runtime record revision conflict");
+    }
+    return { ...record, revision };
+  }
+  saveAttempt(attempt: DurableAttempt): void {
+    this.#mutable();
+    const result = this.db.query("UPDATE attempts SET data = ? WHERE attempt_id = ? AND task_id = ? AND epoch = ? AND status = 'active'")
+      .run(encodeJson(attempt), attempt.attemptId, attempt.taskId, attempt.epoch);
+    if (result.changes !== 1) throw new Error("Attempt is no longer active");
+  }
   tasks(runId: string): DurableTask[] {
     return (this.db.query("SELECT data FROM tasks WHERE run_id = ? ORDER BY rowid").all(runId) as DataRow[]).map((row) => JSON.parse(row.data));
   }
@@ -249,4 +333,9 @@ function effectFromRow(row: EffectRow): RuntimeEffect {
     attempts: row.attempts, dueAt: row.due_at, data: JSON.parse(row.data),
     ...(row.lease_token ? { leaseToken: row.lease_token, leaseOwner: row.lease_owner!, leaseGeneration: row.lease_generation!, leaseExpiresAt: row.lease_expires_at! } : {}),
   };
+}
+
+type RecordRow = { kind: string; record_id: string; run_id: string; task_id: string | null; revision: number; value: string };
+function recordFromRow<T>(row: RecordRow): RuntimeRecord<T> {
+  return { kind: row.kind, id: row.record_id, runId: row.run_id, ...(row.task_id ? { taskId: row.task_id } : {}), revision: row.revision, value: JSON.parse(row.value) };
 }

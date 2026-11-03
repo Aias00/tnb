@@ -21,8 +21,9 @@ export function createConfiguredTransport(
   selection: ProviderSelection,
   reasoningEffort?: ReasoningEffort,
   fastMode = false,
+  execution?: { maxRetries?: number },
 ): ModelTransport {
-  const transport = createRawConfiguredTransport(selection, reasoningEffort, fastMode);
+  const transport = createRawConfiguredTransport(selection, reasoningEffort, fastMode, execution);
   return {
     async *stream(request, signal) {
       const billing = resolveBillingRoute(selection, request.model);
@@ -37,6 +38,7 @@ function createRawConfiguredTransport(
   selection: ProviderSelection,
   reasoningEffort?: ReasoningEffort,
   fastMode = false,
+  execution?: { maxRetries?: number },
 ): ModelTransport {
   const { provider, model } = selection;
   if (fastMode && (provider.api !== "anthropic-messages" || !isAnthropicFastModeModel(model.id))) {
@@ -49,6 +51,7 @@ function createRawConfiguredTransport(
       baseUrl: provider.baseUrl,
       headers: { ...provider.headers, ...model.headers },
       maxOutputTokens: model.maxTokens,
+      maxRetries: execution?.maxRetries,
       compat: model.compat,
       reasoning: model.reasoning,
       ...(reasoningEffort ? { reasoningEffort } : {}),
@@ -64,6 +67,7 @@ function createRawConfiguredTransport(
     baseUrl: provider.baseUrl,
     headers: { ...provider.headers, ...model.headers },
     maxOutputTokens: model.maxTokens,
+    maxRetries: execution?.maxRetries,
     ...(provider.promptCaching ? { promptCaching: provider.promptCaching } : {}),
     ...(model.compat.anthropicRequiredToolChoice
       ? { requiredToolChoice: model.compat.anthropicRequiredToolChoice }

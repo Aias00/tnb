@@ -2,7 +2,7 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readdir, readFile, stat, unlink } from "node:fs/promises";
+import { readdir, readFile, stat, unlink, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { arch, platform, release } from "node:os";
 import { join, resolve } from "node:path";
@@ -982,6 +982,13 @@ function stripGoalLoopOptions(argv: string[]): string[] {
 
 export async function runCli(options: CliOptions): Promise<number> {
   let releaseSession: (() => Promise<void>) | undefined;
+  const workspaceReleases: Array<() => Promise<void>> = [];
+  const lockedWorkspaces = new Set<string>();
+  const lockWorkspace = async (path: string) => {
+    const canonical = await realpath(path); if (lockedWorkspaces.has(canonical)) return;
+    const { acquireWorkspace } = await import("../services/runtime/workspace");
+    workspaceReleases.push(await acquireWorkspace(canonical)); lockedWorkspaces.add(canonical);
+  };
   let usageBudget: UsageBudget | undefined;
   let releasePermissionObserver: (() => void) | undefined;
   let teamSupervisor = options.teamSupervisor;
@@ -1000,11 +1007,13 @@ export async function runCli(options: CliOptions): Promise<number> {
   let completed = false;
   try {
     const parsed = parseArguments(options.argv, options.env);
+    await lockWorkspace(options.cwd);
     await loadPromptFiles(parsed, options.cwd);
     const configDir =
       options.configDir ?? options.env.TNB_HOME ?? join(homedir(), ".tnb");
     const workspace = options.workspaceState ?? new WorkspaceState(options.cwd);
     applyAdditionalWorkspaceRoots(workspace, parsed.additionalDirectories);
+    for (const root of workspace.roots()) await lockWorkspace(root);
     const [providerCatalog, settings] = await Promise.all([
       loadProviderCatalog({ configDir, env: options.env }),
       loadSettings({ configDir, cwd: options.cwd, ...(parsed.settingsInput ? { additional: parsed.settingsInput } : {}) }),
@@ -1216,6 +1225,7 @@ export async function runCli(options: CliOptions): Promise<number> {
       shellManager.setCwd(workspace.current());
       hooks.setCwd(workspace.current());
     }
+    for (const root of workspace.roots()) await lockWorkspace(root);
     const history = await session.calls.recover(restoredSession.messages, (message) => session.append([message]));
     const permissionRequestHook = (request: PermissionAskRequest, signal?: AbortSignal) =>
       requestPermissionThroughHooks(hooks, request, signal);
@@ -2232,7 +2242,7 @@ export async function runCli(options: CliOptions): Promise<number> {
       try {
         if (completed) await usageBudget?.finish();
         else await usageBudget?.close();
-      } finally { await releaseSession?.(); }
+      } finally { try { await releaseSession?.(); } finally { for (const release of workspaceReleases.reverse()) await release(); } }
     }
   }
 }
@@ -3165,6 +3175,14 @@ async function runInteractiveSlashCommand(
   command: SlashCommandRequest,
   context: InteractiveSlashCommandContext,
 ): Promise<SlashCommandResult> {
+  if (command.name === "runtime") {
+    const args = splitCommandWords(command.argument); const action = args[0] ?? "list";
+    if (!["list", "status", "result", "events", "pause", "resume", "cancel", "storage"].includes(action)) throw new Error("Use tnb runtime submit from a terminal to create work; /runtime supports list, status, result, events, pause, resume, cancel and storage.");
+    const { runRuntimeCommand } = await import("./runtime"); let output = ""; let error = "";
+    const code = await runRuntimeCommand({ argv: ["runtime", ...(args.length ? args : [action]), "--config-dir", context.configDir], cwd: context.cwd,
+      env: context.env, stdout: { write: (value) => { output += value; } }, stderr: { write: (value) => { error += value; } } });
+    if (code) throw new Error(error.trim()); return { message: output.trim() };
+  }
   if (command.name === "about") {
     requireNoCommandArgument(command);
     const current = context.currentSelection();
@@ -5941,6 +5959,9 @@ if (import.meta.main) {
     : suppliedArgv;
   if (argv.includes("--version") || argv.includes("-V")) {
     process.stdout.write(`${packageJson.version}\n`);
+  } else if (argv[0] === "runtime") {
+    const { runRuntimeCommand } = await import("./runtime");
+    process.exitCode = await runRuntimeCommand({ argv, cwd: process.cwd(), env: process.env, stdout: process.stdout, stderr: process.stderr });
   } else if (suppliedArgv[0] === "remote-control" && (suppliedArgv.includes("--help") || suppliedArgv.includes("-h"))) {
     process.stdout.write(`Usage: tnb remote-control [--socket <path>] [--server-file <path>] [runtime options]\n\nWithout --socket, runs the bidirectional stream-json protocol over stdin/stdout.\nWith --socket, serves the same protocol to local Unix socket clients and writes a 0600 discovery descriptor beside the socket.\n`);
   } else if (suppliedArgv[0] === "remote-control" && remoteControlSocket) {

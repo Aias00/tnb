@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-export const RUNTIME_SCHEMA_VERSION = 1;
+export const RUNTIME_SCHEMA_VERSION = 2;
 const RUNTIME_APPLICATION_ID = 0x544e4252; // TNBR
 
 export function migrateRuntime(database: Database): void {
@@ -13,6 +13,11 @@ export function migrateRuntime(database: Database): void {
       if (application !== RUNTIME_APPLICATION_ID) throw new Error("Unrecognized runtime database identity");
       return;
     }
+    if (version === 1 && application === RUNTIME_APPLICATION_ID) {
+      addRecords(database);
+      return;
+    }
+    if (version === 1) throw new Error("Unrecognized runtime database identity");
     if (application !== 0 || version !== 0 || database.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1").get()) {
       throw new Error("Unrecognized runtime database; migration refused");
     }
@@ -109,5 +114,14 @@ export function migrateRuntime(database: Database): void {
       PRAGMA user_version = 1;
       PRAGMA application_id = ${RUNTIME_APPLICATION_ID};
     `);
+    addRecords(database);
   }).immediate();
+}
+
+function addRecords(database: Database): void {
+  database.exec(`CREATE TABLE runtime_records (
+    kind TEXT NOT NULL, record_id TEXT NOT NULL, run_id TEXT NOT NULL REFERENCES runs(run_id),
+    task_id TEXT, revision INTEGER NOT NULL CHECK(revision > 0), value TEXT NOT NULL CHECK(json_valid(value)),
+    PRIMARY KEY(kind, record_id), FOREIGN KEY(run_id, task_id) REFERENCES tasks(run_id, task_id)
+  ); CREATE INDEX records_by_run ON runtime_records(kind, run_id); PRAGMA user_version = 2;`);
 }

@@ -10,6 +10,7 @@ export type OpenAITransportOptions = {
   headers?: Record<string, string>;
   fetch?: FetchLike;
   maxOutputTokens?: number;
+  maxRetries?: number;
   compat?: OpenAICompatibility;
   reasoning?: boolean;
   reasoningEffort?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -22,7 +23,7 @@ export function createOpenAITransport(options: OpenAITransportOptions): ModelTra
     async *stream(request, signal) {
       yield* streamWithRetry(
         () => streamOpenAI(fetcher, options, request, signal),
-        { ...(signal ? { signal } : {}) },
+        { maxRetries: options.maxRetries, ...(signal ? { signal } : {}) },
       );
     },
   };

@@ -17,6 +17,7 @@ export type JournalOutcome = { result: ToolResultBlock; attachments: MediaBlock[
 
 /** Storage-owned lifecycle barriers. A failed barrier must stop the loop, not retry a side effect. */
 export interface ToolCallJournal {
+  scope?(messages: readonly ConversationMessage[]): string;
   intend(call: ToolUseBlock, input: unknown, scope?: string): Promise<string>;
   dispatch(invocationId: string): Promise<void>;
   settle(invocationId: string, outcome: JournalOutcome): Promise<void>;

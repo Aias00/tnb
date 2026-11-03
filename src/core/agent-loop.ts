@@ -60,7 +60,7 @@ export type AgentLoopOptions = {
   ): Promise<AuthorizationDecision>;
   onEvent?(event: ModelEvent): void;
   onToolEvent?(event: ToolExecutionEvent): void;
-  onMessage?(message: ConversationMessage): void | Promise<void>;
+  onMessage?(message: ConversationMessage, context?: { stopReason?: StopReason }): void | Promise<void>;
   compactMessages?(
     messages: ConversationMessage[],
     signal: AbortSignal,
@@ -249,7 +249,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<{
     }
     if (content.length) {
       messages.push(assistantMessage);
-      await options.onMessage?.(structuredClone(assistantMessage));
+      await options.onMessage?.(structuredClone(assistantMessage), { stopReason });
     }
     if (stopReason === "max-tokens" && outputTokenRecoveries < MAX_OUTPUT_TOKEN_RECOVERIES) {
       outputTokenRecoveries += 1;
@@ -290,7 +290,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<{
     }
 
     const results: Array<ToolResultBlock | MediaBlock> = [];
-    const scope = options.callJournal ? toolCallScope(messages) : undefined;
+    const scope = options.callJournal ? options.callJournal.scope?.(messages) ?? toolCallScope(messages) : undefined;
     for (const use of content.filter((block): block is ToolUseBlock => block.type === "tool-use")) {
       const outcome = await executeTool(use, { ...options, tools: availableTools, toolCatalog: undefined }, signal, scope);
       results.push(outcome.result, ...outcome.attachments);

@@ -255,7 +255,26 @@ language servers contribute structured document symbols; TypeScript uses its
 compiler AST and the offline parser remains available when an optional LSP is
 not installed.
 
-Run a persistent objective as a foreground autonomous loop with:
+For durable tasks that survive the submitting terminal, use the local owner service:
+
+```sh
+tnb runtime submit 'Fix the retry bug and verify it' --cwd /path/to/project \
+  --allow-write --allow-shell --check 'bun run typecheck' --check 'bun test'
+tnb runtime status RUN_ID
+tnb runtime result RUN_ID
+tnb runtime pause RUN_ID
+tnb runtime resume RUN_ID
+tnb runtime cancel RUN_ID
+```
+
+The default `auto` mode starts with one Agent and can admit bounded, independent
+read-only investigations. `--mode single` forbids delegation; writable child
+Agents and remote federation are not enabled. Results require runtime acceptance;
+unknown write/Shell outcomes block for explicit reconciliation. macOS validation
+covers native sandbox enforcement, actual process death and hierarchical recovery.
+See [the durable runtime guide](docs/durable-runtime.md) for controls, backups,
+limits and the exact recovery guarantees. Interactive `/runtime` commands inspect
+and control the same service. The existing foreground loop remains available:
 
 ```bash
 tnb goal-loop "Implement the requested migration and verify it" --turns 30
