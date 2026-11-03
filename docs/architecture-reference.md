@@ -1,5 +1,13 @@
 # Architecture references
 
+## Planned durable task runtime
+
+The [durable task runtime design](superpowers/specs/2026-11-03-durable-task-runtime-design.md)
+specifies persistent single-agent tasks, adaptive delegation, recovery and
+acceptance boundaries. Its [design review](superpowers/specs/2026-11-03-durable-task-runtime-review.md)
+records the baseline findings and revisions. This is a proposed implementation
+roadmap; the current runtime behavior is described below.
+
 ## Pi Agent Harness
 
 Reference repository: <https://github.com/earendil-works/pi>
