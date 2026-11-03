@@ -8,6 +8,10 @@ acceptance boundaries. Its [design review](superpowers/specs/2026-11-03-durable-
 records the baseline findings and revisions. This is a proposed implementation
 roadmap; the current runtime behavior is described below.
 
+The [P0-A storage foundation](durable-runtime.md) is implemented as an internal
+module with atomic commands, durable waits and leased outbox rows. It is not yet
+connected to production Agent dispatch or automatic recovery.
+
 ## Pi Agent Harness
 
 Reference repository: <https://github.com/earendil-works/pi>

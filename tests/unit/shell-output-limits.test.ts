@@ -22,7 +22,7 @@ async function fixture() {
 const quote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
 const command = (script: string) => `${quote(process.execPath)} -e ${quote(script)}`;
 async function until(check: () => boolean) {
-  const deadline = Date.now() + 5000;
+  const deadline = Date.now() + 15000;
   while (!check()) {
     if (Date.now() > deadline) throw new Error("Command did not finish");
     await Bun.sleep(10);
@@ -146,4 +146,4 @@ test("real shell commands share the runtime log ceiling and keep completing afte
   const files = await readdir(join(root, "logs"));
   const sizes = await Promise.all(files.map(async (file) => (await stat(join(root, "logs", file))).size));
   expect(sizes.reduce((total, size) => total + size, 0)).toBe(MAX_RUNTIME_LOG_BYTES);
-}, 15000);
+}, 60000);

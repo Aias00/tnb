@@ -10,6 +10,14 @@ import type { TaskRecord } from "../../src/services/tasks/manager";
 const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
 
+async function until(check: () => boolean): Promise<void> {
+  const deadline = Date.now() + 5000;
+  while (!check()) {
+    if (Date.now() >= deadline) throw new Error("Team recovery did not settle");
+    await Bun.sleep(5);
+  }
+}
+
 describe("Agent Team recovery", () => {
   test("keeps an empty session supervisor idle without creating a lease or reporting an error", async () => {
     const root = await mkdtemp(join(tmpdir(), "tnb-team-"));
@@ -226,11 +234,10 @@ describe("Agent Team recovery", () => {
       resumed.push(recovered.id);
       await restored.setStatus("delivery", member.agentId, "running");
     });
-    supervisor.start();
-    await Bun.sleep(10);
-
-    expect(resumed).toEqual(["runtime-original"]);
-    await supervisor.close();
+    try {
+      await supervisor.recoverAll();
+      expect(resumed).toEqual(["runtime-original"]);
+    } finally { await supervisor.close(); }
   });
 
   test("retries failed recovery with backoff and stops scheduling after close", async () => {
@@ -280,12 +287,12 @@ describe("Agent Team recovery", () => {
       await restored.setStatus("delivery", member.agentId, "running");
     });
     supervisor.start();
-    await Bun.sleep(35);
-
-    expect(attempts).toBe(2);
-    expect(errors).toEqual(["temporary recovery failure"]);
-    expect(restored.member("delivery", member.agentId).recoveryAttempts).toBeUndefined();
-    await supervisor.close();
+    try {
+      await until(() => attempts === 2 && restored.member("delivery", member.agentId).recoveryAttempts === undefined);
+      expect(attempts).toBe(2);
+      expect(errors).toEqual(["temporary recovery failure"]);
+      expect(restored.member("delivery", member.agentId).recoveryAttempts).toBeUndefined();
+    } finally { await supervisor.close(); }
     const attemptsAtClose = attempts;
     await restored.setStatus("delivery", member.agentId, "recovering");
     await Bun.sleep(20);

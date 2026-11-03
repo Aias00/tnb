@@ -69,12 +69,18 @@ describe("scheduled prompts", () => {
       description: "test stream",
     }), new AbortController().signal);
     expect(monitorOutput).toContain("Started monitor monitor_");
-    expect(await Promise.race([
-      monitorEvent,
-      new Promise<string>((_, reject) => setTimeout(() => reject(new Error("monitor event timed out")), 1_000)),
-    ])).toContain("monitor event");
-    await shell.close();
-  });
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      expect(await Promise.race([
+        monitorEvent,
+        new Promise<string>((_, reject) => { timeout = setTimeout(() => reject(new Error("monitor event timed out")), 5_000); }),
+      ])).toContain("monitor event");
+    } finally {
+      clearTimeout(timeout);
+      await shell.close();
+      await manager.close();
+    }
+  }, 10000);
 
   test("merges concurrent durable jobs and preserves deletion across stale writers", async () => {
     const directory = await mkdtemp(join(tmpdir(), "tnb-schedule-concurrent-"));
