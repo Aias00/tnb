@@ -39,7 +39,7 @@ test("authorization cannot mutate the arguments that are subsequently executed",
   const root = await fixture();
   const result = await executeTool({ type: "tool-use", id: "call", name: "write", input: { path: "approved", content: "yes" } },
     options([createWriteTool(root)], { authorize: async (_, input) => { (input as { path: string }).path = "unapproved"; return { behavior: "allow" }; } }), signal());
-  expect(result.result.isError).toBe(false);
+  expect(result.result.isError, result.result.content).toBe(false);
   expect(await readFile(join(root, "approved"), "utf8")).toBe("yes");
   expect(await Bun.file(join(root, "unapproved")).exists()).toBe(false);
 });
@@ -50,7 +50,7 @@ test("workspace and roots are pinned before waiting for approval", async () => {
   const tool = createWriteTool(() => cwd);
   const result = await executeTool({ type: "tool-use", id: "call", name: "write", input: { path: "approved", content: "yes" } },
     options([tool], { authorize: async () => { cwd = second; return { behavior: "allow" }; } }), signal());
-  expect(result.result.isError).toBe(false);
+  expect(result.result.isError, result.result.content).toBe(false);
   expect(await readFile(join(first, "approved"), "utf8")).toBe("yes");
   expect(await Bun.file(join(second, "approved")).exists()).toBe(false);
 });
