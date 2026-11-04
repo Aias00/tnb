@@ -104,16 +104,18 @@ test("a trusted replacement with the same adapter/package versions cannot resume
 });
 
 test("shutdown drains workers before disposers, concurrent close is shared and ownership lasts through cleanup", async () => {
-  const f = await fixture(); await trustPlugin(f.trust, f.installedRoot);
-  const host = await f.open(); await host.submit({ commandId: "hold", objective: "Hold", namespace: "fixture", adapter: descriptor({ hold: true }) });
-  const end = Date.now() + 8000;
-  while (!(await f.events()).includes("model")) { if (Date.now() > end) throw new Error("Worker did not start"); await Bun.sleep(10); }
-  const runtimeClosing = host.runtime.close();
-  const first = host.close(), second = host.close(); expect(first).toBe(second); await Promise.all([runtimeClosing, first]);
-  const events = await f.events(); expect(events.indexOf("worker-aborted")).toBeLessThan(events.indexOf("dispose-last"));
-  expect(events.indexOf("worker-close")).toBeLessThan(events.indexOf("dispose-last"));
-  expect(events.filter(event => event === "dispose-first")).toHaveLength(1);
-  expect(host.plugins.list()[0]!.status).toBe("stopped");
+  for (const abortBeforeSubscribe of [false, true]) {
+    const f = await fixture(); await trustPlugin(f.trust, f.installedRoot);
+    const host = await f.open(); await host.submit({ commandId: "hold", objective: "Hold", namespace: "fixture", adapter: descriptor({ hold: true, abortBeforeSubscribe }) });
+    const end = Date.now() + 8000;
+    while (!(await f.events()).includes("model")) { if (Date.now() > end) throw new Error("Worker did not start"); await Bun.sleep(10); }
+    const runtimeClosing = host.runtime.close();
+    const first = host.close(), second = host.close(); expect(first).toBe(second); await Promise.all([runtimeClosing, first]);
+    const events = await f.events(); expect(events.indexOf("worker-aborted")).toBeLessThan(events.indexOf("dispose-last"));
+    expect(events.indexOf("worker-close")).toBeLessThan(events.indexOf("dispose-last"));
+    expect(events.filter(event => event === "dispose-first")).toHaveLength(1);
+    expect(host.plugins.list()[0]!.status).toBe("stopped");
+  }
 });
 
 test("owner rejection imports no code; revoked trust blocks the next generation", async () => {

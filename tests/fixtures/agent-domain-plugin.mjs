@@ -25,7 +25,11 @@ export default async function setup(api) {
           await log("model");
           const receipts = request.messages.flatMap(message => message.role === "user" ? message.content.filter(block => block.type === "tool-result") : []);
           if (context.descriptor.config.hold) {
-            await new Promise(resolve => context.signal.addEventListener("abort", resolve, { once: true }));
+            // Exercise cancellation before subscription, as well as cancellation while awaiting.
+            if (context.descriptor.config.abortBeforeSubscribe) {
+              while (!context.signal.aborted) await new Promise(resolve => setTimeout(resolve, 5));
+            }
+            if (!context.signal.aborted) await new Promise(resolve => context.signal.addEventListener("abort", resolve, { once: true }));
             await log("worker-aborted"); context.signal.throwIfAborted();
           }
           if (!receipts.some(item => item.toolUseId === "lookup")) { yield* call("lookup", {}); return; }
