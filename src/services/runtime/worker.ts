@@ -72,12 +72,13 @@ export function createRuntimeWorkerFactory(options: { configDir: string; runtime
       // Each physical request has one persistent reservation. Retries belong to the durable scheduler.
       transport: { stream: (request, requestSignal) => createConfiguredTransport(selection, undefined, false, { maxRetries: 0 }).stream(request, requestSignal) }, model: selection.model.id, tools,
       route: resolveBillingRoute(selection, selection.model.id), maxOutputTokens: Math.min(selection.model.maxTokens, 8192),
+      contextWindowTokens: selection.model.contextWindow,
       binding: { provider: selection.provider.id, api: selection.provider.api, endpoint: selection.provider.baseUrl, model: selection.model,
         headers: digestJson(selection.provider.headers), permissions: { deny: settings.permissions?.deny, ask: settings.permissions?.ask } },
       projectInstructions: await loadProjectInstructions(workspace, { stopAt: workspace }),
       authorize: async (tool, input, context) => {
         signal.throwIfAborted();
-        if (tool.name === "agent" || tool.name === "durable_wait") return { behavior: "allow" };
+        if (tool.name === "agent" || tool.name === "durable_wait" || tool.name === "durable_recall") return { behavior: "allow" };
         return checker({ ...tool, risk: tool.access }, input, signal, context);
       },
       check: shell ? async (command, checkSignal) => {

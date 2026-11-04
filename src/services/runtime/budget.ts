@@ -26,9 +26,11 @@ export class DurableBudget {
     const durable: ModelTransport = { async *stream(request: ModelRequest, signal?: AbortSignal): AsyncGenerator<ModelEvent> {
       signal = signal ? AbortSignal.any([signal, AbortSignal.timeout(600_000)]) : AbortSignal.timeout(600_000);
       context.assertLive(); signal?.throwIfAborted();
+      const maxOutputTokens = Math.min(context.maxOutputTokens, request.maxOutputTokens ?? context.maxOutputTokens);
+      if (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens < 1) throw new Error("Invalid model output limit");
       const requestId = randomUUID();
       const reserve = context.route.pricing ? calculateCostUsd({ inputTokens: Buffer.byteLength(JSON.stringify(request)),
-        outputTokens: context.maxOutputTokens, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 }, context.route.pricing) : 0;
+        outputTokens: maxOutputTokens, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 }, context.route.pricing) : 0;
       if (context.maxCostUsd !== undefined && !context.route.pricing) throw new Error("Durable dollar budgets require configured model pricing");
       budget.store.command(randomUUID(), { kind: "budget.reserve", requestId }, Date.now(), (tx) => {
         const totals = budget.totals(context.runId);
@@ -40,7 +42,7 @@ export class DurableBudget {
       });
       let complete = false; let count = 0; let seenUsage = false; let responseBytes = 0;
       try {
-        for await (const event of raw.stream({ ...request, maxOutputTokens: context.maxOutputTokens }, signal)) {
+        for await (const event of raw.stream({ ...request, maxOutputTokens }, signal)) {
           responseBytes += JSON.stringify(event).length;
           if (responseBytes > 2 * 1024 * 1024) throw new Error("Model response byte limit exceeded");
           if (event.type === "usage") {

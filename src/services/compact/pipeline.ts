@@ -53,7 +53,7 @@ export async function compactConversationPipeline(options: CompactConversationOp
   }
 
   if (options.sessionMemory && !options.sessionMemory.canAttemptFullCompaction()) {
-    const collapsed = collapseOldRounds(working, options.thresholdTokens);
+    const collapsed = collapseOldRounds(working, options.thresholdTokens, options.keepRecentMessages, options.allowToolRoundBoundary);
     return {
       compacted: micro.pruned > 0 || collapsed.collapsed,
       messages: collapsed.messages,
@@ -83,11 +83,12 @@ export async function compactConversationPipeline(options: CompactConversationOp
     }
   } catch (error) {
     options.signal?.throwIfAborted();
+    if (options.recoverFromSummaryError?.(error) === false) throw error;
     // Context collapse is the bounded recovery path used when the full summarizer
     // cannot produce a valid replacement. It preserves recent turns and complete
     // tool-use/result pairs, and never masks aborts or returns the original
     // over-budget history as if compaction succeeded.
-    const collapsed = collapseOldRounds(working, options.thresholdTokens);
+    const collapsed = collapseOldRounds(working, options.thresholdTokens, options.keepRecentMessages, options.allowToolRoundBoundary);
     await options.sessionMemory?.recordCompactionAttempt("full", false);
     if (!collapsed.collapsed) throw error;
     return {
@@ -101,7 +102,7 @@ export async function compactConversationPipeline(options: CompactConversationOp
     };
   }
 
-  const collapsed = collapseOldRounds(working, options.thresholdTokens);
+  const collapsed = collapseOldRounds(working, options.thresholdTokens, options.keepRecentMessages, options.allowToolRoundBoundary);
   working = collapsed.messages;
   workingTokens = estimateConversationTokens(working);
   return {
@@ -160,16 +161,18 @@ export function collapseOldRounds(
   messages: ConversationMessage[],
   thresholdTokens: number,
   keepRecentMessages = 8,
+  allowToolRounds = false,
 ): { messages: ConversationMessage[]; collapsed: boolean; removed: number } {
   assertBalancedToolHistory(messages);
   const preTokens = estimateConversationTokens(messages);
   if (messages.length <= keepRecentMessages + 2) return { messages: structuredClone(messages), collapsed: false, removed: 0 };
-  const keepFrom = findSafeHistoryBoundary(messages, messages.length - keepRecentMessages);
+  const keepFrom = findSafeHistoryBoundary(messages, messages.length - keepRecentMessages, allowToolRounds);
   if (keepFrom <= 2 || keepFrom === messages.length) return { messages: structuredClone(messages), collapsed: false, removed: 0 };
   const targetTokens = Math.max(1, Math.floor(thresholdTokens * 0.9));
   for (let removeThrough = 2; removeThrough <= keepFrom; removeThrough += 1) {
     const boundary = messages[removeThrough];
-    if (boundary?.role !== "user" || boundary.content.some((block) => block.type === "tool-result")) continue;
+    if (!boundary || (!allowToolRounds && (boundary.role !== "user" || boundary.content.some((block) => block.type === "tool-result")))) continue;
+    try { assertBalancedToolHistory(messages.slice(removeThrough)); } catch { continue; }
     const candidate = collapsedHistory(messages, removeThrough);
     const candidateTokens = estimateConversationTokens(candidate);
     if (candidateTokens <= targetTokens && candidateTokens < preTokens) {

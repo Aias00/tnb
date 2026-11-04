@@ -26,6 +26,7 @@ export type AgentCompactionResult = {
   messages: ConversationMessage[];
   preTokens: number;
   postTokens: number;
+  details?: Record<string, unknown>;
 };
 
 export type ToolExecutionEvent =
@@ -311,7 +312,7 @@ function providerMessages(messages: ConversationMessage[]): ConversationMessage[
   });
 }
 
-function isContextOverflowError(error: unknown): boolean {
+export function isContextOverflowError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   const message = `${error.name} ${error.message}`.toLowerCase();
   return [

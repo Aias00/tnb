@@ -6,6 +6,9 @@ export type CompactConversationOptions = {
   messages: ConversationMessage[];
   thresholdTokens: number;
   keepRecentMessages?: number;
+  /** Durable workers may retain complete tool rounds without a new human input. */
+  allowToolRoundBoundary?: boolean;
+  recoverFromSummaryError?(error: unknown): boolean;
   summarize(
     messages: ConversationMessage[],
     signal?: AbortSignal,
@@ -78,6 +81,7 @@ export async function compactConversation(
   const keepFrom = findSafeHistoryBoundary(
     original,
     Math.max(0, original.length - (options.keepRecentMessages ?? 4)),
+    options.allowToolRoundBoundary,
   );
   if (keepFrom <= 0) {
     return { compacted: false, messages: original, preTokens, postTokens: preTokens };

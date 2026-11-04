@@ -15,6 +15,21 @@ function fixture() {
   return { store, budget, context, ...created };
 }
 const request: ModelRequest = { model: "fixture", messages: [], tools: [] };
+test("bounded summary output limits constrain both reservation and physical requests", async () => {
+  const f = fixture(); let physicalLimit: number | undefined;
+  const raw: ModelTransport = { async *stream(input) {
+    physicalLimit = input.maxOutputTokens;
+    yield { type: "usage", usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 } };
+    yield { type: "response-end", reason: "end-turn" };
+  } };
+  const transport = f.budget.wrap(raw, f.context);
+  for await (const _event of transport.stream({ ...request, maxOutputTokens: 10 })) {}
+  expect(physicalLimit).toBe(10);
+  const charge = f.store.records<{ reserved: number }>("model-request", f.run.runId)[0]!.value;
+  expect(charge.reserved).toBeCloseTo((Buffer.byteLength(JSON.stringify({ ...request, maxOutputTokens: 10 })) + 10) / 1_000_000, 9);
+  await expect((async () => { for await (const _event of transport.stream({ ...request, maxOutputTokens: 0 })) {} })()).rejects.toThrow("Invalid model output");
+  expect(f.store.records("model-request", f.run.runId)).toHaveLength(1);
+});
 async function drain(transport: ModelTransport) { for await (const _event of transport.stream(request)) { /* consume all usage and close */ } }
 
 test("root and children share reservations; failed unbilled requests remain uncertain after recovery", async () => {

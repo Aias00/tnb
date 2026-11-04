@@ -22,11 +22,11 @@ export function assertBalancedToolHistory(messages: readonly ConversationMessage
   if (pending.size) throw new Error(`Unresolved tool calls: ${[...pending.keys()].join(", ")}; reconcile their effects before resuming`);
 }
 
-/** A real user input, never a tool-result container, can begin a retained suffix. */
-export function findSafeHistoryBoundary(messages: readonly ConversationMessage[], preferredIndex: number): number {
+/** Default boundaries start at real user input; durable workers can opt into balanced tool rounds. */
+export function findSafeHistoryBoundary(messages: readonly ConversationMessage[], preferredIndex: number, allowToolRounds = false): number {
   for (let index = Math.max(1, preferredIndex); index < messages.length; index += 1) {
     const message = messages[index];
-    if (message?.role !== "user" || message.content.some((block) => block.type === "tool-result")) continue;
+    if (!message || (!allowToolRounds && (message.role !== "user" || message.content.some((block) => block.type === "tool-result")))) continue;
     try {
       assertBalancedToolHistory(messages.slice(0, index));
       assertBalancedToolHistory(messages.slice(index));
