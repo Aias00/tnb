@@ -520,3 +520,19 @@ Research 示例使用宿主资料客户端，完全不依赖项目目录、Git�
 新增 **15 项**单元/集成回归：无项目的研究执行、虚构引用拒绝、问答重开恢复、精确适配器版本、未授权工具隐藏、验收期间输入变化、未知远端写入查询后继续且只写一次、委派资源/权限收窄及父复核、能力指纹变化拒绝、双 owner 拒绝、业务授权与 runtime 控制分离、启动事务失败释放资源、JSON 描述校验、原子读写准入、SIGKILL 后租约回收。
 
 最终 macOS **912 pass / 2 skip / 0 fail**，Linux Ubuntu 24.04.4 ARM64 / Bun 1.3.14、`TNB_REQUIRE_NATIVE_SANDBOX=1` 下 **907 pass / 7 skip / 0 fail**；均 **914 tests / 142 files**。两端类型检查、构建和研究示例通过。内核打包依赖检查不包含 CLI、TUI、Coding 适配器、Shell、Settings 或 SQLite。没有新增 Windows 实机、数小时 soak、线上模型质量或分布式恢复验证。证据在 `/Volumes/data/tnb-review-2026-11-04/general-agent/`，保留初始问答夹具只有一个选项而被原协议拒绝的失败记录；修正为两个选项后通过，未放松协议。
+
+## 20 基于 Pi 与 DeepSeek Harness 的领域插件调整
+
+日期：2026-11-04。基线 `af29c85`。对照 Pi loader 的 commit/discard 和 DSH preset generation/inventory 后，将领域适配器接入原插件安装、兼容性、启用与内容信任机制，未新增独立包管理器。源码快照、路径和调用方法见 [领域插件比较](../../agent-plugin-comparison.md)。
+
+清单以 `contributes.adapters` 声明 `.mjs` 入口和 id/version；每包所有 factory 成功后才提交，失败全部回滚并逆序执行 disposer。API 离开所属 factory 后封闭，加载失败保留 inventory 诊断，不阻塞健康的独立插件，也不能覆盖宿主同身份实现。owner 锁先于导入；受信树复制到私有目录并复核指纹，本代包内资源不受原目录升级影响。重启清理崩溃副本，不自动恢复历史包的信任。
+
+任务持久化插件 name/package version/tree SHA256；只有新提交可补来源，恢复不能在 inline 与插件之间静默切换。同版本代码变化也暂停旧任务，恢复原受信字节后可显式继续。当前采用重启生效，没有多 generation 热替换、历史包保留或自动迁移。代码为受信进程内扩展，撤销信任不强制卸载本代已导入代码，需停止宿主后重启重新检查。
+
+审阅发现直接 `runtime.close()` 与 `host.close()` 并发时，原 close 提前返回可能让插件先于 Worker 释放；已改为共享关闭 Promise。关闭先排空 Worker，再释放插件、关闭数据库，最后释放 owner；清理异常也尝试全部 disposer。新增 `bun run agent:plugin-demo`，实际编译安装、首次显式信任、资料工具调用和回执验收；重开复用原 Run/Task。
+
+上一轮 GitHub macOS CI 暴露 branch watcher 首次事件丢失；现先订阅再读初始 HEAD，以单文件 stat 兜底并去重回调，不增加目录扫描或 Git 子进程。
+
+新增 **14 项**回归，覆盖安装、信任、禁用、变更不导入、跨入口初始化回滚、逆序清理、独立插件失败隔离、实际工具证据与问答恢复、同版本代码变化拒绝及恢复原字节、并发排空关闭、双 owner、撤销信任、入口越界、符号链接、宿主注册冲突、代码副本隔离及清理期间持锁、清理异常与 inline/plugin 来源绑定。
+
+最终 macOS **926 pass / 2 skip / 0 fail**；Linux Ubuntu 24.04.4 ARM64 / Bun 1.3.14、`TNB_REQUIRE_NATIVE_SANDBOX=1` 下 **921 pass / 7 skip / 0 fail**，两端均 **928 tests / 143 files**。类型检查、构建、编译产物 help、插件示例与同目录重开通过。独立内核 bundle 未引入插件加载器、CLI、TUI、Coding 或 SQLite。没有外部模型调用，未新增 Windows 实机、热升级、数小时 soak 或不受信插件隔离验证。证据在 `/Volumes/data/tnb-review-2026-11-04/adapter-plugins/`；保留初始夹具安装参数和 macOS `/var` 规范路径失败记录，修正后通过。

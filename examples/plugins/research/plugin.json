@@ -1,0 +1,9 @@
+{
+  "name": "offline-research",
+  "manifestVersion": 2,
+  "apiVersion": "tnb.plugin/v1",
+  "version": "1.0.0",
+  "contributes": {
+    "adapters": [{ "id": "research", "version": "1", "entry": "index.mjs" }]
+  }
+}

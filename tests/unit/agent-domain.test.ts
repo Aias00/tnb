@@ -4,7 +4,7 @@ import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { DomainRegistry, validateDomainDescriptor, type DomainDescriptor } from "../../src/agent/domain";
+import { DomainRegistry, validateDomainDescriptor, type DomainDescriptor, type AgentDomainAdapter } from "../../src/agent/domain";
 import { tryAcquireResources } from "../../src/services/runtime/resources";
 const roots: string[] = [];
 afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
@@ -19,6 +19,17 @@ test("persisted adapter descriptors reject executable config and permission esca
   expect(() => new DomainRegistry().resolve(descriptor())).toThrow("pinned version");
   const sparse = descriptor(); sparse.config = Array(2);
   expect(() => validateDomainDescriptor(sparse)).toThrow("JSON");
+});
+test("plugin provenance cannot be acquired during recovery or fall back to an inline adapter", () => {
+  const adapter: AgentDomainAdapter = { id: "fixture", version: "1", validate() {}, async snapshot() { return {}; },
+    async createWorker(): Promise<never> { throw new Error("unused"); }, async accept() { return { checks: [{ command: "test", output: "ok" }] }; } };
+  const identity = { name: "fixture-plugin", version: "1.0.0", fingerprint: "a".repeat(64) };
+  const registry = new DomainRegistry([], [{ adapter, plugin: identity }]);
+  expect(() => registry.resolve(descriptor())).toThrow("identity changed");
+  const pinned = registry.prepare(descriptor()); expect(pinned.plugin).toEqual(identity);
+  expect(registry.resolve(pinned).id).toBe("fixture");
+  expect(() => new DomainRegistry([adapter]).resolve(pinned)).toThrow("identity changed");
+  expect(() => validateDomainDescriptor({ ...descriptor(), plugin: null } as unknown as DomainDescriptor)).toThrow("plugin identity");
 });
 test("resource admission atomically allows readers, excludes writers and rolls back partial admission", async () => {
   const directoryPath = await directory(), id = randomUUID();

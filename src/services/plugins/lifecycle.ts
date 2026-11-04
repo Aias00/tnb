@@ -159,6 +159,8 @@ function pluginFingerprint(plugin: LoadedPlugin): string {
     lifecycle: plugin.lifecycle,
     contributionSummary: plugin.contributionSummary,
     toolContributions: plugin.toolContributions,
+    adapterContributions: plugin.adapterContributions,
+    fingerprint: plugin.fingerprint,
   });
 }
 

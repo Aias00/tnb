@@ -17,7 +17,7 @@ import { RuntimeStore } from "./store";
 import { RuntimeCommands, wakeWaiting, type TaskDefinition } from "./commands";
 import { RuntimeArtifacts } from "./artifacts";
 import { codingDomain } from "../../adapters/coding/domain";
-import { DomainRegistry, RUNTIME_TOOL_NAMES, selectDomainTools, validateDomainDescriptor, type DomainDescriptor, type DomainContext, type DomainAcceptance } from "../../agent/domain";
+import { DomainRegistry, RUNTIME_TOOL_NAMES, selectDomainTools, type DomainDescriptor, type DomainContext, type DomainAcceptance } from "../../agent/domain";
 import { tryAcquireResources } from "./resources";
 import { DurableBudget, DurableBudgetExhaustedError, ChildRequestLimitError } from "./budget";
 import { DurableCallJournal, type Operation } from "./journal";
@@ -72,6 +72,7 @@ export class DurableRuntime {
   #dirty = false;
   #pumping?: Promise<void>;
   #closed = false;
+  #closing?: Promise<void>;
   #storageCheckAt = 0;
   #storagePressure = false;
   lastError?: string;
@@ -119,7 +120,7 @@ export class DurableRuntime {
     if (configuration.originSessionId !== undefined) text(configuration.originSessionId, "origin session", 128);
     if (configuration.conversationContext !== undefined) text(configuration.conversationContext, "conversation context", 16384);
     if (configuration.domain) {
-      configuration.domain = validateDomainDescriptor(configuration.domain); this.domains.resolve(configuration.domain);
+      configuration.domain = this.domains.prepare(configuration.domain);
       if (configuration.strategyVersion !== 2 || !configuration.workspace.startsWith("agent:") || configuration.allowedWorkspaces.length !== 1 || configuration.allowedWorkspaces[0] !== configuration.workspace
         || configuration.allowWrite || configuration.allowShell || configuration.checks.length) throw new Error("Domain tasks use explicit resource capabilities, not coding flags");
     } else await codingDomain.normalize(configuration, this.root);
@@ -1018,14 +1019,15 @@ export class DurableRuntime {
       about: "Continue after these child tasks have been accepted. Read their persisted results; do not recreate or repeat completed investigations." });
     return JSON.stringify({ waiting: true, waitId: wait.waitId, children: ids, message: "This attempt will end; accepted child results arrive in the durable continuation." });
   }
-  async close(): Promise<void> {
-    if (this.#closed) return;
-    this.#closed = true; clearTimeout(this.#timer); this.#unsubscribe?.();
-    await this.#pumping?.catch(() => undefined);
-    for (const entry of this.#running.values()) entry.controller.abort(new Error("Runtime stopped; checkpoint and reconcile on restart"));
-    await Promise.allSettled([...this.#running.values()].map((entry) => entry.done));
-    for (const release of this.#domainLeases.values()) release(); this.#domainLeases.clear();
-    try { await this.budget.close(); } finally { await this.#release?.(); this.#release = undefined; }
+  close(): Promise<void> {
+    return this.#closing ??= (async () => {
+      this.#closed = true; clearTimeout(this.#timer); this.#unsubscribe?.();
+      await this.#pumping?.catch(() => undefined);
+      for (const entry of this.#running.values()) entry.controller.abort(new Error("Runtime stopped; checkpoint and reconcile on restart"));
+      await Promise.allSettled([...this.#running.values()].map((entry) => entry.done));
+      for (const release of this.#domainLeases.values()) release(); this.#domainLeases.clear();
+      try { await this.budget.close(); } finally { await this.#release?.(); this.#release = undefined; }
+    })();
   }
   #fatal(error: unknown): void {
     this.lastError = message(error); clearTimeout(this.#timer);

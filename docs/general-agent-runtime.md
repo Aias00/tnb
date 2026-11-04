@@ -9,6 +9,7 @@ TNB 的执行内核可以嵌入非编码应用；持久任务运行时通过场�
 | `tnb/agent` / `src/agent/index.ts` | 无界面执行内核：模型流、工具调用、授权边界、压缩回调、消息和调用日志接口；不加载 CLI/TUI/Coding 工具 |
 | `tnb/agent/runtime` / `src/agent/runtime.ts` | 先获得 owner 锁再开 SQLite，注册适配器，提交持久任务和重启恢复 |
 | `src/agent/domain.ts` | 可序列化场景描述、资源声明、能力授权、适配器版本注册和宿主验收接口 |
+| `src/agent/plugins.ts` | 沿原插件系统发现和信任适配器包，事务注册、内容指纹绑定、当前宿主生命周期与清理 |
 | `src/services/runtime/` | 原 Run/Task、调度、等待、上下文、预算、回执、产物和恢复协议 |
 | `src/adapters/coding/` | 原编码 Worker 组合、文件摘要、编码提示词、工作区及 Shell 验收策略；旧 `runtime/worker.ts` 入口继续转发 |
 | `tnb/adapters/research` | 版本化资料读取和报告引用验收；资料客户端由宿主注入 |
@@ -57,7 +58,9 @@ await host.close();
 
 ## 适配器合同
 
-`AgentDomainAdapter` 包含固定的 `id/version`、同步配置校验、`createWorker`、`snapshot`、`accept`，以及可选的 `reconcile` 查询。描述数据只保存 JSON，包括配置引用、资源和能力授权；连接、凭据、回调和实例留在宿主。不要把密钥放进可持久配置，使用宿主凭据引用。版本代表宿主提供的实现合同，框架无法证明宿主用同一版本号替换的任意代码语义相同。
+`AgentDomainAdapter` 包含固定的 `id/version`、同步配置校验、`createWorker`、`snapshot`、`accept`，以及可选的 `reconcile` 查询。描述数据只保存 JSON，包括配置引用、资源和能力授权；连接、凭据、回调和实例留在宿主。不要把密钥放进可持久配置，使用宿主凭据引用。代码直接注册时版本代表宿主提供的实现合同，框架无法证明同版本任意代码语义相同；通过插件装配时，描述另绑定包版本和完整内容指纹，重启不能静默替换。
+
+领域适配器也可以放入现有插件包的 `contributes.adapters`，由 `openAgentRuntime({ plugins: { roots, trustStorePath, enabled } })` 装配。它复用安装、启用、信任、兼容性检查；每包初始化成功才提交注册，关闭排空 Worker 后才释放插件。入口为打包 `.mjs`，本轮采用重启生效，保留直接 `adapters` 注入方式。源码比较、清单和恢复边界见 [领域插件与 DSH/Pi 比较](agent-plugin-comparison.md)；完整离线示例运行 `bun run agent:plugin-demo`。
 
 `snapshot` 必须从真实资源取得版本/摘要，不能使用模型总结；执行前/报告提交时和验收前后检查版本。`accept` 为可安全重放的只读验证，收到候选报告、输入摘要和最近最多 128 项成功工具回执。每项结果预览最多 16,000 字符并显式标记是否截断；缺少必要证据时拒绝，不能从截断内容推断完成。验收至少提供一项检查，最多 64 项，另可附 JSON 证据，整体仍受 1 MiB 产物上限约束。运行时提交 `domain-verified` 表示宿主检查已通过，具体语义由适配器声明。
 

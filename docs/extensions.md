@@ -1,5 +1,12 @@
 # Plugins and Skills
 
+Domain adapters can also be distributed in the existing plugin package through
+`contributes.adapters`. Executable entries require an explicit trust store and
+are loaded by `openAgentRuntime({ plugins: ... })`; Coding CLI discovery does
+not execute these entries. Adapter contributions always require a host restart.
+See [domain plugins and the DSH/Pi comparison](agent-plugin-comparison.md) for
+the manifest, transactional registration, pinned package recovery and example.
+
 tnb loads user plugins from `~/.tnb/plugins`, project plugins from
 `.tnb/plugins`, user Skills from `~/.tnb/skills`, and project Skills
 from `.tnb/skills`. Local directories can be installed and removed through

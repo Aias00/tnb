@@ -9,7 +9,9 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | { [key:
 export type ResourceClaim = { id: string; mode: "read" | "write" };
 export type CapabilityGrant = { name: string; resources: string[]; mode: "read" | "write" };
 /** Persisted data only. Credentials and executable adapter code remain on the host. */
-export type DomainDescriptor = { id: string; version: string; config: JsonValue; resources: ResourceClaim[]; grants: CapabilityGrant[] };
+export type AdapterPluginIdentity = { name: string; version: string; fingerprint: string };
+export type DomainDescriptor = { id: string; version: string; config: JsonValue; resources: ResourceClaim[]; grants: CapabilityGrant[]; plugin?: AdapterPluginIdentity };
+export type PluginAdapterRegistration = { adapter: AgentDomainAdapter; plugin: AdapterPluginIdentity };
 export type DomainContext = { descriptor: DomainDescriptor; namespace: string; run: DurableRun; task: DurableTask; signal: AbortSignal };
 export type DomainAcceptance = { checks: Array<{ command: string; output: string }>; evidence?: JsonValue };
 export type DomainOperation = { operationId: string; call: ToolUseBlock; input: unknown };
@@ -38,8 +40,14 @@ export function validateDomainDescriptor(descriptor: DomainDescriptor): DomainDe
     throw new Error("Adapter descriptor must contain JSON data only");
   };
   visit(descriptor);
-  if (!descriptor || Object.keys(descriptor).some(key => !["id", "version", "config", "resources", "grants"].includes(key))) throw new Error("Invalid adapter descriptor");
+  if (!descriptor || Object.keys(descriptor).some(key => !["id", "version", "config", "resources", "grants", "plugin"].includes(key))) throw new Error("Invalid adapter descriptor");
   text(descriptor.id, "adapter ID", 128); text(descriptor.version, "adapter version", 128);
+  if (descriptor.plugin !== undefined) {
+    const plugin = descriptor.plugin;
+    if (!plugin || typeof plugin !== "object" || Array.isArray(plugin)) throw new Error("Invalid adapter plugin identity");
+    text(plugin.name, "plugin name", 64); text(plugin.version, "plugin version", 128);
+    if (Object.keys(plugin).some(key => !["name", "version", "fingerprint"].includes(key)) || !/^[a-f0-9]{64}$/.test(plugin.fingerprint)) throw new Error("Invalid adapter plugin identity");
+  }
   if (descriptor.id === "coding") throw new Error("coding is a reserved adapter ID");
   if (!Array.isArray(descriptor.resources) || !descriptor.resources.length || descriptor.resources.length > 32) throw new Error("Adapter needs one to 32 resource claims");
   if (!Array.isArray(descriptor.grants) || descriptor.grants.length > 64) throw new Error("Invalid capability grants");
@@ -58,20 +66,38 @@ export function validateDomainDescriptor(descriptor: DomainDescriptor): DomainDe
   return structuredClone(descriptor);
 }
 
+export function bindDomainAdapter(adapter: AgentDomainAdapter): AgentDomainAdapter {
+  text(adapter.id, "adapter ID", 128); text(adapter.version, "adapter version", 128);
+  if (adapter.id === "coding") throw new Error("Reserved adapter identity");
+  return Object.freeze({ id: adapter.id, version: adapter.version, validate: adapter.validate.bind(adapter), createWorker: adapter.createWorker.bind(adapter),
+    snapshot: adapter.snapshot.bind(adapter), accept: adapter.accept.bind(adapter), ...(adapter.reconcile ? { reconcile: adapter.reconcile.bind(adapter) } : {}) });
+}
+
 export class DomainRegistry {
   readonly #adapters = new Map<string, AgentDomainAdapter>();
-  constructor(adapters: readonly AgentDomainAdapter[] = []) {
-    for (const adapter of adapters) {
+  readonly #plugins = new Map<string, AdapterPluginIdentity>();
+  constructor(adapters: readonly AgentDomainAdapter[] = [], plugins: readonly PluginAdapterRegistration[] = []) {
+    for (const { adapter, plugin } of [...adapters.map(adapter => ({ adapter, plugin: undefined })), ...plugins]) {
       text(adapter.id, "adapter ID", 128); text(adapter.version, "adapter version", 128);
       const key = digestJson({ id: adapter.id, version: adapter.version });
       if (adapter.id === "coding" || this.#adapters.has(key)) throw new Error("Duplicate or reserved adapter identity");
-      this.#adapters.set(key, Object.freeze({ id: adapter.id, version: adapter.version, validate: adapter.validate.bind(adapter), createWorker: adapter.createWorker.bind(adapter),
-        snapshot: adapter.snapshot.bind(adapter), accept: adapter.accept.bind(adapter), ...(adapter.reconcile ? { reconcile: adapter.reconcile.bind(adapter) } : {}) }));
+      this.#adapters.set(key, bindDomainAdapter(adapter));
+      if (plugin) this.#plugins.set(key, Object.freeze({ ...plugin }));
     }
   }
+  /** Pin new submissions. Recovery must use resolve directly and cannot acquire a new identity. */
+  prepare(descriptor: DomainDescriptor): DomainDescriptor {
+    const value = validateDomainDescriptor(descriptor);
+    const plugin = this.#plugins.get(digestJson({ id: value.id, version: value.version }));
+    if (!value.plugin && plugin) value.plugin = { ...plugin };
+    this.resolve(value);
+    return validateDomainDescriptor(value);
+  }
   resolve(descriptor: DomainDescriptor): AgentDomainAdapter {
-    const adapter = this.#adapters.get(digestJson({ id: descriptor.id, version: descriptor.version }));
+    const key = digestJson({ id: descriptor.id, version: descriptor.version });
+    const adapter = this.#adapters.get(key);
     if (!adapter) throw new Error(`Adapter unavailable: ${descriptor.id}@${descriptor.version}; register the pinned version or migrate explicitly`);
+    if (digestJson(descriptor.plugin ?? null) !== digestJson(this.#plugins.get(key) ?? null)) throw new Error(`Adapter plugin identity changed: ${descriptor.id}@${descriptor.version}; restore the pinned package or migrate explicitly`);
     const validation: unknown = adapter.validate(structuredClone(descriptor.config));
     if (validation && typeof (validation as { then?: unknown }).then === "function") {
       void Promise.resolve(validation).catch(() => undefined);

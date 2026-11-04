@@ -110,6 +110,7 @@ export type ExternalPluginToolContribution = {
 };
 
 export type PluginToolContribution = BuiltInPluginToolContribution | ExternalPluginToolContribution;
+export type PluginAdapterContribution = { id: string; version: string; entry: string };
 
 export type LoadedPlugin = {
   name: string;
@@ -140,6 +141,7 @@ export type LoadedPlugin = {
   mcpPath?: string;
   tools?: string[];
   toolContributions: PluginToolContribution[];
+  adapterContributions?: PluginAdapterContribution[];
   contributionSummary: {
     skills: boolean;
     agents: boolean;
@@ -148,6 +150,7 @@ export type LoadedPlugin = {
     mcpServers: boolean;
     builtInTools: string[];
     externalTools: string[];
+    adapters?: string[];
   };
 };
 
@@ -159,7 +162,7 @@ export type PluginLoadResult = {
 export async function loadPlugins(
   roots: Array<{ directory: string; source: LoadedPlugin["source"] }>,
   enabled: Record<string, boolean> = {},
-  options: { trustStorePath?: string } = {},
+  options: { trustStorePath?: string; includeDisabled?: boolean } = {},
 ): Promise<PluginLoadResult> {
   const plugins = new Map<string, LoadedPlugin>();
   const errors: PluginLoadResult["errors"] = [];
@@ -179,7 +182,8 @@ export async function loadPlugins(
         const root = await realpath(candidate);
         const manifest = await readManifest(root, entry.name);
         const key = manifest.name.toLowerCase();
-        if (enabled[manifest.name] === false || enabled[key] === false) continue;
+        const disabled = enabled[manifest.name] === false || enabled[key] === false;
+        if (disabled && !options.includeDisabled) continue;
         const explicitlyEnabled = enabled[manifest.name] === true || enabled[key] === true;
         if (plugins.has(key)) continue;
         const skillsDir = join(root, "skills");
@@ -197,7 +201,7 @@ export async function loadPlugins(
           root,
           source: source.source,
           explicitlyEnabled,
-          active: requestedActive && (trust === "trusted" || trust === "not-required"),
+          active: !disabled && requestedActive && (trust === "trusted" || trust === "not-required"),
           ...(fingerprint ? { fingerprint } : {}),
           trust,
           skillsDir,
@@ -218,6 +222,7 @@ export async function loadPlugins(
             externalTools: manifest.toolContributions
               .filter((tool): tool is ExternalPluginToolContribution => tool.type === "external")
               .map((tool) => tool.id),
+            ...(manifest.adapterContributions?.length ? { adapters: manifest.adapterContributions.map(adapter => `${adapter.id}@${adapter.version}`) } : {}),
           },
         });
       } catch (error) {
@@ -247,6 +252,7 @@ async function readManifest(root: string, fallbackName: string): Promise<{
   mcpServers?: string;
   tools?: string[];
   toolContributions: PluginToolContribution[];
+  adapterContributions?: PluginAdapterContribution[];
 }> {
   const candidates = [join(root, ".tnb-plugin", "plugin.json"), join(root, "plugin.json")];
   let value: unknown;
@@ -294,6 +300,10 @@ async function readManifest(root: string, fallbackName: string): Promise<{
   const tools = toolContributions
     .filter((tool): tool is BuiltInPluginToolContribution => tool.type === "builtin")
     .map((tool) => tool.id);
+  const adapterContributions = optionalAdapterContributions(contributes?.adapters, manifestPath ?? root, root);
+  if (adapterContributions.length && (manifestVersion !== 2 || apiVersion !== "tnb.plugin/v1" || !version)) {
+    throw new Error("Adapter plugins require manifestVersion 2, apiVersion tnb.plugin/v1 and a package version");
+  }
   return {
     name,
     manifestVersion,
@@ -303,12 +313,30 @@ async function readManifest(root: string, fallbackName: string): Promise<{
     ...(apiVersion ? { apiVersion } : {}),
     ...(compatibility ? { compatibility } : {}),
     ...(documentation ? { documentation } : {}),
-    lifecycle,
+    lifecycle: adapterContributions.length ? { ...lifecycle, reload: "restart" } : lifecycle,
     ...(hooks ? { hooks } : {}),
     ...(mcpServers ? { mcpServers } : {}),
     ...(tools?.length ? { tools } : {}),
     toolContributions,
+    ...(adapterContributions.length ? { adapterContributions } : {}),
   };
+}
+
+function optionalAdapterContributions(value: unknown, path: string, root: string): PluginAdapterContribution[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || !value.length || value.length > 32) throw new Error(`Plugin contributes.adapters must contain 1..32 entries: ${path}`);
+  const seen = new Set<string>();
+  return value.map((item, index) => {
+    if (!isRecord(item)) throw new Error(`Invalid adapter contribution: ${path}`);
+    const id = requiredIdentifier(item.id, `adapters[${index}].id`, path);
+    const version = requiredString(item.version, `adapters[${index}].version`, path);
+    if (version.length > 128 || id === "coding" || seen.has(`${id}@${version}`)) throw new Error(`Duplicate or reserved adapter contribution: ${path}`);
+    seen.add(`${id}@${version}`);
+    const entry = requiredString(item.entry, `adapters[${index}].entry`, path);
+    contributionPath(root, entry, "adapters.entry");
+    if (!entry.endsWith(".mjs")) throw new Error(`Adapter entries must be bundled .mjs modules: ${path}`);
+    return { id, version, entry };
+  });
 }
 
 function validatePluginCompatibility(input: {

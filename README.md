@@ -7,6 +7,9 @@ non-coding applications through versioned domain adapters. Coding remains the
 default CLI profile. See [general agent runtime](docs/general-agent-runtime.md)
 and run `bun run agent:research-demo` for an offline research example with real
 tool receipts and adapter acceptance.
+Domain adapters can also use the existing plugin installer and trust store;
+see [plugin source comparison and usage](docs/agent-plugin-comparison.md) or run
+`bun run agent:plugin-demo` for a bundled, installed offline example.
 
 This repository uses public documentation and authorized implementation references. Imported concepts are reduced to tnb's requirements and normalized to tnb naming; product-specific branding, gateways, telemetry, and deployment assumptions are excluded.
 
