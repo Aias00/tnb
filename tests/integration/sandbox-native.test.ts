@@ -38,7 +38,7 @@ describe.skipIf(!available.supported)(`native sandbox effects (${process.platfor
 
   test("backend can actually launch under its selected policy", async () => {
     await probeSandboxRuntime(runtime(), cwd, process.env);
-  });
+  }, 20_000);
 
   test.skipIf(process.platform !== "linux")("Linux descendants inherit no effective capabilities", async () => {
     const result = await run(runtime(), "/bin/cat", ["/proc/self/status"]);

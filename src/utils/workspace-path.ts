@@ -1,6 +1,6 @@
 import { realpathSync } from "node:fs";
 import { lstat, realpath } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep, toNamespacedPath } from "node:path";
 
 export function resolveWorkspaceRoot(workspaceRoot: string): string {
   return realpathSync(resolve(workspaceRoot));
@@ -11,7 +11,7 @@ export function assertInsideWorkspace(
   target: string,
   operation: "read" | "write",
 ): void {
-  const pathFromWorkspace = relative(workspaceRoot, target);
+  const pathFromWorkspace = relative(toNamespacedPath(workspaceRoot), toNamespacedPath(target));
   if (
     pathFromWorkspace === ".." ||
     pathFromWorkspace.startsWith(`..${sep}`) ||
@@ -95,7 +95,7 @@ async function canonicalCandidate(candidate: string, operation: "read" | "write"
 }
 
 function isInside(root: string, target: string): boolean {
-  const pathFromRoot = relative(root, target);
+  const pathFromRoot = relative(toNamespacedPath(root), toNamespacedPath(target));
   return pathFromRoot !== ".." && !pathFromRoot.startsWith(`..${sep}`) && !isAbsolute(pathFromRoot);
 }
 
