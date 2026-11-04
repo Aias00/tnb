@@ -40,7 +40,9 @@ export function createSandbox(options: {
   settings?: SandboxSettings | undefined;
   env: Record<string, string | undefined>;
 }, host: SandboxHost = createSandboxHost(options.env)): SandboxRuntime | undefined {
-  options = structuredClone(options);
+  // process.env is a non-cloneable host object on Bun/Windows. Snapshot its
+  // entries before cloning configuration so later caller changes cannot leak in.
+  options = { ...options, env: { ...options.env }, settings: structuredClone(options.settings) };
   const config = mergeSandboxConfig(options);
   if (!config.enabled) return undefined;
   const availability = getAvailabilityForConfig({ config, env: options.env }, host);

@@ -20,7 +20,7 @@ export async function withFileMutation<T>(target: string, operation: () => Promi
     }
   }
   const identity = createHash("sha256").update(canonical).digest("hex");
-  const directory = join(tmpdir(), `tnb-file-mutations-${process.getuid?.() ?? "local"}`);
+  const directory = join(tmpdir(), `tnb-file-mutations-${process.platform === "win32" ? "local" : process.getuid?.() ?? "local"}`);
   return withFileLock(join(directory, identity), operation);
 }
 

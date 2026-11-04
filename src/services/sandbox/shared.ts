@@ -1,6 +1,6 @@
 import { accessSync, constants, existsSync, realpathSync } from "node:fs";
 import { homedir, platform, tmpdir } from "node:os";
-import { dirname, delimiter, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import type {
   SandboxCommandPreference,
@@ -153,7 +153,9 @@ export function findExecutable(
     : [...names];
   for (const directory of directories) {
     for (const name of candidates) {
-      const candidate = join(directory, name);
+      // Host adapters also simulate other platforms in tests; do not let the
+      // executing OS change separators in the supplied target PATH.
+      const candidate = directory.replace(/[\\/]+$/, "") + "/" + name;
       if (host.canExecute(candidate)) return candidate;
     }
   }
@@ -162,7 +164,7 @@ export function findExecutable(
 
 function splitPathEntries(pathValue: string | undefined, targetPlatform: NodeJS.Platform = platform()): string[] {
   if (!pathValue) return [];
-  const separator = targetPlatform === "win32" ? ";" : delimiter;
+  const separator = targetPlatform === "win32" ? ";" : ":";
   return pathValue.split(separator).filter(Boolean);
 }
 

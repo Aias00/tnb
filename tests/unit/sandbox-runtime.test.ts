@@ -24,6 +24,15 @@ function host(overrides: Partial<ReturnType<typeof createSandboxHost>>) {
 }
 
 describe("sandbox runtime factory", () => {
+  test("snapshots non-cloneable environment objects before retaining sandbox options", () => {
+    const values = { PATH: "/usr/bin:/bin", TNB_BWRAP_PATH: "/usr/bin/bwrap" };
+    const env = new Proxy(values, {});
+    const settings = { profile: "restrictive" as const, allowedPaths: ["/approved"] };
+    const runtime = createSandbox({ requested: true, env, settings }, host({ platform: "linux" }))!;
+    values.TNB_BWRAP_PATH = "/changed"; settings.allowedPaths.push("/unapproved");
+    expect(runtime.allowedPaths).toEqual(["/approved"]);
+    expect(runtime.wrap("/bin/sh", ["-c", "true"], "/workspace").file).toBe("/usr/bin/bwrap");
+  });
   test("system bin paths never expand strict read access to the entire filesystem", () => {
     const roots = defaultReadableRoots("/workspace", [], { PATH: "/bin:/usr/bin:/" }, host({ execPath: "/bin/bun" }));
     expect(roots).not.toContain("/"); expect(roots).toContain("/bin"); expect(roots).toContain("/workspace");
