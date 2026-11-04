@@ -306,6 +306,9 @@ export type StreamJsonCliOptions = Omit<CliOptions, "promptContent"> & {
 };
 
 export async function runStreamJsonCli(options: StreamJsonCliOptions): Promise<number> {
+  // Subscribe before asynchronous resume/fork preparation: readline starts flowing
+  // immediately and can otherwise lose piped input (including EOF) during startup.
+  const input = options.input[Symbol.asyncIterator]();
   const sessionIdFactory = options.sessionIdFactory ?? randomUUID;
   const permissionSessionRules = options.permissionSessionRules ?? [];
   const configDir = options.configDir ?? options.env.TNB_HOME ?? join(homedir(), ".tnb");
@@ -382,13 +385,10 @@ export async function runStreamJsonCli(options: StreamJsonCliOptions): Promise<n
       return undefined;
     }
     if (record.subtype === "set_model") {
-      const separator = record.model.indexOf("/");
-      if (separator > 0) {
-        selectedProvider = record.model.slice(0, separator);
-        selectedModel = record.model.slice(separator + 1);
-      } else {
-        selectedModel = record.model;
-      }
+      const catalog = await loadProviderCatalog({ configDir, env: options.env });
+      const selection = resolveInteractiveModel(catalog, record.model);
+      selectedProvider = selection.provider.id;
+      selectedModel = selection.model.id;
       return {
         provider: selectedProvider,
         model: selectedModel,
@@ -478,7 +478,7 @@ export async function runStreamJsonCli(options: StreamJsonCliOptions): Promise<n
 
   const inputTask = (async () => {
     try {
-      for await (const line of options.input) {
+      for await (const line of { [Symbol.asyncIterator]: () => input }) {
         if (!line.trim()) continue;
         const record = parseStreamInput(line);
         if (record.type === "user") {
@@ -4855,7 +4855,7 @@ function stripInteractiveRuntimeOptions(argv: string[]): string[] {
     "--attachment",
     "-a",
   ]);
-  const optionsWithMultipleValues = new Set(["--add-dir", "--mcp-config", "--tools"]);
+  const optionsWithMultipleValues = new Set(["--add-dir", "--mcp-config"]);
   const flags = new Set(["--continue", "--fork-session", "--yolo", "--dangerously-skip-permissions", "--strict-mcp-config", "-p", "--print"]);
   flags.add("--fast");
   const result: string[] = [];

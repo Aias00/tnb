@@ -68,6 +68,10 @@ Because invoking a skill may lead to file, process, network, or MCP activity,
 the `skill` tool is classified as execute-risk and requires an allow rule or explicit YOLO
 permission in the current non-interactive CLI.
 
+Use `skill(review-code)` to allow or deny a particular Skill. The name is
+normalized to lowercase before policy matching; `skill` applies to all Skills.
+An explicit named deny still takes precedence over a broad allow or YOLO.
+
 The `skill` tool exposes only names plus compact descriptions, activation hints,
 and keywords to the parent model. Full instructions and the resource manifest
 are loaded only after model invocation. This follows model-driven Skill

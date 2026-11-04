@@ -260,3 +260,49 @@ macOS / Bun 1.3.14 最终验证：类型检查、构建通过；要求原生沙�
 最终 macOS / Bun 1.3.14 验证：类型检查、构建通过；要求原生沙箱的完整回归 **802 pass / 2 skip / 0 fail，804 tests / 125 files**。两项跳过为其他平台专属测试。两处缺陷均先通过回归复现，再验证修复。前两轮失败证据保留，未将其隐藏或重新归类为成功。
 
 测试程序为仓库外 `/Volumes/data/tnb-review-2026-11-03/magpie-free-live.ts`，本地转发器仅允许所选 free 分组和最多 12 次请求，原样转发真实上游响应；每次请求 120 秒、整体 330 秒边界。成功证据在 `/Volumes/data/tnb-review-2026-11-03/magpie-free-live-2026-11-04T03-30-01-645Z/`，包括 summary.json、requests.json、events.jsonl、result.json、原始响应和终端日志。失败证据分别在同级 `03-20-34-156Z` 和 `03-23-59-728Z` 目录。完整回归日志为 magpie-live-full-tests.log；未向第三方发送消息或通知。
+
+## 10 普通会话、SDK、扩展与完整终端入口验证
+
+用户要求扩大到完整功能验证后，在 `dde9ef9` 基线上对普通执行链、扩展与交互入口建立覆盖矩阵。不是把上一节的任务模式测试推广为其他模式已通过。当前 **29 组场景均取得通过证据**，覆盖实际编译 CLI、SDK 子进程、真实 PTY、独立安装包和 Magpie free 分组。普通会话与 durable Worker 分别验证，配置、工作区、插件、MCP 服务、进程及文件均在隔离测试目录中创建。
+
+所有真实模型请求仍只允许 `group/free-models`，没有修改 Magpie 分组路由。响应头实际记录到 `workbuddy-ai/hy3` 和 `tokenharbor/deepseek-v4.1-flash:free`。29 组的探索、失败与复测共 185 次请求，另有最终 durable 回归 6 次，共 191 次；包括测试脚本修正前的请求，未仅统计成功轮次。没有为这些模型补写虚构零价格，CLI 的零费用估算不能充当服务商账单证据。
+
+| 功能面 | 实际验证与判断依据 |
+| --- | --- |
+| 启动、配置和管理 | help/version、models/status/doctor、skills/agents/hooks/plugins/MCP/sessions/jobs、三种 shell 补全，以及 config set/get/unset。管理命令没有调用模型。 |
+| 普通对话与输出 | 普通 JSON 输出、实时 JSONL、多轮对话、真实 usage；不通过 `/task` 转接。 |
+| 编码闭环 | 模型实际调用 glob/grep/read/edit/write/notebook_edit/bash，修复加法，清除 Notebook 的旧输出，执行 `bun test`；独立检查实际文件与测试结果，拒绝把只有工具请求或完成报告算执行成功。 |
+| 权限与沙箱 | SDK 允许与拒绝回调；plan 拒绝写入；显式 deny 优先；符号链接写入不能逃逸；原生沙箱拒绝工作区外写入。 |
+| SDK 控制 | 有限输入流的两轮独立写入均获得审批；context usage、任务 CRUD、非运行任务 stop 拒绝、插件 reload、MCP 添加/启用/重连/删除、权限和模型切换；真实流开始后取消。迟到审批与监听清理另有进程回归。 |
+| 会话与上下文 | 进程重开后 resume、fork 不修改来源会话、continue 选择最新分支；真实模型自动摘要把测试历史从约 3,945 tokens 降到 371，并在重开后保留历史代号；TUI 手动压缩从约 3,460 降到 453，导出和会话分支均有磁盘证据。自动压缩使用预先构造的历史，不宣称这些旧消息全部来自真人交互。 |
+| Agent 与计划 | 实际 explore 子 Agent 读取文件，限制子 Agent 工具；进入 plan、读需求、强制 exit_plan_mode 审批后才写入；待办和持久 work-item CRUD。 |
+| Skill | 元数据发现、按名称授权、独立 fork、仅 read 子工具、按需读取支持文件。父请求没有提前注入资源代号。 |
+| MCP 与 Hook | 本地真实 stdio 服务进程和 HTTP 服务完成握手、工具发现与调用；Hook 的 SessionStart/UserPromptSubmit/PreToolUse/PostToolUse/Stop/SessionEnd 有日志，模型实际收到 Hook 注入的上下文。服务为受控本地实现，不是假称联通过第三方 MCP。 |
+| 插件 | 未信任插件不激活，显式信任后贡献 security_scan 并被模型调用；内容变更后原信任失效。 |
+| Shell 与分发包 | 后台进程启动/读取/停止；真实 PTY 启动、输入、读取、90×24 resize 和停止。重新构建后通过 `install:local --prefix` 安装到源码仓库外，验证随包 JS/native 资源可用；依然需要系统 Node。 |
+| 搜索与工作区 | 本地符号索引、独立安全扫描命令和插件扫描工具；实际 HTTPS 读取 example.com；独立 Git worktree 启动，来源跟踪文件没有变化。 |
+| TUI 与文本 REPL | 完整 CLI 在真实 PTY 中自动提问、方向键选择 BLUE、允许一次写入、限制模型只看到两个工具、退出还原终端；TUI 本地 slash 不调用模型，并完成 rename/export/compact/fork。文本 REPL 验证普通多轮与其实际支持的任务命令。 |
+| 最终 durable 回归 | 最终构建再次走通 `/task` 自动提问、关闭对话、owner 重启、原 Task/wait 恢复、直接回答、写文件、原生验收和完成提醒，6 次真实请求，约 26 秒，succeeded。 |
+
+### 本轮发现并修复的实现问题
+
+1. **fork 启动丢失管道输入。** readline 在异步 fork 准备期间已经流动，稍后订阅会遗漏输入和 EOF。现在先取得迭代器，再做异步初始化。进程回归验证 fork 继承上下文、只调用一次模型且不修改来源。
+2. **SDK 取消路径及资源清理。** 单轮取消曾调用仅供双向会话的 interrupt 并同步抛错；结束后取消监听仍保留；取消后迟到审批会写入关闭的输入。现在 signal 终止整个查询并关闭子进程，移除监听，忽略迟到回调。
+3. **有限多轮输入提前关闭审批通道。** 输入生成器完成不等于所有工具已获得审批。现在按已提交轮次与终态结果计数，在最后一轮结果到达后才关闭 stdin。回归包含两轮审批均异步完成的场景。
+4. **SDK 模型 ID 中的 `/` 被错误解释。** `group/free-models` 曾被拆成 Provider `group`。现在复用配置模型解析，先匹配完整 ID，也支持显式 provider/model；非法切换不污染原选择。
+5. **按 Skill 名称的权限规则没有匹配内容。** 现在 `skill(review)` 使用规范小写名称，真实授权可生效，显式 named deny 仍优先于 broad allow 和 YOLO。
+6. **TUI 丢弃 `--tools`。** 构造实际对话参数时误删显式工具选择。现在保留限制；新增完整 CLI 的真实 PTY 回归，核对 Provider 请求中的工具目录，而不只测试参数解析器。
+7. **编译后的 PTY 无法加载模块。** Node 子进程不能 require Bun 虚拟文件系统。build 现复制 node-pty JS 与对应平台原生包，运行时从二进制旁的真实目录加载，隔离安装测试验证完整生命周期。
+8. **跨文件系统精度缓存使正常锁失效。** `/tmp` 与挂载工作区时间戳精度不同，proper-lockfile 在共享 fs 对象上缓存首个探测值，导致正常续租后 mtime 不匹配。现在每把锁使用独立 fs facade，独立探测精度，没有放宽所有权检查或忽略失效。新增混合精度回归先复现错误再验证修复；最终真实 TUI 多轮、审批和退出未再出现 ECOMPROMISED。
+
+macOS / Bun 1.3.14 最终结果：类型检查、构建通过；要求原生沙箱的完整回归 **811 pass / 2 skip / 0 fail，813 tests / 128 files**。新增 9 个回归，跳过项仍为其他平台专属。后续只修改文档和仓库外测试驱动，没有在这个结果后调整生产代码。隔离安装位于 `/Volumes/data/tnb-review-2026-11-03/full-installed/`，没有替换用户正常安装；测试进程和本地服务已清理。
+
+### 验证边界与保留问题
+
+- 非 TTY 文本 REPL 只原生处理 `/task` 及别名、`/runtime`、`/exit`、`/quit`，其他输入沿普通 prompt 路径；它与 TUI 的完整 slash 管理不等价。README 已明确，自动化应使用 CLI 子命令或 stream-json SDK。
+- 短对话的模型摘要可能比源历史更大；手动压缩会明确拒绝，不替换历史。足量历史的手动与自动压缩均另行通过，没有为了测试而取消缩小检查。
+- free 模型偶尔只描述计划、不调用工具，或者在普通文本里打印伪工具标记，也可能额外做只读检查。本次判断以实际 tool execution 回执、磁盘状态及宿主检查为准，文字中的工具名和自述没有视作执行证据。编排框架不能单凭模型遵循提示来保证业务完成。
+- Workflow、Team、goal loop、远程控制、重试/fallback、断流/崩溃窗口、LSP、其他 MCP 协议及 OAuth、图像与多模态适配仍由完整自动化测试中的受控 fixture 验证；本轮没有把它们标为真实外部服务全部联通。未调用 Brave 或付费图像接口，未登录外部 OAuth/IDE，未发布更新、反馈或对第三方发送消息。
+- 真实调用均为短流程；不代表连续数小时稳定性、Linux/Windows、全部 free 成员或任意项目已经验证。
+
+汇总为仓库外 `/Volumes/data/tnb-review-2026-11-03/full-functional-verification.json`，列出 29 组各自通过的证据目录、全部探索/失败/复测记录、实际路由和限制。测试驱动为 full-live.ts、full-live-extra.ts、full-live-tui.ts；每个目录保留请求/响应、JSONL、服务器协议日志、真实终端原始及还原文本。最终 TUI 证据在 `full-live-2026-11-04T04-13-02-973Z/`；最终 durable 证据在 `magpie-free-live-2026-11-04T04-13-23-143Z/`。完整回归日志为 full-regression.log，类型检查与构建日志为 full-typecheck.log、full-build.log。

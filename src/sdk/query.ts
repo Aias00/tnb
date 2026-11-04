@@ -113,13 +113,18 @@ class SubprocessQuery implements Query {
   readonly #pendingControls = new Map<string, { resolve(value: unknown): void; reject(error: Error): void }>();
   readonly #multiTurn: boolean;
   readonly #canUseTool: CanUseTool | undefined;
+  readonly #abortSignal: AbortSignal | undefined;
   readonly #abortHandler: (() => void) | undefined;
   #closed = false;
   #receivedResult = false;
+  #inputComplete = false;
+  #pendingUserTurns = 0;
   #stderr = "";
 
   constructor(input: QueryInput) {
     const options = input.options ?? {};
+    options.signal?.throwIfAborted();
+    this.#abortSignal = options.signal;
     if (options.permissionMode === "bypassPermissions" && options.env?.TNB_DISABLE_YOLO === "true") {
       throw new Error("bypassPermissions is disabled by TNB_DISABLE_YOLO");
     }
@@ -183,7 +188,11 @@ class SubprocessQuery implements Query {
       if (this.#child.exitCode !== null) this.#finish();
     });
     if (options.signal) {
-      this.#abortHandler = () => { void this.interrupt().catch(() => this.close()); };
+      this.#abortHandler = () => {
+        const reason = options.signal!.reason;
+        this.#fail(reason instanceof Error ? reason : new DOMException("Query aborted", "AbortError"));
+        this.close();
+      };
       if (options.signal.aborted) this.#abortHandler();
       else options.signal.addEventListener("abort", this.#abortHandler, { once: true });
     }
@@ -193,7 +202,8 @@ class SubprocessQuery implements Query {
         message: { role: "user", content: input.prompt },
         parent_tool_use_id: null,
       });
-      if (!this.#multiTurn) this.#child.stdin.end();
+      this.#inputComplete = true;
+      this.#endInputIfComplete();
     } else {
       void this.#pumpInput(input.prompt);
     }
@@ -303,7 +313,8 @@ class SubprocessQuery implements Query {
   async #pumpInput(input: AsyncIterable<SDKUserMessage>): Promise<void> {
     try {
       for await (const message of input) this.#sendUser(message);
-      this.#child.stdin.end();
+      this.#inputComplete = true;
+      this.#endInputIfComplete();
     } catch (error) {
       this.#fail(error instanceof Error ? error : new Error(String(error)));
       this.close();
@@ -331,9 +342,8 @@ class SubprocessQuery implements Query {
     }
     if (message.type === "result") {
       this.#receivedResult = true;
-      if (this.#multiTurn && typeof (message as { subtype?: unknown }).subtype === "string" && typeof this.#canUseTool === "function" && this.#child.stdin.writable) {
-        this.#child.stdin.end();
-      }
+      this.#pendingUserTurns = Math.max(0, this.#pendingUserTurns - 1);
+      this.#endInputIfComplete();
     }
     this.#messages.push(message);
   }
@@ -372,6 +382,7 @@ class SubprocessQuery implements Query {
     } catch (error) {
       result = { behavior: "deny", message: error instanceof Error ? error.message : String(error) };
     }
+    if (this.#closed || !this.#child.stdin.writable) return;
     this.#write({
       type: "control_response",
       request_id: requestId,
@@ -381,6 +392,13 @@ class SubprocessQuery implements Query {
 
   #sendUser(message: SDKUserMessage): void {
     this.#write(message);
+    this.#pendingUserTurns++;
+  }
+
+  #endInputIfComplete(): void {
+    // A finite producer can finish before its tools request approval. Keep the
+    // control channel writable until every submitted turn has a terminal result.
+    if (this.#inputComplete && this.#pendingUserTurns === 0 && this.#child.stdin.writable) this.#child.stdin.end();
   }
 
   #sendControl<T = void>(request: Record<string, unknown>): Promise<T> {
@@ -409,6 +427,7 @@ class SubprocessQuery implements Query {
   }
 
   #finish(): void {
+    if (this.#abortHandler) this.#abortSignal?.removeEventListener("abort", this.#abortHandler);
     this.#messages.close();
     for (const pending of this.#pendingControls.values()) pending.reject(new Error("tnb exited before acknowledging control request"));
     this.#pendingControls.clear();

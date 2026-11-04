@@ -106,6 +106,27 @@ describe("tnb session arguments", () => {
 });
 
 describe("tnb print mode", () => {
+  test("SDK model changes preserve configured slash identifiers and reject invalid selections atomically", async () => {
+    const cwd = await workspace(), configDir = await workspace();
+    await writeFile(join(configDir, "models.json"), JSON.stringify({ providers: { fixture: {
+      api: "openai-completions", baseUrl: "http://127.0.0.1:1/v1", apiKey: "fixture",
+      models: [{ id: "group/free-models", contextWindow: 32000, maxTokens: 256 }],
+    } } }));
+    const transport = new ScriptedTransport([[{ type: "text", index: 0, text: "done" }, { type: "response-end", reason: "end-turn" }]]);
+    async function* input() {
+      for (const [request_id, model] of [["exact", "group/free-models"], ["qualified", "fixture/group/free-models"], ["invalid", "missing/model"]]) {
+        yield JSON.stringify({ type: "control_request", request_id, request: { subtype: "set_model", model } });
+      }
+      yield JSON.stringify({ type: "user", prompt: "Continue with the last valid selection" });
+    }
+    let stdout = "";
+    expect(await runStreamJsonCli({ argv: ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--provider", "fixture", "--model", "group/free-models"],
+      cwd, configDir, env: {}, transport, input: input(), stdout: { write: text => { stdout += text; } }, stderr: { write: () => undefined } })).toBe(0);
+    const controls = stdout.trim().split("\n").map(line => JSON.parse(line)).filter(record => record.type === "control_response");
+    expect(controls.map(record => record.response.subtype)).toEqual(["success", "success", "error"]);
+    expect(controls[0].response.payload).toEqual({ provider: "fixture", model: "group/free-models" });
+    expect(transport.requests[0]?.model).toBe("group/free-models");
+  });
   test("processes multiple stream-json user records in one persistent session", async () => {
     const cwd = await workspace();
     const configDir = await workspace();

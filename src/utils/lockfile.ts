@@ -1,4 +1,5 @@
 import type { CheckOptions, LockOptions, UnlockOptions } from "proper-lockfile";
+import * as nodeFs from "node:fs";
 import { mkdir, open } from "node:fs/promises";
 import { dirname } from "node:path";
 
@@ -13,11 +14,18 @@ function getLockfile(): Lockfile {
 }
 
 export function lock(file: string, options?: LockOptions): Promise<() => Promise<void>> {
-  return getLockfile().lock(file, options);
+  return getLockfile().lock(file, isolatedFilesystem(options));
 }
 
 export function lockSync(file: string, options?: LockOptions): () => void {
-  return getLockfile().lockSync(file, options);
+  return getLockfile().lockSync(file, isolatedFilesystem(options));
+}
+
+function isolatedFilesystem(options?: LockOptions): LockOptions {
+  // proper-lockfile caches timestamp precision on its fs object. /tmp and a
+  // mounted workspace can have different precision; sharing that probe causes
+  // a healthy lease to be declared compromised at the next renewal.
+  return { ...options, fs: { ...(options?.fs ?? nodeFs) } };
 }
 
 export function unlock(file: string, options?: UnlockOptions): Promise<void> {

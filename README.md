@@ -117,6 +117,12 @@ runtime task, worktree, and goal state. `/export` writes
 a plain-text transcript inside the active workspace and derives its default
 filename from the first prompt and current timestamp.
 
+When stdin or stdout is not a terminal, tnb uses a smaller text REPL. Its local
+commands are `/task` (and its aliases), `/runtime`, `/exit`, and `/quit`; other
+input follows the ordinary prompt path. The full slash-command management
+surface requires the TUI. Use CLI subcommands or the stream-json SDK for
+automation.
+
 The Agent can maintain a structured task list for multi-step work. The latest
 list is rendered in the TUI and recovered from session history on later turns.
 It can also ask one to four structured questions. Use the arrow keys and Enter
@@ -433,6 +439,9 @@ PTY mode requires a `node` executable on `PATH` (or `TNB_NODE_PATH`) for
 the native `@lydell/node-pty` host. tnb uses this small host because the
 native PTY event bridge is reliable in Node while the main CLI and compiled
 binary continue to run on Bun.
+The build includes its JS and platform-native companions under
+`dist/node_modules/@lydell/`; keep that directory beside the binary when
+relocating the build. `install:local` copies the complete runtime bundle.
 
 `notebook_edit` performs cell-level replace, insert, and delete operations on
 existing `.ipynb` files. It accepts real Jupyter cell ids and `cell-N`

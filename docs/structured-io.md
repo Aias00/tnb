@@ -48,3 +48,11 @@ The two formats must be selected together and require print mode:
 ```text
 -p --input-format stream-json --output-format stream-json
 ```
+
+The SDK keeps its input channel open until all submitted turns have terminal
+results, so a finite `AsyncIterable` can still approve tools in its last turn.
+Use `options.signal` to cancel the entire query and close its subprocess;
+`interrupt()` is a separate control for an open bidirectional conversation.
+Completed queries remove their abort listener, and late approval callbacks
+cannot write into a cancelled query. Model switching accepts an exact configured
+model ID, including IDs containing `/`, or an explicit `provider/model` name.

@@ -1,7 +1,7 @@
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { platform } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { spawn as spawnChild, type ChildProcessWithoutNullStreams } from "node:child_process";
 import type { Readable } from "node:stream";
 import { randomUUID } from "node:crypto";
@@ -603,7 +603,10 @@ async function spawnPtyBridge(options: {
   signal?: AbortSignal;
 }): Promise<PtyBridge> {
   options.signal?.throwIfAborted();
-  const moduleUrl = import.meta.resolve("@lydell/node-pty");
+  // The Node bridge needs real JS/native files; Bun's virtual bundle cannot
+  // supply a require() target to a separate Node process.
+  const companion = join(dirname(process.execPath), "node_modules", "@lydell", "node-pty", "index.js");
+  const moduleUrl = existsSync(companion) ? companion : import.meta.resolve("@lydell/node-pty");
   const modulePath = moduleUrl.startsWith("file:") ? fileURLToPath(moduleUrl) : moduleUrl;
   const node = options.env.TNB_NODE_PATH ?? "node";
   const host = spawnChild(node, ["-e", PTY_HOST_SOURCE], {
