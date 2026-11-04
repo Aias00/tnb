@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { realpath } from "node:fs/promises";
 import { runtimePaths, runtimeRequest, serveDurableRuntime } from "../services/runtime/server";
-import { ensureRuntime } from "../services/runtime/client";
+import { ensureRuntime, assertConversationOwner } from "../services/runtime/client";
+import type { DurableRun } from "../services/runtime/types";
 import { registerCleanup } from "../utils/cleanup-registry";
 import { withOfflineRuntime, backupRuntime, restoreRuntime, pruneRuntime, runtimeStorageUsage } from "../services/runtime/maintenance";
 
@@ -82,8 +84,9 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
 }
 
 /** Direct user slash commands inherit the active conversation's workspace and selected model. */
-export async function runRuntimeChatCommand(options: { args: string[]; cwd: string; workspace: string; configDir: string;
-  env: Record<string, string | undefined>; provider: string; model: string; sessionId: string }): Promise<string> {
+export type RuntimeChatOptions = { args: string[]; cwd: string; workspace: string; configDir: string;
+  env: Record<string, string | undefined>; provider: string; model: string; sessionId: string };
+export async function runRuntimeChatCommand(options: RuntimeChatOptions): Promise<string> {
   const args = options.args.length ? [...options.args] : ["list"]; const action = args[0]!;
   if (!["submit", "list", "status", "result", "events", "pause", "resume", "cancel", "storage"].includes(action)) throw new Error("/runtime supports submit, list, status, result, events, pause, resume, cancel and storage.");
   const valueFlags = new Set(["--cwd", "--mode", "--check", "--allow-workspace", "--provider", "--model", "--max-budget-usd", "--max-turns", "--command-id", "--config-dir", "--after", "--task"]);
@@ -105,4 +108,52 @@ export async function runRuntimeChatCommand(options: { args: string[]; cwd: stri
     env: options.env, originSessionId: options.sessionId, stdout: { write: (value) => { output += value; } }, stderr: { write: (value) => { error += value; } } });
   if (code) throw new Error(error.trim());
   return action === "submit" ? `Durable task accepted; it continues in the background. Use /runtime status <run-id> or /runtime result <run-id>.\n${output.trim()}` : output.trim();
+}
+
+const LONG_TASK_HELP = `Long tasks · /longtask (aliases: /long, /长任务)
+
+/longtask "objective" [--mode single|auto|multi] [--allow-write] [--allow-shell]
+  [--check "command"]... [--max-budget-usd N] [--max-turns N]
+/longtask list
+/longtask status|result|events|pause|resume|cancel [run-id]
+
+Starts a durable background task using the current workspace and model.
+Writing requires explicit --allow-write and replay-safe --check commands.
+Without a run-id, controls select this conversation's latest task, then the
+workspace's latest task. list shows this workspace's tasks. Use an explicit
+run-id to select another task. Closing the conversation does not cancel work.
+`;
+
+/** A task-oriented slash entry point over the same runtime commands, not another executor. */
+export async function runLongTaskChatCommand(options: RuntimeChatOptions): Promise<string> {
+  let args = [...options.args];
+  if (!args.length || args[0] === "help" || args.includes("--help") || args.includes("-h")) return LONG_TASK_HELP;
+  const actions = new Set(["submit", "list", "status", "result", "events", "pause", "resume", "cancel"]);
+  if (!actions.has(args[0]!)) args.unshift("submit");
+  if (args[0] === "submit") {
+    const flagAt = args.findIndex((value, index) => index > 0 && value.startsWith("--"));
+    const boundary = flagAt < 0 ? args.length : flagAt;
+    args = ["submit", args.slice(1, boundary).join(" "), ...args.slice(boundary)];
+    const result = await runRuntimeChatCommand({ ...options, args });
+    return result.replaceAll("/runtime status <run-id>", "/longtask status").replaceAll("/runtime result <run-id>", "/longtask result");
+  }
+  if (args[0] === "list" || !args[1] || args[1]!.startsWith("--")) {
+    if (args[0] === "list") for (let index = 1; index < args.length; index += 2) {
+      if (!["--cwd", "--config-dir"].includes(args[index]!) || !args[index + 1] || args[index + 1]!.startsWith("--")) throw new Error("Usage: /longtask list [--cwd PATH] [--config-dir PATH]");
+    }
+    const option = (name: string) => { const index = args.indexOf(name); return index < 0 ? undefined : args[index + 1]; };
+    const configDir = resolve(option("--config-dir") ?? options.configDir);
+    const workspace = await realpath(resolve(option("--cwd") ?? options.workspace));
+    assertConversationOwner(await runtimeRequest(configDir, "/health") as Parameters<typeof assertConversationOwner>[0]);
+    const resource = `/runs?workspace=${encodeURIComponent(workspace)}`;
+    const runs = await runtimeRequest(configDir, resource) as DurableRun[];
+    if (args[0] === "list") {
+      return runs.length ? JSON.stringify(runs, null, 2) : '当前工作区没有长任务。使用 /longtask "任务目标" 创建。';
+    }
+    const own = await runtimeRequest(configDir, `${resource}&sessionId=${encodeURIComponent(options.sessionId)}`) as DurableRun[];
+    const run = own.at(-1) ?? runs.at(-1);
+    if (!run) throw new Error('当前工作区没有长任务。使用 /longtask "任务目标" 创建。');
+    args.splice(1, 0, run.runId);
+  }
+  return runRuntimeChatCommand({ ...options, args });
 }

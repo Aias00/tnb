@@ -184,3 +184,9 @@
 回归覆盖自然语言工具交接、前台释放后执行、忙碌时查进度、拒绝授权、Plan、重复 key、跨工作区拒绝、暂停/恢复不重复新建、子 Agent 不暴露工具、旧 owner 拒绝、历史 Plan 恢复、旧 Hook handler 不越权，以及真正的终端 REPL 斜杠路由。对话摘要有 16 KiB 上限，独立 Run 的预算会单独记录；本轮没有增加运行中修改目标或动态扩大授权的消息协议。
 
 补充验证：macOS / Bun 1.3.14 类型检查和构建通过；完整原生沙箱测试 **758 pass / 2 skip / 0 fail，760 tests / 120 files**。两项跳过仍为 Linux/Windows 专属场景。编译后的 `dist/tnb` 使用真实双向 stream-json 对话，经一次 `can_use_tool` 确认提交，自动启动独立 owner；同一 session 下一轮在工作区忙碌时只有控制工具，能查询原 Run；关闭对话后后台继续，最终交付并验收成功。持久记录保留来源 session 和 SQLite 设计上下文，未重复创建工作。全部模型请求来自本地 SSE fixture，无付费调用。验证文件位于仓库外 `/Volumes/data/tnb-review-2026-11-03/conversation-*.log` 和 `compiled-conversation-smoke.json`。
+
+## 5 专用长任务斜杠命令
+
+增加 `/longtask`，别名 `/long`、`/长任务`。直接输入目标时复用 `runtime submit`，不创建另一套执行器；默认只读，写入许可和验收要求保持一致。查询和控制可省略 Run ID，优先选来源 session 最新任务，再选当前工作区最新任务；列表限定当前工作区。TUI 解析、补全和终端 REPL 使用同一斜杠目录；裸命令只显示帮助，不启动工作。
+
+macOS / Bun 1.3.14 验证：类型检查、构建通过，完整测试 **762 pass / 2 skip / 0 fail，764 tests / 121 files**。新增回归覆盖专用命令和别名直接路由、补全、默认任务选择、工作区隔离、暂停/恢复/取消及无副作用帮助。编译后的真实终端 REPL 依次执行 `/longtask` 提交、`/long status`、`/长任务 result`、列表和帮助，只有一个后台 Run、一次本地 worker 模型请求、零次聊天解释请求，最终验收成功。验证记录在仓库外 `longtask-*.log` 和 `compiled-longtask-smoke.json`；无付费模型调用。

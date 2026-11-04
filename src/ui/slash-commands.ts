@@ -2,6 +2,12 @@ import type { TranscriptEntry } from "./transcript/model";
 
 export const SLASH_COMMANDS = [
   {
+    name: "longtask",
+    aliases: ["long", "长任务"] as const,
+    usage: '/longtask "objective" [options] | list|status|result|events|pause|resume|cancel [run-id]',
+    description: "Submit and manage durable long tasks; aliases: /long and /长任务.",
+  },
+  {
     name: "runtime",
     aliases: [] as const,
     usage: '/runtime submit "objective" [options] | list|status|result|events|pause|resume|cancel|storage [run-id]',

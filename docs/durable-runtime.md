@@ -47,6 +47,21 @@ tnb runtime stop
 
 模型会把目标与相关讨论整理成 `objective` 和有界 `context`，沿用当前工作区、Provider 和模型，按现有权限策略申请提交。确认的输入包含写入/Shell 许可、验收命令及可选费用上限。后台 Run 拥有独立预算，不自动与当前聊天的 invocation 额度合并。普通聊天不会仅因为内容长而自动启动任务；模型应在用户明确要求持久/后台执行时调用该工具。
 
+可以直接使用专用长任务命令，`/long` 和 `/长任务` 是别名：
+
+```text
+/longtask "分析项目重试与恢复机制" --mode auto
+/longtask "修复重试逻辑并补测试" --allow-write --allow-shell --check "bun run typecheck"
+/longtask status
+/longtask result
+/longtask pause
+/longtask resume
+/longtask cancel RUN_ID
+/longtask list
+```
+
+裸 `/longtask` 显示帮助，不启动服务或任务。提交可以省略 `submit`；查询和控制省略 Run ID 时，优先定位本对话最新创建的任务，没有则选择当前工作区最新任务。`list` 只列当前工作区，多个任务时可指定 Run ID。默认只读，开放写入仍需明确的许可和验收命令。
+
 也可以使用确定的斜杠命令，两种交互界面均支持：
 
 ```text

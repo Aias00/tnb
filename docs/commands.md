@@ -20,6 +20,13 @@ Incoming model and tool output does not move a viewport that has been detached f
 The Ink session exposes operational commands for the existing runtime instead
 of implementing a second execution path:
 
+- `/longtask "objective" [options]` submits a durable background task using the
+  current workspace and model; `/long` and `/长任务` are aliases. `list`, `status`,
+  `result`, `events`, `pause`, `resume`, and `cancel` manage those tasks. Without
+  a Run ID, controls prefer the current conversation's latest Run, then the
+  workspace's latest Run. Bare `/longtask` shows help without starting work.
+  Writable tasks require `--allow-write` and replay-safe `--check` commands.
+  This entry works in both the TUI and terminal REPL;
 - `/about` reports the CLI/runtime/model/workspace identity;
 - `/reload` (alias `/refresh`) reloads Skills, Agents, commands, Plugins, and
   reconnects MCP servers;

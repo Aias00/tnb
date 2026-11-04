@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { runCli, runInteractiveCli } from "../../src/entrypoints/cli";
-import { runRuntimeChatCommand } from "../../src/entrypoints/runtime";
+import { runRuntimeChatCommand, runLongTaskChatCommand } from "../../src/entrypoints/runtime";
 import { DurableRuntime } from "../../src/services/runtime/engine";
 import { RuntimeStore } from "../../src/services/runtime/store";
 import { serveDurableRuntime, runtimeRequest } from "../../src/services/runtime/server";
@@ -207,4 +207,46 @@ test("busy control hooks cannot reuse a prior foreground handler with workspace 
     } },
   });
   expect(code).toBe(0); expect(error).toBe(""); expect(leaked).toBe(0); expect(f.store.getRun(accepted.run.runId)?.status).toBe("active");
+});
+
+test("long-task slash commands and aliases submit directly without a chat model call", async () => {
+  const f = await fixture(); let output = ""; let error = ""; let modelCalls = 0;
+  const answers = ['/longtask "Inspect durable execution" --mode single', "/long status", "/长任务 list", "/exit"];
+  const code = await runInteractiveCli({ cwd: f.workspace, configDir: f.configDir, env: process.env,
+    argv: ["--provider", "fixture", "--model", "fixture"], sessionIdFactory: () => "longtask-session",
+    transport: { async *stream() { modelCalls++; throw new Error("Long-task slash commands must bypass model interpretation"); } },
+    question: async () => answers.shift() ?? "/exit", stdout: { write: (value) => { output += value; } }, stderr: { write: (value) => { error += value; } } });
+  expect(code).toBe(0); expect(error).toBe(""); expect(modelCalls).toBe(0);
+  expect(output).toContain("/longtask status"); expect(f.store.runs()).toHaveLength(1);
+  const run = f.store.runs()[0]!; expect(run.objective).toBe("Inspect durable execution"); expect(run.policy.mode).toBe("single");
+  expect(output).toContain(run.runId); expect(f.runtime.configuration(run.runId).originSessionId).toBe("longtask-session");
+});
+
+test("long-task controls prefer the current conversation and list only its workspace", async () => {
+  const f = await fixture();
+  const options = { cwd: f.workspace, workspace: f.workspace, configDir: f.configDir, env: process.env, provider: "fixture", model: "fixture", sessionId: "conversation-a" };
+  const execute = (args: string[], sessionId = options.sessionId) => runLongTaskChatCommand({ ...options, sessionId, args });
+  await execute(["Inspect", "protocol", "A"]);
+  await execute(["submit", "Inspect protocol B"], "conversation-b");
+  const [a, b] = f.store.runs();
+  expect(a!.objective).toBe("Inspect protocol A");
+  const other = join(f.root, "other-command-workspace"); await mkdir(other);
+  const outside = await f.runtime.submit({ commandId: "outside-longtask", objective: "Do not select this other workspace", configuration: {
+    workspace: other, allowedWorkspaces: [other], allowWrite: false, allowShell: false, checks: [], maxTurns: 10, maxRetries: 1, compactThreshold: 10000,
+  } });
+  expect(JSON.parse(await execute(["status"])).run.runId).toBe(a!.runId);
+  expect(JSON.parse(await execute(["status"], "new-conversation")).run.runId).toBe(b!.runId);
+  const listed = JSON.parse(await execute(["list"])); expect(listed.map((run: { runId: string }) => run.runId)).toEqual([a!.runId, b!.runId]);
+  expect(listed.some((run: { runId: string }) => run.runId === outside.run.runId)).toBe(false);
+  await execute(["pause"]); await until(() => f.store.getRun(a!.runId)?.status === "paused");
+  expect(f.store.getRun(b!.runId)?.status).toBe("active");
+  await execute(["resume"]); expect(f.store.getRun(a!.runId)?.status).toBe("active"); expect(f.store.runs()).toHaveLength(3);
+  await execute(["cancel"]); await until(() => f.store.getRun(a!.runId)?.status === "cancelled");
+});
+
+test("bare long-task command shows help without starting or accepting work", async () => {
+  const f = await fixture(); const options = { args: [] as string[], cwd: f.workspace, workspace: f.workspace, configDir: join(f.root, "unused-config"), env: process.env,
+    provider: "fixture", model: "fixture", sessionId: "help-session" };
+  const help = await runLongTaskChatCommand(options);
+  expect(help).toContain("/longtask"); expect(help).toContain("--check"); expect(f.store.runs()).toHaveLength(0); expect(f.workerCalls()).toBe(0);
 });

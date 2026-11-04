@@ -203,7 +203,7 @@ import { setShutdownResumeHint, setupGracefulShutdown } from "../utils/graceful-
 import { McpActivityController } from "../ui/mcp-activity-controller";
 import { PermissionController } from "../ui/permission-controller";
 import { QuestionController } from "../ui/question-controller";
-import type { ManagementView, SlashCommandRequest, SlashCommandResult } from "../ui/slash-commands";
+import { parseSlashCommand, type ManagementView, type SlashCommandRequest, type SlashCommandResult } from "../ui/slash-commands";
 import packageJson from "../../package.json";
 import { createDurableTaskTool, DURABLE_CONVERSATION_INSTRUCTIONS } from "../services/runtime/conversation-tool";
 
@@ -2422,10 +2422,12 @@ export async function runInteractiveCli(options: InteractiveCliOptions): Promise
       write: (text) => void options.stdout.write(text),
       sessionIdFactory: () => sessionId,
       async handleCommand(input) {
-        if (!/^\/runtime(?:\s|$)/.test(input)) return false;
+        const parsedCommand = parseSlashCommand(input);
+        if (parsedCommand.kind !== "command" || !["runtime", "longtask"].includes(parsedCommand.command.name)) return false;
         try {
-          const { runRuntimeChatCommand } = await import("./runtime");
-          options.stdout.write(`${await runRuntimeChatCommand({ args: splitCommandWords(input.replace(/^\/runtime\s*/, "")),
+          const { runRuntimeChatCommand, runLongTaskChatCommand } = await import("./runtime");
+          const execute = parsedCommand.command.name === "runtime" ? runRuntimeChatCommand : runLongTaskChatCommand;
+          options.stdout.write(`${await execute({ args: splitCommandWords(parsedCommand.command.argument),
             cwd: options.cwd, workspace: workspaceState.current(), configDir, env: options.env,
             provider: selection.provider.id, model: selection.model.id, sessionId })}\n`);
         } catch (error) { options.stderr.write(`tnb: ${error instanceof Error ? error.message : String(error)}\n`); }
@@ -3197,9 +3199,10 @@ async function runInteractiveSlashCommand(
   command: SlashCommandRequest,
   context: InteractiveSlashCommandContext,
 ): Promise<SlashCommandResult> {
-  if (command.name === "runtime") {
-    const { runRuntimeChatCommand } = await import("./runtime"); const selection = context.currentSelection();
-    return { message: await runRuntimeChatCommand({ args: splitCommandWords(command.argument), cwd: context.cwd,
+  if (command.name === "runtime" || command.name === "longtask") {
+    const { runRuntimeChatCommand, runLongTaskChatCommand } = await import("./runtime"); const selection = context.currentSelection();
+    const execute = command.name === "runtime" ? runRuntimeChatCommand : runLongTaskChatCommand;
+    return { message: await execute({ args: splitCommandWords(command.argument), cwd: context.cwd,
       workspace: context.currentWorkspaceRoots()[0] ?? context.cwd, configDir: context.configDir, env: context.env,
       provider: selection.provider.id, model: selection.model.id, sessionId: command.sessionId }) };
   }
