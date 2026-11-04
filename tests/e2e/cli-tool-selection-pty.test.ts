@@ -30,7 +30,7 @@ test("full CLI TUI retains an explicit provider-facing tool restriction", async 
   try {
     await until(() => output.includes("\u001b[?2004h"));
     child.stdin.write("\u001b[200~Inspect this project without tools.\u001b[201~");
-    await until(() => output.includes("Inspect this project without tools.")); child.stdin.write("\r");
+    await until(() => output.replaceAll("\u001b[1C", " ").includes("Inspect this project without tools.")); child.stdin.write("\r");
     const tools = await Promise.race([requested.promise, new Promise<never>((_, reject) => setTimeout(() => reject(new Error("No TUI model request")), 8000))]);
     expect(tools).toEqual(["read"]);
     await until(() => output.includes("SELECTION_DONE")); await Bun.sleep(50);

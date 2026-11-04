@@ -104,6 +104,19 @@ function appendTranscript(
   };
 }
 
+function commitStreamingText(state: TuiState): TuiState {
+  return {
+    ...state,
+    transcript: state.transcript.map((entry) => entry.kind === "assistant" && entry.streaming
+      ? reviseTranscriptEntry(entry, { streaming: false })
+      : entry),
+    messages: state.streamingText
+      ? [...state.messages, { role: "assistant", text: state.streamingText }]
+      : state.messages,
+    streamingText: "",
+  };
+}
+
 export function reduceTuiState(state: TuiState, action: TuiAction): TuiState {
   if (action.type === "activity") return { ...state, activity: action.phase };
   if (action.type === "notice") {
@@ -167,6 +180,7 @@ export function reduceTuiState(state: TuiState, action: TuiAction): TuiState {
     };
   }
   if (action.type === "model-event") {
+    if (action.event.type === "response-end") return commitStreamingText(state);
     if (action.event.type === "usage") {
       const usage = addUsage(state.usage, action.event.usage);
       return {
@@ -204,6 +218,7 @@ export function reduceTuiState(state: TuiState, action: TuiAction): TuiState {
     };
   }
   if (action.type === "tool-start") {
+    state = commitStreamingText(state);
     const todos = action.name === "todo_write" ? todoItems(action.input) : state.todos;
     const transcriptUpdate = action.name === "todo_write"
       ? {}
@@ -281,11 +296,14 @@ export function reduceTuiState(state: TuiState, action: TuiAction): TuiState {
   }
   const committed = state.transcript.map((entry) => entry.kind === "assistant" && entry.streaming
     ? reviseTranscriptEntry(entry, { streaming: false })
-    : entry);
+    : entry.kind === "tool" && entry.status === "running"
+      ? reviseTranscriptEntry(entry, { status: "failed", output: action.message })
+      : entry);
   const withCommitted = { ...state, transcript: committed };
   return {
     ...withCommitted,
     ...appendTranscript(withCommitted, { kind: "system", text: action.message, tone: "error" }),
+    tools: state.tools.map(tool => tool.status === "running" ? { ...tool, status: "failed", output: action.message } : tool),
     messages: [
       ...state.messages,
       ...(state.streamingText

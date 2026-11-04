@@ -78,7 +78,7 @@ import { createSandboxRuntime } from "../services/sandbox/macos";
 import { loadLspServerConfigs } from "../services/lsp/config";
 import { TnbLspManager } from "../services/lsp/manager";
 import { AutoMemoryStore } from "../services/memory/store";
-import { runGit } from "../services/git/command";
+import { loadWorkingTreeReview } from "../services/git/review";
 import { TaskManager, type TaskRecord, type TaskUpdate } from "../services/tasks/manager";
 import { formatTeamMessages, TeamManager } from "../services/teams/manager";
 import { TeamSupervisor } from "../services/teams/supervisor";
@@ -2707,7 +2707,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
     const keybindings = await loadKeybindings(configDir);
     const permissionSessionRules: string[] = [];
     let activeVimMode = settings.general?.vimMode === true;
-    let activeTheme = settings.ui?.theme ?? "magenta";
+    let activeTheme = settings.ui?.theme ?? "cyan";
     const questionController = new QuestionController();
     durableQuestions = new DurableQuestionInbox({ configDir, workspace: () => activeWorkspaceState.current() });
     durableQuestions.start();
@@ -2851,13 +2851,13 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
           description: prompt.definition.description ?? `MCP prompt from ${prompt.serverName}`,
         })),
       ],
-      async completeInput(input, signal) {
+      async completeInput(input, signal, cursor) {
         try {
           const mcpValues = (await completeMcpPromptInput(input, mcp.prompts, mcp.clients, signal))?.values ?? [];
-          return mcpValues.length ? mcpValues : completeWorkspaceFiles(input, activeWorkspaceState.current(), signal);
+          return mcpValues.length ? mcpValues : completeWorkspaceFiles(input, activeWorkspaceState.current(), signal, cursor);
         } catch (error) {
           if (error instanceof Error && error.message.includes("does not support argument completions")) {
-            return completeWorkspaceFiles(input, activeWorkspaceState.current(), signal);
+            return completeWorkspaceFiles(input, activeWorkspaceState.current(), signal, cursor);
           }
           throw error;
         }
@@ -3467,13 +3467,18 @@ async function runInteractiveSlashCommand(
     return { message: [
       "Keyboard shortcuts",
       "",
-      "Enter          Submit",
+      "Enter          Submit, or queue while the Agent is working",
+      "Ctrl+Q         Preview queued prompts; Enter/E edit, D/Delete remove",
+      "Alt+Up/Down    Select a tool card",
+      "Alt+Enter      Expand/collapse the selected tool card (click also works)",
       "Shift+Enter    Insert newline",
       "Tab            Complete slash commands or MCP prompt arguments",
       "Up/Down        Prompt history or dialog selection",
       "Mouse wheel    Scroll transcript rows",
       "PageUp/Down    Scroll one transcript viewport",
-      "Ctrl+U/D       Scroll half a viewport (Ctrl+D deletes at bottom)",
+      "Ctrl+U/D       Scroll half a viewport when the prompt is empty",
+      "Ctrl+K/U/W     Cut to line end/start or previous word in the prompt",
+      "Ctrl+Y / Alt+Y Paste or cycle cut text; Backspace removes image references",
       "Shift+Up/Down  Transcript page aliases",
       "Ctrl+Home/End  Oldest/latest transcript output",
       "Ctrl+O         Toggle compact/full transcript and tool output",
@@ -3483,12 +3488,14 @@ async function runInteractiveSlashCommand(
       "Ctrl+Shift+C   Copy the selected transcript entry",
       "Ctrl+T         Open background task and PTY controls",
       "Esc            Close dialog, leave Vim insert mode, or interrupt a running turn",
-      "Ctrl+C         Interrupt a turn; exit when idle",
+      "Ctrl+C         Interrupt a turn; press twice while idle to exit",
+      "Sessions       / filter, Enter apply, PgUp/PgDn scroll conversation preview",
       "Ctrl+V         Attach a PNG image from the clipboard",
       "Tab            Complete slash/MCP arguments and workspace file paths",
       "Vim mode       i/I/a/A, h/l, b/w, x/X, D/C, 0/$",
       "",
       `Customize:     ${join(context.configDir, "keybindings.json")}`,
+      `Configured:    ${Object.entries(await loadKeybindings(context.configDir)).map(([action, binding]) => `${action}=${binding ?? "disabled"}`).join(" · ")}`,
     ].join("\n") };
   }
   if (command.name === "tools") {
@@ -3919,18 +3926,25 @@ async function runInteractiveSlashCommand(
     ].join("\n") };
   }
   if (command.name === "diff") {
-    requireNoCommandArgument(command);
-    const [status, diff] = await Promise.all([
-      runGit(context.cwd, ["status", "--short"], { allowFailure: true }),
-      runGit(context.cwd, ["diff", "HEAD", "--"], { allowFailure: true }),
-    ]);
-    if (status.exitCode !== 0 || diff.exitCode !== 0) {
-      throw new Error(status.stderr.trim() || diff.stderr.trim() || "Unable to inspect Git changes");
+    let path = command.argument ? unquoteCommandArgument(command.argument) : undefined;
+    if (command.argument.startsWith('"')) {
+      try { path = JSON.parse(command.argument); } catch { throw new Error("Usage: /diff [file] · invalid quoted filename"); }
+      if (typeof path !== "string") throw new Error("Usage: /diff [file]");
     }
-    const content = [status.stdout.trim() ? `Status\n${status.stdout.trimEnd()}` : "", diff.stdout.trimEnd()]
-      .filter(Boolean).join("\n\n");
-    const limit = 100_000;
-    return { message: content ? `${content.slice(0, limit)}${content.length > limit ? "\n\n[diff truncated]" : ""}` : "No working-tree changes." };
+    const review = await loadWorkingTreeReview(context.cwd, path);
+    if (!review.total) return { message: "No working-tree changes." };
+    return { management: {
+      kind: "diff",
+      title: "Review workspace changes",
+      refreshCommand: path ? `/diff ${JSON.stringify(path)}` : "/diff",
+      description: `${review.total} changed file(s) · working tree + staged changes vs HEAD${review.total > review.files.length && !path ? " · showing the first 100; /diff <file> opens another" : ""}`,
+      items: review.files.map(file => ({
+        id: file.path, label: /[\x00-\x1f\x7f]/.test(file.path) ? JSON.stringify(file.path) : file.path,
+        description: `${file.status} · +${file.added} −${file.removed}${file.binary ? " · binary" : ""}${file.previousPath ? ` · from ${file.previousPath}` : ""}`,
+        badges: [file.status.trim()], diffPreview: file.patch,
+        command: `/diff ${JSON.stringify(file.path)}`,
+      })),
+    } };
   }
   if (command.name === "rewind") {
     const turns = command.argument ? Number(command.argument) : 1;
@@ -4329,7 +4343,7 @@ async function runInteractiveSlashCommand(
       management: {
         kind: "sessions",
         title: query ? `Sessions matching “${command.argument}”` : "Recent sessions",
-        description: "Select a conversation to resume. Rename and fork commands operate on the active session.",
+        description: "Enter resumes the selected conversation. / filters this list; /sessions <query> also searches older history.",
         items: await Promise.all(filtered.slice(0, 20).filter((session) => !session.error).map(async (session) => ({
           id: session.sessionId,
           label: session.title || session.firstPrompt || session.sessionId,

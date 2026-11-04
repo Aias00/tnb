@@ -1,12 +1,12 @@
-import { Cursor } from "../input/cursor";
+import { Cursor, getLastKill, pushToKillRing, recordYank, resetKillAccumulation, resetYankState, yankPop, updateYankLength } from "../input/cursor";
 import { normalizedGraphemeOffset } from "../input/intl";
 import { stringWidth } from "../ink/stringWidth";
-import { atomicReferenceAt, formatImageRef, formatPastedTextRef, getPastedTextRefNumLines, parsePromptReferences } from "./references";
+import { atomicReferenceAt, formatImageRef, formatPastedTextRef, getPastedTextRefNumLines, parsePromptReferences, expandPromptReferences } from "./references";
 import type { PastedContent, PromptEditorState } from "./types";
 
 export type PromptEditorAction =
   | { type: "insert"; text: string; columns?: number }
-  | { type: "left" | "right" | "up" | "down" | "home" | "end" | "backspace" | "delete"; columns?: number }
+  | { type: "left" | "right" | "up" | "down" | "home" | "end" | "backspace" | "delete" | "word-left" | "word-right" | "kill-line-start" | "kill-line-end" | "kill-word" | "yank" | "yank-pop"; columns?: number }
   | { type: "paste-text"; text: string; threshold?: number; columns?: number }
   | { type: "paste-image"; path: string; mediaType: Extract<PastedContent, { type: "image" }>["mediaType"]; columns?: number }
   | { type: "set-mode"; mode: PromptEditorState["mode"] }
@@ -37,8 +37,39 @@ export function applyPromptEditorAction(state: PromptEditorState, action: Prompt
       nextPasteId: id + 1,
     }, formatImageRef(id), action.columns);
   }
-  if (action.type === "insert") return insert(state, normalizeInput(action.text), action.columns);
+  if (action.type === "insert") {
+    resetKillAccumulation(); resetYankState();
+    return insert(state, normalizeInput(action.text), action.columns);
+  }
   const cursor = editorCursor(state, action.columns);
+  if (!action.type.startsWith("kill-") && action.type !== "yank" && action.type !== "yank-pop") { resetKillAccumulation(); resetYankState(); }
+  if (action.type === "word-left") return move(state, snapAtomic(state.value, cursor.prevWord().offset, "start"));
+  if (action.type === "word-right") return move(state, snapAtomic(state.value, cursor.nextWord().offset, "end"));
+  if (action.type === "kill-line-start" || action.type === "kill-line-end" || action.type === "kill-word") {
+    const result = action.type === "kill-line-start" ? cursor.deleteToLineStart() : action.type === "kill-line-end" ? cursor.deleteToLineEnd() : cursor.deleteWordBefore();
+    const start = snapAtomic(state.value, Math.min(cursor.offset, result.cursor.offset), "start");
+    const end = snapAtomic(state.value, Math.max(cursor.offset, result.cursor.offset) + (action.type === "kill-line-end" ? result.killed.length : 0), "end");
+    // The shared text kill ring cannot carry image attachments. Keep them intact.
+    if (parsePromptReferences(state.value.slice(start, end)).some(reference => reference.type === "image")) return state;
+    pushToKillRing(expandPromptReferences(state.value.slice(start, end), state.pastedContents).expanded, action.type === "kill-line-end" ? "append" : "prepend");
+    return removeRange(state, start, end);
+  }
+  if (action.type === "yank") {
+    resetKillAccumulation();
+    const text = getLastKill();
+    const next = applyPromptEditorAction(state, { type: "paste-text", text, columns: action.columns });
+    recordYank(state.cursorOffset, next.value.length - state.value.length);
+    return next;
+  }
+  if (action.type === "yank-pop") {
+    resetKillAccumulation();
+    const result = yankPop();
+    if (!result) return state;
+    const base = removeRange(state, result.start, result.start + result.length);
+    const next = applyPromptEditorAction(base, { type: "paste-text", text: result.text, columns: action.columns });
+    updateYankLength(next.value.length - base.value.length);
+    return next;
+  }
   if (action.type === "left") return move(state, snapAtomic(state.value, cursor.left().offset, "start"));
   if (action.type === "right") return move(state, snapAtomic(state.value, cursor.right().offset, "end"));
   if (action.type === "home") return move(state, cursor.startOfLine().offset);
@@ -92,5 +123,5 @@ function normalizeState(state: PromptEditorState): PromptEditorState {
 }
 
 function normalizeInput(value: string): string {
-  return value.replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, "").replace(/\r/g, "\n").replaceAll("\t", "    ");
+  return value.replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, "").replace(/\r\n?/g, "\n").replaceAll("\t", "    ");
 }

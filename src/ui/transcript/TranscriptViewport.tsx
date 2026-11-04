@@ -25,9 +25,11 @@ export const TranscriptViewport = forwardRef<TranscriptViewportController, {
   height: number;
   theme?: string;
   verbose?: boolean;
+  entryExpansion?: Readonly<Record<string, boolean>>;
+  onToggleEntry?(id: string): void;
   selectedEntryId?: string;
   onStateChange?(state: ViewportState): void;
-}>(function TranscriptViewport({ entries, width, height, theme, verbose = false, selectedEntryId, onStateChange }, ref) {
+}>(function TranscriptViewport({ entries, width, height, theme, verbose = false, entryExpansion = {}, onToggleEntry, selectedEntryId, onStateChange }, ref) {
   const scrollRef = useRef<ScrollBoxHandle | null>(null);
   const entryRefs = useRef(new Map<string, DOMElement>());
   const itemKey = useCallback((entry: TranscriptEntry) => entry.id, []);
@@ -48,7 +50,7 @@ export const TranscriptViewport = forwardRef<TranscriptViewportController, {
   useEffect(() => {
     if (scrollRef.current?.isSticky()) scrollRef.current.scrollToBottom();
     queueMicrotask(() => onStateChange?.(snapshot()));
-  }, [entries, onStateChange, snapshot, theme, verbose, width]);
+  }, [entries, onStateChange, snapshot, theme, verbose, entryExpansion, width]);
 
   useImperativeHandle(ref, () => ({
     scroll(command) {
@@ -87,8 +89,8 @@ export const TranscriptViewport = forwardRef<TranscriptViewportController, {
           <Box ref={element => {
             if (element) entryRefs.current.set(entry.id, element);
             else entryRefs.current.delete(entry.id);
-          }} flexDirection="column">
-            <TranscriptEntryView entry={entry} verbose={verbose} selected={entry.id === selectedEntryId} />
+          }} flexDirection="column" {...(entry.kind === "tool" && onToggleEntry ? { onClick: () => onToggleEntry(entry.id) } : {})}>
+            <TranscriptEntryView entry={entry} verbose={entryExpansion[entry.id] ?? verbose} selected={entry.id === selectedEntryId} />
           </Box>
         )}
       />

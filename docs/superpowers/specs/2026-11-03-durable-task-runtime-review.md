@@ -496,3 +496,11 @@ schema v4 从 v1/v2/v3 迁移，不改原能力绑定和执行策略。墓碑保
 证据目录：`/Volumes/data/tnb-review-2026-11-04/interaction/`；保留所有探索与失败记录。本轮不新增数小时 soak、真实桌面通知、在线模型质量评测、持久 Skill/MCP 或并行编码能力。
 
 最终验证：macOS 类型检查、构建、编译后 `--help` 和全量测试 **867 pass / 2 skip / 0 fail**；Linux Ubuntu 24.04.4 ARM64 / Bun 1.3.14，在 `TNB_REQUIRE_NATIVE_SANDBOX=1` 下类型检查、构建、编译后 `--help` 和全量测试 **862 pass / 7 skip / 0 fail**。两端均为 **869 tests / 137 files**，跳过项均为原平台专属测试；新增 **15 项**回归，包括 **7 项真实 PTY 交互测试**。`macos-all.log`、`typecheck-final.log`、`macos-build-final.log` 与 `linux-evidence.tar.gz` 保存最终结果，二进制及 MIT 附件摘要另存 SHA-256。
+
+## 18 合入远端交互更新
+
+日期：2026-11-04。将 `origin/main` 的 `1553b41` 合入本地 `9d6eff8`。冲突涉及 App、PromptInput、TuiView 和 TUI 状态测试，保留远端文件补全、主题上下文、独立工具展开、会话筛选、窄屏布局和只读 `/diff` 浏览器，同时保留持久任务工作台、问题草稿、审批分页和后台状态。
+
+两套前台队列统一到 `InputQueue`：Ctrl+Q 快捷面板与 Ctrl+T 工作台读取同一组持久身份；删除均需确认，取回编辑仍保存原记录，未知派发不自动重放。新增跨入口编辑并只执行一次的交互回归。队列面板、Shell 面板与搜索期间不自动派发，切换会话保留原会话文件。保留排空取消提示，取消中的队列项不错误删除；窄屏先显示模型与用量，再显示工作区，防止路径挤掉模型名称。同步修正文档中的旧“仅内存队列”描述。
+
+初轮全量测试发现中性文字使用 ANSI 光标前进表示空格，旧 PTY 驱动按原始连续空格等待造成超时。更正终端驱动对 `ESC[1C` 的识别，保留实际模型请求、工具限制、问答、草稿与退出断言；失败和最终复测日志都保存。最终 macOS **896 pass / 2 skip / 0 fail**，Linux Ubuntu 24.04.4 ARM64 / Bun 1.3.14、`TNB_REQUIRE_NATIVE_SANDBOX=1` 下 **891 pass / 7 skip / 0 fail**；两端均 **898 tests / 140 files**，类型检查和构建通过。验证使用脚本 transport 与本地服务，没有新增外部模型调用，也不替代推送后的 GitHub CI 结果。证据在 `/Volumes/data/tnb-review-2026-11-04/merge-origin-main/`。

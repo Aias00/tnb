@@ -26,3 +26,33 @@ describe("workspace file completion", () => {
     expect(await completeWorkspaceFiles("/tmp/", cwd, signal)).toEqual([]);
   });
 });
+
+test("completes at the cursor, preserving trailing instructions and quoting spaces", async () => {
+  const cwd = await mkdtemp(join(tmpdir(), "tnb-completion-"));
+  try {
+    await mkdir(join(cwd, "src"));
+    await writeFile(join(cwd, "src", "my file.ts"), "");
+    const input = "inspect @src/my old.ts and explain";
+    const cursor = "inspect @src/my".length;
+    const values = await completeWorkspaceFiles(input, cwd, new AbortController().signal, cursor);
+    // An unquoted token ends at whitespace; the rest of the instruction remains untouched.
+    expect(values).toContain('inspect @"src/my file.ts" old.ts and explain');
+  } finally { await import("node:fs/promises").then(fs => fs.rm(cwd, { recursive: true, force: true })); }
+});
+
+test("@ filename search discovers nested files and ignores symlink escapes", async () => {
+  const { rm, symlink } = await import("node:fs/promises");
+  const cwd = await mkdtemp(join(tmpdir(), "tnb-completion-"));
+  const outside = await mkdtemp(join(tmpdir(), "tnb-outside-"));
+  try {
+    await mkdir(join(cwd, "src"));
+    await writeFile(join(cwd, "src", "widget.ts"), "");
+    await writeFile(join(outside, "secret.txt"), "");
+    await symlink(outside, join(cwd, "external"));
+    const signal = new AbortController().signal;
+    expect(await completeWorkspaceFiles("read @widget", cwd, signal)).toContain("read @src/widget.ts");
+    expect(await completeWorkspaceFiles("read @external/", cwd, signal)).toEqual([]);
+    const aborted = new AbortController(); aborted.abort();
+    expect(await completeWorkspaceFiles("@widget", cwd, aborted.signal)).toEqual([]);
+  } finally { await rm(cwd, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true }); }
+});

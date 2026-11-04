@@ -25,7 +25,8 @@ async function terminal() {
     const end = Date.now() + 4000;
     while (!await predicate()) { if (Date.now() > end || child.exitCode !== null) throw new Error(`Question UI timed out: ${error}; ${output.slice(-1000)}`); await Bun.sleep(10); }
   }
-  const seen = (text: string) => until(() => output.includes(text));
+  // Neutral text may encode spaces as terminal cursor advances.
+  const seen = (text: string) => until(() => output.replaceAll("\u001b[1C", " ").includes(text));
   const send = (text: string) => new Promise<void>((resolve, reject) => { child.stdin.write(text, (error) => error ? reject(error) : resolve()); });
   const contents = (suffix: string) => readFile(trigger + suffix, "utf8").catch(() => "");
   const push = async (action: string) => {

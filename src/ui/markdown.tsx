@@ -3,6 +3,8 @@ import { highlight, supportsLanguage } from "cli-highlight";
 import { Box, Text } from "./ink/index";
 import { marked, type Token, type Tokens } from "marked";
 
+import { useAccent, type AccentColor } from "./theme";
+
 type MarkdownProps = { children: string; streaming?: boolean };
 
 export const Markdown = memo(function Markdown({ children }: MarkdownProps) {
@@ -17,20 +19,21 @@ export const Markdown = memo(function Markdown({ children }: MarkdownProps) {
 });
 
 function MarkdownBlock({ token }: { token: Token }): React.ReactNode {
+  const accent = useAccent();
   switch (token.type) {
     case "space":
       return null;
     case "heading": {
       const heading = token as Tokens.Heading;
-      return <Text bold color="magenta">{inlineTokens(heading.tokens)}</Text>;
+      return <Text bold color={accent}>{inlineTokens(heading.tokens, accent)}</Text>;
     }
     case "paragraph": {
       const paragraph = token as Tokens.Paragraph;
-      return <Text wrap="wrap">{inlineTokens(paragraph.tokens)}</Text>;
+      return <Text wrap="wrap">{inlineTokens(paragraph.tokens, accent)}</Text>;
     }
     case "text": {
       const text = token as Tokens.Text;
-      return <Text wrap="wrap">{inlineTokens(text.tokens ?? [text])}</Text>;
+      return <Text wrap="wrap">{inlineTokens(text.tokens ?? [text], accent)}</Text>;
     }
     case "code": {
       const code = token as Tokens.Code;
@@ -60,7 +63,7 @@ function MarkdownBlock({ token }: { token: Token }): React.ReactNode {
         <Box flexDirection="column">
           {list.items.map((item, index) => (
             <Box key={index} paddingLeft={1}>
-              <Text color="magenta">{list.ordered ? `${Number(list.start) + index}.` : "•"} </Text>
+              <Text color={accent}>{list.ordered ? `${Number(list.start) + index}.` : "•"} </Text>
               <Box flexDirection="column" flexGrow={1}>
                 {item.tokens.map((child, childIndex) => <MarkdownBlock key={childIndex} token={child} />)}
               </Box>
@@ -89,26 +92,26 @@ function MarkdownBlock({ token }: { token: Token }): React.ReactNode {
   }
 }
 
-function inlineTokens(tokens: Token[]): React.ReactNode[] {
+function inlineTokens(tokens: Token[], accent: AccentColor): React.ReactNode[] {
   return tokens.map((token, index) => {
     switch (token.type) {
       case "strong": {
         const strong = token as Tokens.Strong;
-        return <Text key={index} bold>{inlineTokens(strong.tokens)}</Text>;
+        return <Text key={index} bold>{inlineTokens(strong.tokens, accent)}</Text>;
       }
       case "em": {
         const emphasis = token as Tokens.Em;
-        return <Text key={index} italic>{inlineTokens(emphasis.tokens)}</Text>;
+        return <Text key={index} italic>{inlineTokens(emphasis.tokens, accent)}</Text>;
       }
       case "del": {
         const deleted = token as Tokens.Del;
-        return <Text key={index} strikethrough>{inlineTokens(deleted.tokens)}</Text>;
+        return <Text key={index} strikethrough>{inlineTokens(deleted.tokens, accent)}</Text>;
       }
       case "codespan":
-        return <Text key={index} color="cyan">{(token as Tokens.Codespan).text}</Text>;
+        return <Text key={index} color={accent}>{(token as Tokens.Codespan).text}</Text>;
       case "link": {
         const link = token as Tokens.Link;
-        return <Text key={index} color="cyan" underline>{inlineTokens(link.tokens)} ({link.href})</Text>;
+        return <Text key={index} color={accent} underline>{inlineTokens(link.tokens, accent)} ({link.href})</Text>;
       }
       case "br":
         return <Text key={index}>{"\n"}</Text>;

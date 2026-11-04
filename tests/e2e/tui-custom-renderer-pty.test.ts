@@ -26,7 +26,7 @@ describe('custom renderer PTY lifecycle', () => {
       timeout = setTimeout(() => reject(new Error(`PTY fixture did not become ready or exit: ${JSON.stringify(output.slice(-600))}`)), 5_000)
     })
     const waitForOutput = (text: string) => Promise.race([
-      output.includes(text) ? Promise.resolve() : new Promise<void>((resolve) => waiters.push({ text, resolve })),
+      output.replaceAll('\u001b[1C', ' ').includes(text) ? Promise.resolve() : new Promise<void>((resolve) => waiters.push({ text, resolve })),
       deadline,
       exited.then(async (code) => { throw new Error(`PTY exited before output (${code}): ${await errorTask}`) }),
     ])
@@ -34,7 +34,7 @@ describe('custom renderer PTY lifecycle', () => {
       const decoder = new TextDecoder()
       for await (const chunk of child.stdout) {
         output += decoder.decode(chunk, { stream: true })
-        for (const waiter of waiters) if (output.includes(waiter.text)) waiter.resolve()
+        for (const waiter of waiters) if (output.replaceAll('\u001b[1C', ' ').includes(waiter.text)) waiter.resolve()
       }
       output += decoder.decode()
     })()
@@ -60,7 +60,8 @@ describe('custom renderer PTY lifecycle', () => {
       expect(output).toContain('\u001b[?1049h')
       expect(output).toContain('\u001b[?1006h')
       expect(output).toContain('fixture-model')
-      expect(output).toContain('[Pasted text #1 +3 lines]')
+      // Neutral text lets the renderer encode single spaces as cursor advances.
+      expect(output.replaceAll('\u001b[1C', ' ')).toContain('[Pasted text #1 +3 lines]')
       expect(output).not.toContain('[200~')
       expect(output).not.toContain('[201~')
       expect(output).not.toContain('�')

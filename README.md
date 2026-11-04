@@ -64,7 +64,12 @@ export ANTHROPIC_API_KEY="..."
 The TUI uses an alternate terminal screen, renders streaming Markdown and code,
 tracks tool execution, preserves prompt history, and shows a keyboard-selectable
 permission dialog. Use the arrow keys and Enter in permission dialogs; press
-Escape to interrupt an active turn, or Ctrl-C while idle to exit. `/exit` and
+Escape to interrupt an active turn, or Ctrl-C while idle to exit.
+You can keep drafting while a turn runs; Enter queues the prompt for the next
+turn. Queued prompts run in submission order, and starting a queued turn keeps
+your current draft intact. The status line shows the pending prompt count. Ctrl+Q opens the queue to
+preview, edit or remove pending prompts. Alt+Up/Down selects a tool card and
+Alt+Enter expands just that card; clicking a card also toggles its output. `/exit` and
 `/quit` also close it. Set `TNB_TUI_FULLSCREEN=0` to keep the same Ink UI
 in normal terminal scrollback while debugging.
 
@@ -78,7 +83,12 @@ Streaming follows the bottom only while it is pinned; scrolling up keeps the
 current reading position until you return to the bottom.
 
 Interactive commands are registered through a shared slash-command catalog. Type
-`/` to see matching commands and press Tab to complete the first match. The
+`/` to see matching commands, use Up/Down to select, and press Tab or Enter
+to complete the selection. Enter submits an exact command. Long input scrolls
+with the cursor inside a bounded editor so the conversation stays visible.
+Typing `@` opens a file menu at the cursor; Up/Down selects and Tab/Enter accepts
+without sending. `/diff` opens a read-only per-file review with Enter for a
+full-width patch and PageUp/PageDown for scrolling. The
 current set includes `/help`, `/model`, `/models`, `/permissions`, `/status`,
 `/agents`, `/skills`, `/plugins`, `/hooks`, `/mcp`, `/commands`, `/sessions`, `/rename`, `/fork`, `/resume`, `/continue`, `/memory`,
 `/rewind`, `/rollback`, `/diff`, `/context`, `/usage`, `/copy`,
