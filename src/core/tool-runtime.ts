@@ -28,7 +28,7 @@ export async function executeTool(
         throw new Error("Execution authority changed while authorizing this tool; request fresh approval");
       }
     };
-    tool = tool.bindExecution?.() ?? tool;
+    tool = tool.bindExecution?.({ toolUseId: use.id, scope }) ?? tool;
     const decision = pre?.decision?.behavior === "deny"
       ? pre.decision
       : await options.authorize(tool, structuredClone(input), { toolUseId: use.id, preApproved: pre?.decision?.behavior === "allow" });

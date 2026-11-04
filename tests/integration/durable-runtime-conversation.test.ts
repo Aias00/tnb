@@ -8,6 +8,7 @@ import { DurableRuntime } from "../../src/services/runtime/engine";
 import { RuntimeStore } from "../../src/services/runtime/store";
 import { serveDurableRuntime, runtimeRequest } from "../../src/services/runtime/server";
 import { createDurableTaskTool } from "../../src/services/runtime/conversation-tool";
+import { acquireWorkspace } from "../../src/services/runtime/workspace";
 import type { ModelEvent, ModelRequest, ModelTransport } from "../../src/providers/types";
 
 const roots: string[] = []; const cleanup: Array<() => Promise<unknown>> = [];
@@ -113,6 +114,48 @@ test("busy conversations can pause and resume the same Run with no duplicate tas
   await f.chat((_request, index) => !index ? call("durable_task", { action: "resume", runId }) : done, true, true, "继续刚才的长任务");
   await until(() => f.workerCalls() === 2); expect(f.store.runs()).toHaveLength(1);
   f.finish(); await until(() => f.store.getRun(runId)?.status === "succeeded");
+});
+
+test("identical control words in different persisted call scopes create distinct intents while replay keeps one identity", async () => {
+  const f = await fixture(); const release = await acquireWorkspace(f.workspace); cleanup.push(release);
+  const submit = createDurableTaskTool(f.context);
+  const accepted = [];
+  for (const key of ["first", "second"]) accepted.push(JSON.parse(await submit.execute(submit.validate({ action: "submit", key, objective: key }), new AbortController().signal) as string));
+  const context = { ...f.context, sourceText: "暂停任务" };
+  const bound = (scope: string, sourceText = context.sourceText) => createDurableTaskTool({ ...context, sourceText }).bindExecution!({ toolUseId: "reused-provider-call-id", scope });
+  const invoke = async (scope: string, action = "pause") => { const tool = bound(scope, action === "cancel" ? "取消任务" : context.sourceText); return JSON.parse(await tool.execute(tool.validate({ action }), new AbortController().signal) as string); };
+  const first = await invoke("message-one"); expect(first.status).toBe("clarify");
+  expect(await invoke("message-one")).toEqual(first);
+  const runId = accepted[0].run.runId;
+  const choose = (decision: typeof first, commandId: string) => runtimeRequest(f.configDir, "/command", { action: "resolve-route", commandId, runId,
+    resolveInputId: decision.inputId, expectedRevision: decision.revision,
+    source: { inputId: commandId, workspace: decision.workspace, rawText: runId, source: "conversation", sessionId: context.sessionId } });
+  await choose(first, "choose-first"); expect(f.store.getRun(runId)?.status).toBe("paused");
+  await f.runtime.resume(runId);
+  const second = await invoke("message-two");
+  expect(second.status).toBe("clarify"); expect(second.inputId).not.toBe(first.inputId); expect(await invoke("message-two")).toEqual(second);
+  await choose(second, "choose-second"); expect(f.store.getRun(runId)?.status).toBe("paused"); expect(f.workerCalls()).toBe(0);
+  const cancellation = await invoke("cancel-message", "cancel"); expect(cancellation.status).toBe("clarify");
+  await choose(cancellation, "choose-cancel"); await until(() => f.store.getRun(runId)?.status === "cancelled");
+  expect(await invoke("cancel-message", "cancel")).toMatchObject({ status: "accepted", runId });
+  const other = accepted[1].run.runId;
+  expect(f.store.getRun(other)?.status).toBe("active");
+  f.runtime.commands.cancelRun({ commandId: "clean-other", runId: other, expectedRevision: f.store.getRun(other)!.revision });
+  await until(() => f.store.getRun(other)?.status === "cancelled");
+});
+
+test("historical terminal runs do not make a unique eligible conversational control ambiguous", async () => {
+  const f = await fixture(); const release = await acquireWorkspace(f.workspace); cleanup.push(release);
+  const tool = createDurableTaskTool(f.context); const created = [];
+  for (const key of ["historical", "current"]) created.push(JSON.parse(await tool.execute(tool.validate({ action: "submit", key, objective: key }), new AbortController().signal) as string));
+  const historical = created[0].run.runId, current = created[1].run.runId;
+  f.runtime.commands.cancelRun({ commandId: "cancel-history", runId: historical, expectedRevision: f.store.getRun(historical)!.revision });
+  await until(() => f.store.getRun(historical)?.status === "cancelled");
+  const control = createDurableTaskTool({ ...f.context, sourceText: "暂停刚才的任务" });
+  const result = JSON.parse(await control.execute(control.validate({ action: "pause" }), new AbortController().signal) as string);
+  expect(result.run).toMatchObject({ runId: current, status: "paused" });
+  expect(f.store.routes<{ status: string }>(f.runtime.configuration(current).workspace).some((row) => row.status === "clarify")).toBe(false);
+  expect(f.workerCalls()).toBe(0);
 });
 
 test("direct slash submission inherits the conversation's model and works in the terminal REPL", async () => {

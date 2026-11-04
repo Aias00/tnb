@@ -61,7 +61,11 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
             if (url.pathname === "/health") return Response.json({ ready: !runtime.lastError, pid: process.pid, error: runtime.lastError, capabilities: RUNTIME_CAPABILITIES });
             if (url.pathname === "/routing") {
               const workspace = await realpath(url.searchParams.get("workspace") ?? "");
-              return Response.json(store.routes(workspace));
+              if (url.searchParams.has("inputId")) {
+                const decision = store.route<RoutingDecision>(url.searchParams.get("inputId")!);
+                return Response.json(decision?.workspace === workspace ? [decision] : []);
+              }
+              return Response.json(store.routes(workspace, { pendingOnly: url.searchParams.get("pending") === "true", beforeInputId: url.searchParams.get("beforeInput") ?? undefined }));
             }
             if (url.pathname === "/attention") {
               const workspace = url.searchParams.get("workspace"); if (!workspace) throw new Error("Notification workspace is required");

@@ -1,6 +1,6 @@
 import type { Database } from "bun:sqlite";
 
-export const RUNTIME_SCHEMA_VERSION = 3;
+export const RUNTIME_SCHEMA_VERSION = 4;
 const RUNTIME_APPLICATION_ID = 0x544e4252; // TNBR
 
 export function migrateRuntime(database: Database): void {
@@ -16,9 +16,11 @@ export function migrateRuntime(database: Database): void {
     if (version === 1 && application === RUNTIME_APPLICATION_ID) {
       addRecords(database);
       addRouting(database);
+      addRoutingTombstones(database);
       return;
     }
-    if (version === 2 && application === RUNTIME_APPLICATION_ID) { addRouting(database); return; }
+    if (version === 2 && application === RUNTIME_APPLICATION_ID) { addRouting(database); addRoutingTombstones(database); return; }
+    if (version === 3 && application === RUNTIME_APPLICATION_ID) { addRoutingTombstones(database); return; }
     if (version === 1) throw new Error("Unrecognized runtime database identity");
     if (application !== 0 || version !== 0 || database.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' LIMIT 1").get()) {
       throw new Error("Unrecognized runtime database; migration refused");
@@ -118,6 +120,7 @@ export function migrateRuntime(database: Database): void {
     `);
     addRecords(database);
     addRouting(database);
+    addRoutingTombstones(database);
   }).immediate();
 }
 
@@ -125,6 +128,12 @@ function addRouting(database: Database): void {
   database.exec(`CREATE TABLE routing_inputs (
     input_id TEXT PRIMARY KEY, workspace TEXT NOT NULL, data TEXT NOT NULL CHECK(json_valid(data))
   ); CREATE INDEX routing_by_workspace ON routing_inputs(workspace); PRAGMA user_version = 3;`);
+}
+
+function addRoutingTombstones(database: Database): void {
+  database.exec(`CREATE TABLE routing_tombstones (input_id TEXT PRIMARY KEY, workspace TEXT NOT NULL, digest TEXT NOT NULL);
+    CREATE INDEX routing_pending ON routing_inputs(workspace, json_extract(data,'$.status'));
+    PRAGMA user_version = 4;`);
 }
 
 function addRecords(database: Database): void {

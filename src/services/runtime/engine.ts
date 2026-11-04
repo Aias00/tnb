@@ -241,7 +241,10 @@ export class DurableRuntime {
       const journal = this.#journal(task, assertLive, (name, input) => name === "agent" || name === "durable_wait" || tools.find((tool) => tool.name === name)?.isReadOnly(input) === true);
       const transcript = new DurableTranscript({ store: this.store, root: this.root, runId: run.runId, taskId });
       const strict = config.strategyVersion === 2;
-      const submittedReport = () => this.store.record<{ report: string; inputRevision: number }>("submitted-report", taskId)?.value;
+      const submittedReport = () => {
+        const value = this.store.record<{ report: string; inputRevision: number; invalidated?: boolean }>("submitted-report", taskId)?.value;
+        return value?.invalidated ? undefined : value;
+      };
       const canDelegate = run.policy.mode !== "single" && this.#depth(task) < run.policy.maxDelegationDepth;
       const assessment = () => this.store.record<{ choice: string; inputRevision: number }>("delegation-assessment", taskId)?.value;
       const assessed = () => assessment()?.inputRevision === (this.store.getTask(taskId)?.inputRevision ?? 0);
@@ -545,6 +548,18 @@ export class DurableRuntime {
     const config = this.configuration(task.runId, task.taskId);
     const record = this.store.record<number>("retries", task.taskId);
     const count = (record?.value ?? 0) + 1;
+    // Persist rejection before asynchronous feedback delivery. A crash must not make a
+    // rejected submission eligible for the successful-report recovery shortcut again.
+    this.store.command(randomUUID(), { kind: "report.invalidate", taskId: task.taskId, candidateRef: task.candidateRef }, Date.now(), (tx) => {
+      const current = tx.getTask(task.taskId)!;
+      if (current.status !== "validating" || current.candidateRef !== task.candidateRef) throw new Error("Validation candidate changed");
+      const submitted = tx.record<{ report: string; inputRevision: number; invalidated?: boolean }>("submitted-report", task.taskId);
+      if (submitted && !submitted.value.invalidated) {
+        tx.saveRecord({ ...submitted, value: { ...submitted.value, invalidated: true } }, submitted.revision);
+        tx.event(task.runId, "report.invalidated", { candidateRef: task.candidateRef, reason: message(error) }, task.taskId);
+      }
+      return true;
+    });
     const transcript = new DurableTranscript({ store: this.store, root: this.root, runId: task.runId, taskId: task.taskId });
     await transcript.load();
     await transcript.append([{ role: "user", content: [{ type: "text", text: `Runtime verification failed: ${message(error)}. Inspect and fix the cause, then submit a corrected deliverable. Do not repeat completed unrelated operations.` }] }], false, undefined,

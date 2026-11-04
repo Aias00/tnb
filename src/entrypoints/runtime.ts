@@ -13,7 +13,7 @@ const HELP = `Usage: tnb runtime <submit|status|result|list|events|questions|ans
 
 followup [run-id] --text "requirements" [--task ID] [--input-id ID]
   Select an unresolved input with --resolve-input ID --revision N and a run-id.
-routing [--cwd PATH]  Show input routing decisions and pending clarification.
+routing [--cwd PATH] [--pending] [--before-input ID]  Show decisions, prioritizing pending clarification.
 submit <objective> [--cwd PATH] [--mode single|auto|multi] [--allow-write] [--allow-shell]
   [--check COMMAND]... [--allow-workspace PATH]... [--provider ID] [--model ID]
   [--max-budget-usd N] [--max-turns N] [--deadline ISO-DATE] [--command-id ID] [--no-start]
@@ -76,7 +76,11 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
     if (action === "submit" && !args.includes("--no-start")) await ensureRuntime(configDir, options.env);
     let result: unknown;
     if (action === "list") result = await runtimeRequest(configDir, "/runs");
-    else if (action === "routing") result = await runtimeRequest(configDir, `/routing?workspace=${encodeURIComponent(await realpath(resolve(value("--cwd") ?? options.cwd)))}`);
+    else if (action === "routing") {
+      const query = new URLSearchParams({ workspace: await realpath(resolve(value("--cwd") ?? options.cwd)), pending: String(args.includes("--pending")) });
+      if (value("--before-input")) query.set("beforeInput", value("--before-input")!);
+      result = await runtimeRequest(configDir, `/routing?${query}`);
+    }
     else if (action === "followup") {
       const commandId = value("--command-id") ?? randomUUID();
       const workspace = await realpath(resolve(value("--cwd") ?? options.cwd));
@@ -137,8 +141,8 @@ export type RuntimeChatOptions = { args: string[]; cwd: string; workspace: strin
 export async function runRuntimeChatCommand(options: RuntimeChatOptions): Promise<string> {
   const args = options.args.length ? [...options.args] : ["list"]; const action = args[0]!;
   if (!["followup", "routing", "submit", "list", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel", "storage", "start", "restart", "stop"].includes(action)) throw new Error("/runtime supports submit, list, status, result, events, questions, answer, limits, pause, resume, cancel, storage, start, restart and stop.");
-  const valueFlags = new Set(["--text", "--input-id", "--resolve-input", "--successor", "--cwd", "--mode", "--check", "--allow-workspace", "--provider", "--model", "--max-budget-usd", "--max-turns", "--command-id", "--config-dir", "--after", "--task", "--question", "--answer", "--version", "--deadline", "--extend-hours", "--revision"]);
-  const flags = new Set(["--allow-write", "--allow-shell", "--no-start", "--help", "-h"]);
+  const valueFlags = new Set(["--before-input", "--text", "--input-id", "--resolve-input", "--successor", "--cwd", "--mode", "--check", "--allow-workspace", "--provider", "--model", "--max-budget-usd", "--max-turns", "--command-id", "--config-dir", "--after", "--task", "--question", "--answer", "--version", "--deadline", "--extend-hours", "--revision"]);
+  const flags = new Set(["--pending", "--allow-write", "--allow-shell", "--no-start", "--help", "-h"]);
   if (action === "followup" && (!args[1] || args[1].startsWith("--"))) args.splice(1, 0, "");
   const hasTarget = ["followup", "submit", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel"].includes(action);
   for (let index = hasTarget ? 2 : 1; index < args.length; index++) {
@@ -165,7 +169,7 @@ const LONG_TASK_HELP = `Long tasks · /longtask (aliases: /task, /long, /长任�
 /longtask "objective" [--mode single|auto|multi] [--allow-write] [--allow-shell]
   [--check "command"]... [--max-budget-usd N] [--max-turns N]
 /longtask followup [run-id] --text "additional requirements"
-/longtask routing
+/longtask routing [--pending] [--before-input ID]
 /longtask list
 /longtask status|result|events|pause|resume|cancel [run-id]
 /longtask questions [run-id]

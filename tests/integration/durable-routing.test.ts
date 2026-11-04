@@ -7,19 +7,21 @@ import { RuntimeStore } from "../../src/services/runtime/store";
 import { defineTool } from "../../src/core/tool";
 import type { ModelTransport } from "../../src/providers/types";
 import type { TaskInput } from "../../src/services/runtime/routing";
+import type { DurableTask } from "../../src/services/runtime/types";
+import { writeFile } from "node:fs/promises";
 import { serveDurableRuntime, runtimeRequest } from "../../src/services/runtime/server";
 import { DurableQuestionInbox, durableUserQuestion } from "../../src/services/runtime/attention";
 
 const roots: string[] = [], stores: RuntimeStore[] = [], runtimes: DurableRuntime[] = [];
 afterEach(async () => { for (const runtime of runtimes.splice(0)) await runtime.close(); for (const store of stores.splice(0)) store.close(); await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
-async function fixture(transport: ModelTransport, check?: () => Promise<string>) {
+async function fixture(transport: ModelTransport, check?: () => Promise<string>, close?: (task: DurableTask) => Promise<void>) {
   const root = await mkdtemp(join(tmpdir(), "tnb-route-engine-")); roots.push(root);
   const workspace = join(root, "work"); await mkdir(workspace); const canonical = await realpath(workspace);
   const state = join(root, "control", "runtime"), database = join(state, "state.sqlite");
   const store = new RuntimeStore(database); stores.push(store); let effects = 0;
-  const factory: RuntimeWorkerFactory = async () => ({ transport, model: "fixture", tools: [defineTool({ name: "probe", description: "Read fixture", access: "read", isReadOnly: () => true,
+  const factory: RuntimeWorkerFactory = async ({ task }) => ({ transport, model: "fixture", tools: [defineTool({ name: "probe", description: "Read fixture", access: "read", isReadOnly: () => true,
     inputSchema: {}, validate: (input) => input, execute: async () => { effects++; return "evidence checked once"; } })], authorize: async () => ({ behavior: "allow" }),
-    route: { provider: "fixture", model: "fixture" }, maxOutputTokens: 512, check });
+    route: { provider: "fixture", model: "fixture" }, maxOutputTokens: 512, check, close: () => close?.(task) ?? Promise.resolve() });
   const runtime = new DurableRuntime(store, state, factory); runtimes.push(runtime); await runtime.start();
   const config: RuntimeConfiguration = { workspace, allowedWorkspaces: [workspace], allowWrite: false, allowShell: false, checks: [], maxTurns: 12, maxRetries: 0, compactThreshold: 10000 };
   const follow = (runId: string, id: string, text: string) => runtime.router.followup({ commandId: id, runId, source: { inputId: id, rawText: text, workspace: canonical, source: "api" } });
@@ -109,6 +111,11 @@ test("routing ambiguity automatically appears in the existing question inbox and
     await ready.promise; inbox.start();
     const decision = runtime.router.followup({ commandId: "ambiguous", source: { inputId: "original", workspace: f.canonical, rawText: "ORIGINAL-REQUIREMENTS", source: "conversation", sessionId: "chat" } });
     expect(decision.status).toBe("clarify");
+    f.store.command("recent-history", { kind: "fixture" }, Date.now(), (tx) => {
+      for (let index = 0; index < 300; index++) tx.saveRoute(`recent-${index}`, f.canonical, { inputId: `recent-${index}`, status: "accepted" }); return true;
+    });
+    const pending = await runtimeRequest(configDir, `/routing?workspace=${encodeURIComponent(f.canonical)}&pending=true`) as Array<{ inputId: string }>;
+    expect(pending.map((row) => row.inputId)).toEqual(["original"]);
     await until(runtime, () => !!inbox.next());
     const notice = inbox.next()!; expect("routing" in notice).toBe(true);
     const question = durableUserQuestion(notice); expect(question.options).toHaveLength(2);
@@ -127,6 +134,12 @@ test("routing ambiguity automatically appears in the existing question inbox and
     expect(done).toMatchObject({ status: "accepted", rawText: "Cancel that task", revision: control.revision + 1 });
     expect(["cancelling", "cancelled"]).toContain(f.store.getRun(done.runId)!.status);
     expect(f.store.records("task-input", done.runId).every((record) => (record.value as TaskInput).text !== "Cancel that task")).toBe(true);
+    await runtimeRequest(configDir, "/command", { action: "route-control", commandId: "single-control", routeAction: "pause",
+      source: { inputId: "single-control", workspace: f.canonical, rawText: "Pause remaining task", source: "conversation", sessionId: "chat" } });
+    await until(runtime, () => inbox.current().some((notice) => "routing" in notice && notice.inputId === "single-control"));
+    const single = inbox.current().find((notice) => "routing" in notice && notice.inputId === "single-control")!;
+    expect(durableUserQuestion(single).options).toHaveLength(1);
+    await inbox.answer(single, durableUserQuestion(single).options[0]!.label);
   } finally { await inbox.close(); controller.abort(); await serving; }
 });
 
@@ -216,4 +229,43 @@ test("structured child submission survives a journal receipt failure without ano
   const child = store.tasks(run.runId).find((task) => task.parentTaskId)!;
   expect(store.record("submitted-report", child.taskId)?.revision).toBe(1);
   expect(store.records("submitted-report", run.runId)).toHaveLength(1);
+});
+
+test.each([false, true])("a rejected structured child report is reinvestigated, including a feedback crash: %s", async (crashFeedback) => {
+  let childRequests = 0, parentRequests = 0, changed = false;
+  let currentStore: RuntimeStore;
+  const f = await fixture({ async *stream(input) {
+    if (input.systemPrompt?.includes('"contract":{')) {
+      childRequests++; yield* call("complete_investigation", { summary: `Inspected version ${childRequests}`, evidenceRefs: ["input"], uncertainties: [] }, `submit-${childRequests}`); return;
+    }
+    if (++parentRequests === 1) yield* call("agent", { key: "child", prompt: "Independent investigation", reason: "Independent scope", scope: ["."], evidenceRefs: ["input"],
+      deliverable: "Report", acceptance: "Current evidence", required: true, maxTurns: 5, maxRequests: 8 });
+    else if (parentRequests === 2) {
+      const child = currentStore.runs().flatMap((run) => currentStore.tasks(run.runId)).find((task) => task.parentTaskId)!;
+      yield* call("review_child_result", { taskId: child.taskId, resultRef: child.resultRef, outcome: "accept", reason: "Reviewed fresh report", evidenceRefs: ["input"] });
+    } else yield* report("Integrated current evidence");
+  } }, undefined, async (task) => {
+    if (task.parentTaskId && !changed && f.store.getTask(task.taskId)?.status === "validating") { changed = true; await writeFile(join(f.workspace, "changed.txt"), "new version"); }
+  });
+  currentStore = f.store;
+  const command = f.store.command.bind(f.store); let crash = crashFeedback;
+  f.store.command = ((id: string, value: unknown, now: number, apply: never) => {
+    const event = value as { kind?: string; id?: string };
+    if (crash && event.kind === "message.reserve" && event.id?.includes(":validation-")) { crash = false; throw new Error("Crash after report invalidation before feedback delivery"); }
+    return command(id, value, now, apply);
+  }) as typeof f.store.command;
+  const { run } = await f.runtime.submit({ commandId: "create", objective: "Investigate current project", configuration: { ...f.config, maxRetries: 2 } });
+  await until(f.runtime, () => ["succeeded", "failed", "paused"].includes(f.store.getRun(run.runId)!.status));
+  if (crashFeedback) {
+    expect(f.store.getRun(run.runId)?.status).toBe("paused"); expect(childRequests).toBe(1);
+    expect(f.store.records<{ invalidated: boolean }>("submitted-report", run.runId)[0]!.value.invalidated).toBe(true);
+    await f.runtime.close(); f.store.close(); currentStore = new RuntimeStore(f.database); stores.push(currentStore);
+    const runtime = new DurableRuntime(currentStore, f.state, f.factory); runtimes.push(runtime); await runtime.start(); await runtime.resume(run.runId);
+    await until(runtime, () => ["succeeded", "failed", "paused"].includes(currentStore.getRun(run.runId)!.status));
+  }
+  expect(currentStore.getRun(run.runId)?.status).toBe("succeeded"); expect(childRequests).toBe(2);
+  const child = currentStore.tasks(run.runId).find((task) => task.parentTaskId)!;
+  if (!crashFeedback) expect(currentStore.record<number>("retries", child.taskId)?.value).toBe(1);
+  expect(currentStore.record<{ invalidated?: boolean; report: string }>("submitted-report", child.taskId)?.value).toMatchObject({ report: JSON.stringify({ summary: "Inspected version 2", evidenceRefs: ["input"], uncertainties: [] }) });
+  expect(currentStore.events(run.runId).filter((event) => event.type === "report.invalidated")).toHaveLength(1);
 });

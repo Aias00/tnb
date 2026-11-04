@@ -1,6 +1,14 @@
 import { digestJson, integer, text } from "./json";
 import type { RuntimeStore, RuntimeTransaction } from "./store";
 import type { RuntimeConfiguration } from "./engine";
+import type { DurableRun } from "./types";
+
+export function isControlCandidate(run: DurableRun, action: string): boolean {
+  if (action === "resume") return run.status === "paused";
+  if (action === "pause") return ["active", "paused", "pausing"].includes(run.status);
+  if (action === "cancel") return ["active", "paused", "pausing", "cancelling"].includes(run.status);
+  return false;
+}
 
 export type RoutingInput = { inputId: string; workspace: string; rawText: string; source: "cli" | "conversation" | "api"; sessionId?: string; resolutionRevision?: number };
 export type RoutingDecision = RoutingInput & {
@@ -26,7 +34,8 @@ export function recordRouting(tx: RuntimeTransaction, input: RoutingInput, actio
   if (previous && (previous.workspace !== input.workspace || previous.sessionId !== input.sessionId || previous.rawText !== input.rawText || previous.action !== action || previous.runId !== runId)) throw new Error("Input identity already routed differently");
   if (previous) return;
   const decision: RoutingDecision = { ...input, action, runId, taskId, status: "accepted", reason: "explicit-command", revision: 1, policyRevision: 1, candidates: [], at: tx.now };
-  tx.saveRoute(input.inputId, input.workspace, decision);
+  // User controls and answers must still be durable when ordinary input history is full.
+  tx.saveRoute(input.inputId, input.workspace, decision, action !== "submit" && action !== "followup");
   tx.event(runId, "input.routed", { inputId: input.inputId, action, taskId, policyRevision: 1 }, taskId);
 }
 
@@ -42,11 +51,13 @@ export class TaskRouter {
         if (previous.rawText !== input.source.rawText || previous.workspace !== input.source.workspace || previous.sessionId !== input.source.sessionId || previous.action !== `run.${input.action}`) throw new Error("Input identity conflict");
         return previous;
       }
-      const candidates = this.store.runs().filter((run) => tx.record<RuntimeConfiguration>("configuration", run.runId)?.value.workspace === input.source.workspace
-        && !["succeeded", "failed", "cancelled"].includes(run.status));
+      const eligible = this.store.runs().filter((run) => tx.record<RuntimeConfiguration>("configuration", run.runId)?.value.workspace === input.source.workspace
+        && isControlCandidate(run, input.action));
+      const own = input.source.sessionId ? eligible.filter((run) => tx.record<RuntimeConfiguration>("configuration", run.runId)?.value.originSessionId === input.source.sessionId) : [];
+      const candidates = own.length ? own : eligible;
       const decision: RoutingDecision = { ...input.source, action: `run.${input.action}`, status: "clarify", reason: "select-control-target",
         revision: 1, policyRevision: 1, candidates: candidates.slice(0, 64).map(({ runId, objective, status }) => ({ runId, objective: objective.slice(0, 256), status })), at: tx.now };
-      tx.saveRoute(decision.inputId, decision.workspace, decision); return decision;
+      tx.saveRoute(decision.inputId, decision.workspace, decision, true); return decision;
     });
   }
   followup(input: { commandId: string; source: RoutingInput; runId?: string; taskId?: string; resolveInputId?: string; expectedRevision?: number }): RoutingDecision {

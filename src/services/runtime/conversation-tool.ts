@@ -6,6 +6,7 @@ import { digestJson, text } from "./json";
 import { runtimeRequest } from "./server";
 import { ensureRuntime, assertConversationOwner } from "./client";
 import { parseDeadline, extensionMilliseconds } from "./limits";
+import { isControlCandidate, type RoutingDecision } from "./routing";
 
 export const DURABLE_CONVERSATION_INSTRUCTIONS = "When the user explicitly asks to execute a long-running task durably or in the background, use durable_task submit. Include a self-contained objective and the relevant conversation decisions in context, a stable key, explicit write/Shell grants and replay-safe checks. It creates a separate persistent Run using the current model, with its own disclosed budget; do not use it as an ordinary subagent or to escape this invocation's budget. For progress, results or control, use durable_task with the existing runId. For additional requirements use followup, not submit or answer. When followup returns clarify, ask the user to choose a candidate; resolveInputId and expectedRevision bind the original input. Do not guess a target by topic. Use routing to recover unresolved choices. Read questions to show pending decisions; use answer with the question ID and version only for the user's actual decision, never invent an answer. An answer cannot expand permissions or resume a paused Run. Use limits only for the user's explicit deadline or total-budget decision, after a fully drained pause and reading the current Run revision. Never increase limits autonomously; an update preserves all usage/reservations and stays paused until explicitly resumed. Submission is acceptance, not completion. While the durable task owns this workspace, use its controls and wait for it to release the workspace before local file operations. Never infer completion from submission or promise parallel code writes.";
 
@@ -21,6 +22,7 @@ type Request = {
 export type ConversationRuntimeContext = {
   configDir: string; env: Record<string, string | undefined>; sessionId: string;
   sourceText?: string;
+  sourceInputId?: string;
   workspace(): string; roots(): string[]; provider: string; model: string;
 };
 const reads = new Set(["routing", "list", "status", "result", "events", "questions"]);
@@ -28,6 +30,7 @@ const actions = [...reads, "followup", "submit", "pause", "resume", "cancel", "a
 
 /** User-facing main-conversation capability. It is deliberately excluded from child/Skill/Hook tools. */
 export function createDurableTaskTool(context: ConversationRuntimeContext): AgentTool {
+  const sourceInputId = context.sourceInputId ?? crypto.randomUUID();
   return defineTool<Request>({
     name: "durable_task", access: "execute", isReadOnly: (input) => reads.has(input.action),
     isConcurrencySafe: () => false, requiresApproval: (input) => !reads.has(input.action),
@@ -92,9 +95,10 @@ export function createDurableTaskTool(context: ConversationRuntimeContext): Agen
       }
       return structuredClone(input);
     },
-    bindExecution() {
+    bindExecution(identity) {
       const workspace = realpathSync(context.workspace()); const roots = context.roots().map((root) => realpathSync(root));
-      return createDurableTaskTool({ ...context, workspace: () => workspace, roots: () => roots });
+      return createDurableTaskTool({ ...context, sourceInputId: identity ? digestJson({ sessionId: context.sessionId, ...identity, scope: identity.scope ?? sourceInputId }) : sourceInputId,
+        workspace: () => workspace, roots: () => roots });
     },
     async execute(input, signal) {
       signal.throwIfAborted();
@@ -123,11 +127,22 @@ export function createDurableTaskTool(context: ConversationRuntimeContext): Agen
       assertConversationOwner(await runtimeRequest(context.configDir, "/health") as Parameters<typeof assertConversationOwner>[0]);
       const runs = await runtimeRequest(context.configDir, `/runs?workspace=${encodeURIComponent(workspace)}`) as DurableRun[];
       if (input.action === "list") return JSON.stringify(runs);
+      const controlling = ["pause", "resume", "cancel"].includes(input.action);
+      const controlInputId = `chat-control:${digestJson({ sessionId: context.sessionId, sourceInputId, input })}`;
+      if (controlling) {
+        const prior = (await runtimeRequest(context.configDir, `/routing?workspace=${encodeURIComponent(workspace)}&inputId=${encodeURIComponent(controlInputId)}`) as RoutingDecision[])[0];
+        if (prior) {
+          if (prior.sessionId !== context.sessionId || prior.action !== `run.${input.action}` || (context.sourceText !== undefined && prior.rawText !== context.sourceText)) throw new Error("Control source identity conflict");
+          return JSON.stringify(prior);
+        }
+      }
       const own = input.runId ? undefined : await runtimeRequest(context.configDir, `/runs?workspace=${encodeURIComponent(workspace)}&sessionId=${encodeURIComponent(context.sessionId)}`) as DurableRun[];
-      const candidates = own?.length ? own : runs;
+      const eligible = controlling ? runs.filter((run) => isControlCandidate(run, input.action)) : runs;
+      const ownEligible = controlling ? own?.filter((run) => isControlCandidate(run, input.action)) : own;
+      const candidates = ownEligible?.length ? ownEligible : eligible;
       if (!input.runId && candidates.length > 1 && !reads.has(input.action)) {
         if (["pause", "cancel", "resume"].includes(input.action)) {
-          const commandId = `chat-route:${digestJson({ sessionId: context.sessionId, input, original: context.sourceText })}`;
+          const commandId = controlInputId;
           return JSON.stringify(await runtimeRequest(context.configDir, "/command", { action: "route-control", commandId, routeAction: input.action,
             source: { inputId: commandId, workspace, rawText: context.sourceText ?? `${input.action} existing task`, source: "conversation", sessionId: context.sessionId } }));
         }
@@ -137,8 +152,7 @@ export function createDurableTaskTool(context: ConversationRuntimeContext): Agen
       if (!runId || !runs.some((run) => run.runId === runId)) throw new Error("No matching durable Run in this conversation workspace");
       signal.throwIfAborted();
       if (reads.has(input.action)) return JSON.stringify(await runtimeRequest(context.configDir, `/${input.action}?runId=${encodeURIComponent(runId)}&after=${input.after ?? 0}`));
-      const commandId = `chat:${digestJson(input.action === "answer" || input.action === "limits"
-        ? { sessionId: context.sessionId, runId, input } : { sessionId: context.sessionId, action: input.action, runId, nonce: crypto.randomUUID() })}`;
+      const commandId = controlling ? controlInputId : `chat:${digestJson({ sessionId: context.sessionId, runId, input })}`;
       const source = { inputId: commandId, workspace, rawText: context.sourceText ?? input.answer ?? `${input.action} ${runId}`,
         source: "conversation", sessionId: context.sessionId };
       if (input.action === "answer") return JSON.stringify(await runtimeRequest(context.configDir, "/command", { action: "answer", runId,

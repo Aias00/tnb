@@ -14,6 +14,7 @@ type EffectRow = {
 };
 export type EffectInput = Pick<RuntimeEffect, "runId" | "kind" | "key" | "data"> & { taskId?: string; dueAt: number };
 export type StoreLimits = { maxEffects: number; maxEffectsPerRun: number; maxActiveRuns: number };
+export type RouteQuery = { pendingOnly?: boolean; actionableOnly?: boolean; beforeInputId?: string; limit?: number };
 
 /** Internal persistence boundary. No worker, model, tool, IPC or automatic recovery is started here. */
 export class RuntimeStore {
@@ -57,6 +58,11 @@ export class RuntimeStore {
       if (!run || !["succeeded", "failed", "cancelled"].includes(run.status)) throw new Error("Only terminal Runs can be pruned");
       if (this.#reader().activeAttempts(runId).length || this.operationHeaders(runId).some((row) => row.effectOutcome === "unknown" || row.state === "dispatched")) throw new Error("Run still has unreconciled execution evidence");
       const taskIds = this.tasks(runId).map((task) => task.taskId);
+      // Explicit Run pruning retires routing payloads, but never frees their business identities.
+      for (const row of this.#db.query("SELECT input_id,workspace,data FROM routing_inputs WHERE json_extract(data,'$.runId')=?").all(runId) as Array<{ input_id: string; workspace: string; data: string }>) {
+        this.#db.query("INSERT INTO routing_tombstones(input_id,workspace,digest) VALUES(?,?,?)").run(row.input_id, row.workspace, digestJson(JSON.parse(row.data)));
+        this.#db.query("DELETE FROM routing_inputs WHERE input_id=?").run(row.input_id);
+      }
       this.#db.query("DELETE FROM task_dependencies WHERE task_id IN (SELECT task_id FROM tasks WHERE run_id = ?)").run(runId);
       this.#db.query("DELETE FROM attempts WHERE task_id IN (SELECT task_id FROM tasks WHERE run_id = ?)").run(runId);
       for (const table of ["runtime_records", "effects", "events", "signals"]) this.#db.query(`DELETE FROM ${table} WHERE run_id = ?`).run(runId);
@@ -74,7 +80,7 @@ export class RuntimeStore {
   }
   record<T>(kind: string, id: string): RuntimeRecord<T> | undefined { return this.#reader().record<T>(kind, id); }
   route<T>(id: string): T | undefined { return this.#reader().route<T>(id); }
-  routes<T>(workspace: string): T[] { return this.#reader().routes<T>(workspace); }
+  routes<T>(workspace: string, query?: RouteQuery): T[] { return this.#reader().routes<T>(workspace, query); }
   records<T>(kind: string, runId: string, taskId?: string): RuntimeRecord<T>[] { return this.#reader().records<T>(kind, runId, taskId); }
   operationHeaders(runId: string, taskId?: string): Array<{ id: string; taskId: string; state: string; effectOutcome?: string; name: string }> {
     this.#assertOpen();
@@ -219,12 +225,27 @@ export class RuntimeTransaction {
   constructor(private readonly db: Database, private readonly limits: StoreLimits, readonly commandId: string, readonly now: number) {}
   expire(): void { this.#expired = true; }
   route<T>(id: string): T | undefined { return this.#read<T>("SELECT data FROM routing_inputs WHERE input_id = ?", id); }
-  routes<T>(workspace: string): T[] {
-    return (this.db.query("SELECT data FROM routing_inputs WHERE workspace = ? ORDER BY rowid DESC LIMIT 256").all(workspace) as DataRow[]).map((row) => JSON.parse(row.data));
+  routes<T>(workspace: string, query: RouteQuery = {}): T[] {
+    const limit = integer(query.limit ?? 256, "routing page size", 1, 256);
+    let before = Number.MAX_SAFE_INTEGER;
+    if (query.beforeInputId !== undefined) {
+      text(query.beforeInputId, "routing cursor", 128);
+      const row = this.db.query("SELECT rowid AS position FROM routing_inputs WHERE input_id=? AND workspace=?").get(query.beforeInputId, workspace) as { position: number } | null;
+      if (!row) throw new Error("Routing cursor not found in this workspace");
+      before = row.position;
+    }
+    const pending = query.pendingOnly ? "AND json_extract(data,'$.status')='clarify'" : "";
+    const actionable = query.actionableOnly ? "AND json_array_length(data,'$.candidates')>=1" : "";
+    // Only the explicitly paged pending view uses a row cursor. The combined first
+    // page prioritizes unresolved decisions so ordinary history cannot bury them.
+    if (query.beforeInputId !== undefined && !query.pendingOnly) throw new Error("Routing cursors require the pending view");
+    return (this.db.query(`SELECT data FROM routing_inputs WHERE workspace=? AND rowid<? ${pending} ${actionable}
+      ORDER BY (json_extract(data,'$.status')='clarify') DESC,rowid DESC LIMIT ?`).all(workspace, before, limit) as DataRow[]).map((row) => JSON.parse(row.data));
   }
-  saveRoute(id: string, workspace: string, value: unknown): void {
+  saveRoute(id: string, workspace: string, value: unknown, allowControlOverflow = false): void {
     this.#mutable();
-    if (!this.route(id) && (this.db.query("SELECT COUNT(*) AS n FROM routing_inputs").get() as { n: number }).n >= 10000) throw new Error("Routing history capacity reached");
+    if (this.db.query("SELECT input_id FROM routing_tombstones WHERE input_id=?").get(id)) throw new Error("Routing input was pruned; use a new input identity for new work");
+    if (!allowControlOverflow && !this.route(id) && (this.db.query("SELECT COUNT(*) AS n FROM routing_inputs").get() as { n: number }).n >= 10000) throw new Error("Routing history capacity reached; prune terminal Runs before submitting new work");
     this.db.query("INSERT INTO routing_inputs(input_id,workspace,data) VALUES (?,?,?) ON CONFLICT(input_id) DO UPDATE SET data=excluded.data")
       .run(id, workspace, encodeJson(value));
   }

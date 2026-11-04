@@ -20,7 +20,7 @@ export function questionAttentionResponse(runtime: DurableRuntime, workspace: st
             if (questions.length === 64) break page; // Answering advances the bounded snapshot to the next decisions.
           }
         }
-        for (const decision of runtime.store.routes<RoutingDecision>(workspace).filter((decision) => decision.status === "clarify" && decision.candidates.length >= 2).slice(0, 32)) {
+        for (const decision of runtime.store.routes<RoutingDecision>(workspace, { pendingOnly: true, actionableOnly: true, limit: 32 })) {
           questions.push({ ...decision, routing: true, version: decision.revision });
         }
         return JSON.stringify({ workspace, questions, notifications: pendingRunNotices(runtime, workspace), lifecycleNotifications: true, ready: !runtime.lastError });
