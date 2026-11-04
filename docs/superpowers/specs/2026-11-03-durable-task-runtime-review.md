@@ -225,3 +225,21 @@ macOS / Bun 1.3.14 最终验证：类型检查、构建通过；要求原生沙�
 编译后的 `dist/tnb` 使用生产 Worker 和本地 SSE 模型走通两条流程：打开对话后自动询问并输入编号继续；关闭对话、留下另一个问题、重启 owner、新开对话后自动补提醒并输入编号继续。**手动问题查询命令 0 次、手动回答命令 0 次、聊天模型请求 0 次**，两个 Run 都成功，共 4 次本地 worker 请求。证据在仓库外 `attention-*.log` 和 `compiled-question-notifications-smoke.ts/.log/.json`。没有付费模型调用、真实桌面通知或对外消息。
 
 提醒呈现在打开的 tnb 界面中；界面关闭后问题持久保留，下次打开补提醒。本轮没有实现系统桌面或外部通道通知。旧 owner 必须重启到具备 `questionNotifications` capability 的版本。
+
+## 8 生命周期提醒、连接诊断与经济限制调整
+
+本轮落实前三项优先改进：完成/失败/阻塞等生命周期提醒，后台连接状态可见，原 Run 续期与预算调整；同时统一过期问题的展示和回答条件。使用原 schema v2 的事件与 records，不引入另一套业务状态或模型循环。
+
+生命周期提醒按工作区从当前 Run 状态和稳定持久事件 ID 生成，区分 succeeded、failed、blocked、paused、cancelled；budget、deadline、storage、unknown-effects、execution-error 有明确暂停原因和后续操作。客户端展示后确认送达，确认记录在同一数据库持久保存；断线或 owner 重启补发未确认状态，已确认的提醒不再反复显示。TUI 先提交带稳定 notice ID 的视图条目，再发确认；提醒不改变前台 busy、流式内容或计量。确认不是用户已读、问题回答或业务恢复授权，确认前崩溃仍允许重复提示。
+
+连接明确区分 connecting/online/stopped/offline/incompatible/unauthorized。初次未启动也展示启动入口；旧 owner 缺少完整生命周期协议、控制凭据变化、连接断开或调度 fatal 均有可见说明。离线收起问题弹窗，保留输入，恢复后重新读取快照。新增显式 `runtime start/restart` 与交互入口；restart 排空旧 owner、等待所有权锁释放，再启动当前版本，保留已暂停/取消状态，不自行恢复暂停任务。未安装 launchd/systemd 托管或发送桌面通知。
+
+新增 `/task limits`、`runtime limits` 和需要正常审批的 `durable_task limits`。只允许完全暂停、无活动 Attempt 的原 Run 调整未来截止时间或预算总上限；支持绝对带时区日期或有界时长延长，两者互斥。更新与命令回执、修订号、审计事件同事务提交，重复 command ID 不重复加时。所有 reported/uncertain/reserved 账目保留，新上限不能低于已有报告与预留。调整后保持暂停，resume 是独立授权；未知副作用屏障不受影响。
+
+实现审阅特别修正了预算兼容性：新预算同时写入基础配置与 `run-limits`，使旧配置读取路径也能看到后来设置的上限；`binding-limits` 保存原预算值，仅兼容原安全能力指纹，不用于当前费用准入。模型、工具、文件/Shell 权限保持原值。任务级自定义预算覆盖需要明确迁移，不能令旧读取路径绕过 Run 上限。预算不足暂停的既有 Task 可以沿原绑定恢复，无需为加额度重新创建任务。过期问题隐藏并拒绝作答；续期后原 waitId/版本重新呈现，暂停期间回答仍不自动恢复。
+
+macOS / Bun 1.3.14 最终验证：类型检查、构建通过；要求原生沙箱的完整回归 **801 pass / 2 skip / 0 fail，803 tests / 125 files**，跳过项仍仅为 Linux/Windows 专属。新增验证覆盖总额度更新与 uncertain 保留、事务/修订/重复加时、首次设限的配置兼容、绑定不变继续执行、过期问题续期后恢复、完成提醒持久确认、失败不误报完成、预算阻塞提醒、断线与新 owner 重连、旧协议/凭据/fatal 状态、真实服务 start/restart 保留暂停状态，以及真实 PTY 的完成提示、确认送达、离线撤下弹窗和草稿保留。
+
+编译后的 `dist/tnb` 使用真实 CLI、独立 owner 和本地 SSE 模型走通：极小预算在模型请求前阻止执行并主动提醒；同 command ID 重复续期只生效一次，预算更新后仍暂停；显式恢复、直接回答问题，原 Run 验收成功并自动提醒；在对话内 restart 更换 owner 后不重复完成提示。全程 2 次本地 worker 请求、0 次聊天模型请求、无付费调用。证据在仓库外 `p0-*.log`、`compiled-runtime-p0-smoke.ts/.log/.json`。
+
+后续仍包括系统桌面通知/系统服务托管、持久里程碑与防空转、业务级验收清单、失败分支隔离与公平调度、持久 Skill/MCP 和隔离并行编码。本轮不将这些后续能力标记为已完成。

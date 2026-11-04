@@ -78,3 +78,27 @@ macTest("withdrawing the first question automatically presents the next queued d
     await t.send("\r"); await t.until(async () => (await t.contents(".answers")) === "Redis\n");
   } finally { await t.close(); }
 }, 12000);
+
+macTest("a completion notice renders automatically and acknowledges delivery without a chat turn", async () => {
+  const t = await terminal();
+  try {
+    await t.push("done"); await t.seen("长任务已完成并通过验收");
+    await t.until(async () => (await t.contents(".acks")) === "completed-one\n");
+    expect(await t.contents(".turns")).toBe("");
+  } finally { await t.close(); }
+}, 12000);
+
+macTest("offline status closes the question dialog and preserves new drafts until reconnection", async () => {
+  const t = await terminal();
+  try {
+    await t.push("ask"); await t.seen("选择数据库");
+    await t.push("offline"); await t.seen("后台服务离线");
+    await t.send("offline draft"); await t.seen("offline draft");
+    expect(await t.contents(".answers")).toBe("");
+    const before = t.output().split("选择数据库").length;
+    await t.push("online"); await Bun.sleep(40); await t.send("\r");
+    await t.until(async () => (await t.contents(".turns")) === "offline draft\n");
+    await t.until(() => t.output().split("选择数据库").length > before);
+    await t.send("\r"); await t.until(async () => (await t.contents(".answers")) === "SQLite\n");
+  } finally { await t.close(); }
+}, 12000);

@@ -251,6 +251,30 @@ test("bare long-task command shows help without starting or accepting work", asy
   expect(help).toContain("/longtask"); expect(help).toContain("--check"); expect(f.store.runs()).toHaveLength(0); expect(f.workerCalls()).toBe(0);
 });
 
+test("task limits extend a paused Run once and never change its write grants or consume its budget ledger", async () => {
+  const f = await fixture();
+  const options = { cwd: f.workspace, workspace: f.workspace, configDir: f.configDir, env: process.env, provider: "fixture", model: "fixture", sessionId: "limits-session" };
+  const execute = (args: string[]) => runLongTaskChatCommand({ ...options, args });
+  const deadline = new Date(Date.now() + 3600000).toISOString();
+  await execute(["Inspect limits", "--mode", "single", "--max-budget-usd", "1", "--deadline", deadline]);
+  const runId = f.store.runs()[0]!.runId; await until(() => f.workerCalls() === 1);
+  await execute(["pause"]); await until(() => f.store.getRun(runId)?.status === "paused");
+  const before = f.runtime.budget.totals(runId), original = f.store.getRun(runId)!.deadline!;
+  const args = ["limits", "--extend-hours", "24", "--max-budget-usd", "2", "--command-id", "same-limits"];
+  await execute(args); await execute(args);
+  expect(f.store.getRun(runId)?.deadline).toBe(original + 86400000);
+  expect(f.store.getRun(runId)?.status).toBe("paused"); expect(f.runtime.budget.totals(runId)).toEqual(before);
+  expect(f.runtime.configuration(runId)).toMatchObject({ maxCostUsd: 2, allowWrite: false, allowShell: false });
+  expect(f.store.record<{ maxCostUsd: number }>("configuration", runId)!.value.maxCostUsd).toBe(2);
+  expect(f.store.record<{ maxCostUsd: number }>("binding-limits", runId)!.value.maxCostUsd).toBe(1);
+  await expect(execute(["limits", "--max-budget-usd", "3", "--revision", "invalid"])).rejects.toThrow("revision");
+  const tool = createDurableTaskTool(f.context);
+  expect(() => tool.validate({ action: "limits", runId, maxCostUsd: 3 })).toThrow("revision");
+  expect(() => tool.validate({ action: "limits", runId, expectedRevision: f.store.getRun(runId)!.revision, maxCostUsd: 3, allowWrite: true })).toThrow("expand");
+  await execute(["resume"]); await until(() => f.workerCalls() === 2); f.finish();
+  await until(() => f.store.getRun(runId)?.status === "succeeded");
+});
+
 test("task question/answer slash commands bypass the chat model and reuse the persisted Run", async () => {
   let calls = 0;
   const f = await fixture({ async *stream(request) {

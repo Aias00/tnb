@@ -1,5 +1,6 @@
 import type { DurableRuntime, RuntimeConfiguration } from "./engine";
 import type { QuestionNotice } from "./attention";
+import { pendingRunNotices } from "./notices";
 
 /** A reconnect always starts with authoritative open questions, so no event cursor can lose a decision. */
 export function questionAttentionResponse(runtime: DurableRuntime, workspace: string, signal: AbortSignal): Response {
@@ -18,7 +19,7 @@ export function questionAttentionResponse(runtime: DurableRuntime, workspace: st
             if (questions.length === 64) break page; // Answering advances the bounded snapshot to the next decisions.
           }
         }
-        return JSON.stringify({ workspace, questions });
+        return JSON.stringify({ workspace, questions, notifications: pendingRunNotices(runtime, workspace), lifecycleNotifications: true, ready: !runtime.lastError });
       };
       send = () => {
         if (closed || (controller.desiredSize ?? 0) <= 0) return;
@@ -27,6 +28,7 @@ export function questionAttentionResponse(runtime: DurableRuntime, workspace: st
         previous = data; controller.enqueue(encoder.encode(`data: ${data}\n\n`));
       };
       const heartbeat = setInterval(() => {
+        send(); // Expired questions must disappear even while a Run is already paused.
         if (!closed && (controller.desiredSize ?? 0) > 0) controller.enqueue(encoder.encode(": keepalive\n\n"));
       }, 15_000); heartbeat.unref();
       cleanup = () => {

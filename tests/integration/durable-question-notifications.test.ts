@@ -1,12 +1,12 @@
 // Pending decisions must reach an idle UI without a model/query turn, reappear after
 // reconnect, stay scoped to the workspace, and disappear when another client answers.
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DurableRuntime, type RuntimeConfiguration, type RuntimeWorkerFactory } from "../../src/services/runtime/engine";
 import { RuntimeStore } from "../../src/services/runtime/store";
-import { serveDurableRuntime } from "../../src/services/runtime/server";
+import { serveDurableRuntime, runtimePaths } from "../../src/services/runtime/server";
 import { DurableQuestionInbox } from "../../src/services/runtime/attention";
 import { runRepl } from "../../src/ui/repl";
 
@@ -23,7 +23,7 @@ async function fixture() {
   const state = join(configDir, "runtime"), store = new RuntimeStore(join(state, "state.sqlite")); cleanup.push(async () => store.close());
   let calls = 0;
   const factory: RuntimeWorkerFactory = async () => ({ model: "fixture", tools: [], authorize: async () => ({ behavior: "allow" }),
-    route: { provider: "fixture", model: "fixture" }, maxOutputTokens: 100, transport: { async *stream(request) {
+    route: { provider: "fixture", model: "fixture", pricing: { input: 1, output: 1 } }, maxOutputTokens: 100, transport: { async *stream(request) {
       calls++;
       if (!JSON.stringify(request.messages).includes("tool-result")) {
         yield { type: "tool-start", index: 0, id: "ask", name: "durable_wait" };
@@ -121,4 +121,61 @@ test("switching workspace withdraws the old question and refuses a stale dialog 
   await until(() => inbox.current().length === 0);
   workspace = f.workspace; await until(() => inbox.current().length === 1);
   expect(inbox.current()[0]!.waitId).toBe(question.waitId);
+});
+
+test("completion is pushed and acknowledged durably; reconnect does not repeat the notification", async () => {
+  const f = await fixture(), inbox = f.inbox();
+  const { run } = await f.runtime.submit({ commandId: "complete-notice", objective: "Notify completion", configuration: f.config });
+  await until(() => inbox.current().length === 1); await inbox.answer(inbox.current()[0]!, "SQLite");
+  await until(() => inbox.notifications().some((notice) => notice.runId === run.runId && notice.kind === "succeeded"));
+  const notice = inbox.notifications().find((notice) => notice.runId === run.runId)!;
+  await inbox.acknowledge(notice); await until(() => inbox.notifications().length === 0);
+  const reopened = f.inbox(); await until(() => reopened.connection().state === "online");
+  expect(reopened.notifications()).toEqual([]); expect(f.calls()).toBe(2);
+});
+test("owner loss is visible, stale questions cannot be answered offline, and restart reconnects", async () => {
+  const f = await fixture(), inbox = f.inbox();
+  await f.runtime.submit({ commandId: "connection", objective: "Show connection status", configuration: f.config });
+  await until(() => inbox.current().length === 1); const question = inbox.current()[0]!;
+  await f.close(); await until(() => inbox.connection().state === "offline");
+  await expect(inbox.answer(question, "SQLite")).rejects.toThrow("离线");
+  await f.owner(); await until(() => inbox.connection().state === "online");
+  await inbox.answer(inbox.current()[0]!, "SQLite");
+});
+
+test("budget exhaustion pushes a blocked notice; increasing the total ceiling keeps charges and stays paused", async () => {
+  const f = await fixture(), inbox = f.inbox();
+  const { run } = await f.runtime.submit({ commandId: "budget-notice", objective: "Report blocked budget", configuration: { ...f.config, maxCostUsd: 0.000000001 } });
+  await until(() => inbox.notifications().some((notice) => notice.runId === run.runId));
+  const notice = inbox.notifications().find((notice) => notice.runId === run.runId)!;
+  expect(notice).toMatchObject({ kind: "blocked", reason: "budget" }); expect(notice.message).toContain("预算不足"); expect(f.calls()).toBe(0);
+  await inbox.acknowledge(notice);
+  f.runtime.commands.updateLimits({ commandId: "topup", runId: run.runId, expectedRevision: f.store.getRun(run.runId)!.revision, maxCostUsd: 2 });
+  expect(f.store.getRun(run.runId)?.status).toBe("paused");
+  await f.runtime.resume(run.runId); await until(() => inbox.current().length === 1); await inbox.answer(inbox.current()[0]!, "SQLite");
+  await until(() => inbox.notifications().some((notice) => notice.runId === run.runId && notice.kind === "succeeded")); expect(f.calls()).toBe(2);
+});
+
+test("failed validation pushes failure, never a completion notice", async () => {
+  const f = await fixture(), inbox = f.inbox();
+  const { run } = await f.runtime.submit({ commandId: "failure-notice", objective: "Report failure", configuration: { ...f.config, checks: ["missing-check-executor"] } });
+  await until(() => inbox.current().length === 1); await inbox.answer(inbox.current()[0]!, "SQLite");
+  await until(() => inbox.notifications().some((notice) => notice.runId === run.runId));
+  expect(inbox.notifications().find((notice) => notice.runId === run.runId)?.kind).toBe("failed");
+  expect(inbox.notifications().some((notice) => notice.kind === "succeeded")).toBe(false);
+});
+
+test("old owners, invalid credentials and stopped dispatch produce explicit connection states", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tnb-old-attention-")); cleanup.push(() => rm(root, { recursive: true, force: true }));
+  const workspace = await realpath(root), configDir = join(root, "config"), paths = await runtimePaths(configDir);
+  await writeFile(paths.token, "fixture-key"); let mode = "old";
+  const server = Bun.serve({ unix: paths.socket, fetch() {
+    if (mode === "unauthorized") return new Response("Unauthorized", { status: 403 });
+    const snapshot = { workspace, questions: [], ...(mode === "old" ? {} : { notifications: [], lifecycleNotifications: true, ready: false }) };
+    return new Response(`data: ${JSON.stringify(snapshot)}\n\n`, { headers: { "content-type": "text/event-stream" } });
+  } }); cleanup.push(() => server.stop(true));
+  const inbox = new DurableQuestionInbox({ configDir, workspace: () => workspace }); inbox.start(); cleanup.push(() => inbox.close());
+  await until(() => inbox.connection().state === "incompatible"); expect(inbox.connection().message).toContain("restart");
+  mode = "unauthorized"; await until(() => inbox.connection().state === "unauthorized");
+  mode = "failed"; await until(() => inbox.connection().state === "offline"); expect(inbox.connection().message).toContain("调度已停止");
 });

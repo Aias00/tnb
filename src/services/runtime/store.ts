@@ -109,6 +109,13 @@ export class RuntimeStore {
       type: row.type, ...(row.task_id ? { taskId: row.task_id } : {}), at: row.at, data: JSON.parse(row.data),
     }));
   }
+  latestEvent(runId: string, types: readonly string[]): RuntimeEvent | undefined {
+    this.#assertOpen();
+    if (!types.length) return undefined;
+    const row = this.#db.query(`SELECT event_id FROM events WHERE run_id = ? AND type IN (${types.map(() => "?").join(",")}) ORDER BY sequence DESC LIMIT 1`)
+      .get(runId, ...types) as { event_id: string } | null;
+    return row ? this.#reader().getEvent(runId, row.event_id) : undefined;
+  }
   effects(runId: string): RuntimeEffect[] {
     this.#assertOpen();
     return (this.#db.query("SELECT * FROM effects WHERE run_id = ? ORDER BY sequence").all(runId) as EffectRow[]).map(effectFromRow);
@@ -213,6 +220,12 @@ export class RuntimeTransaction {
   getRun(id: string): DurableRun | undefined { return this.#read<DurableRun>("SELECT data FROM runs WHERE run_id = ?", id); }
   getTask(id: string): DurableTask | undefined { return this.#read<DurableTask>("SELECT data FROM tasks WHERE task_id = ?", id); }
   getAttempt(id: string): DurableAttempt | undefined { return this.#read<DurableAttempt>("SELECT data FROM attempts WHERE attempt_id = ?", id); }
+  getEvent(runId: string, eventId: string): RuntimeEvent | undefined {
+    const row = this.db.query("SELECT * FROM events WHERE run_id = ? AND event_id = ?").get(runId, eventId) as
+      { event_id: string; run_id: string; sequence: number; command_id: string; type: string; task_id: string | null; at: number; data: string } | null;
+    return row ? { eventId: row.event_id, runId: row.run_id, sequence: row.sequence, commandId: row.command_id, type: row.type,
+      ...(row.task_id ? { taskId: row.task_id } : {}), at: row.at, data: JSON.parse(row.data) } : undefined;
+  }
   record<T>(kind: string, id: string): RuntimeRecord<T> | undefined {
     const row = this.db.query("SELECT * FROM runtime_records WHERE kind = ? AND record_id = ?").get(kind, id) as RecordRow | null;
     return row ? recordFromRow<T>(row) : undefined;

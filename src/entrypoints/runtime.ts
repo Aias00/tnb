@@ -3,21 +3,26 @@ import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { realpath } from "node:fs/promises";
 import { runtimePaths, runtimeRequest, serveDurableRuntime } from "../services/runtime/server";
-import { ensureRuntime, assertConversationOwner } from "../services/runtime/client";
+import { ensureRuntime, assertConversationOwner, restartRuntime } from "../services/runtime/client";
+import { parseDeadline, extensionMilliseconds } from "../services/runtime/limits";
 import type { DurableRun } from "../services/runtime/types";
 import { registerCleanup } from "../utils/cleanup-registry";
 import { withOfflineRuntime, backupRuntime, restoreRuntime, pruneRuntime, runtimeStorageUsage } from "../services/runtime/maintenance";
 
-const HELP = `Usage: tnb runtime <submit|status|result|list|events|questions|answer|pause|resume|cancel|reconcile|serve|stop|backup|restore|prune|storage> [options]
+const HELP = `Usage: tnb runtime <submit|status|result|list|events|questions|answer|limits|pause|resume|cancel|reconcile|start|restart|serve|stop|backup|restore|prune|storage> [options]
 
 submit <objective> [--cwd PATH] [--mode single|auto|multi] [--allow-write] [--allow-shell]
   [--check COMMAND]... [--allow-workspace PATH]... [--provider ID] [--model ID]
-  [--max-budget-usd N] [--max-turns N] [--command-id ID] [--no-start]
+  [--max-budget-usd N] [--max-turns N] [--deadline ISO-DATE] [--command-id ID] [--no-start]
 status|result|events|pause|resume|cancel <run-id>  (result accepts --task TASK-ID)
 questions <run-id>  Show outstanding questions and their versions.
 answer <run-id> --question ID --answer TEXT --version N  Answer without changing permissions.
+limits <run-id> [--extend-hours N | --deadline ISO-DATE] [--max-budget-usd N] [--revision N]
+  Requires a fully paused Run. Budget is the total ceiling; usage/reservations remain.
+  Updating limits does not resume the Run or change its tools, model or permissions.
 reconcile <run-id> --task TASK-ID --operation OPERATION-ID --result CONFIRMED-RESULT
 serve  Run the local owner in the foreground (normally started on demand).
+start / restart  Start or explicitly drain/restart the persistent service.
 stop   Drain and stop the service; accepted tasks remain recoverable.
 backup <directory> / restore <directory> / prune <run-id>  Offline maintenance; stop the service first.
 storage  Show state size and free disk space.
@@ -38,6 +43,10 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
   const configDir = resolve(value("--config-dir") ?? options.env.TNB_HOME ?? join(homedir(), ".tnb"));
   try {
     if (!action || args.includes("--help") || args.includes("-h")) { options.stdout.write(HELP); return 0; }
+    if (action === "start" || action === "restart") {
+      if (action === "restart") await restartRuntime(configDir, options.env); else await ensureRuntime(configDir, options.env);
+      options.stdout.write(`${JSON.stringify(await runtimeRequest(configDir, "/health"), null, 2)}\n`); return 0;
+    }
     if (["backup", "restore", "prune", "storage"].includes(action)) {
       const paths = await runtimePaths(configDir);
       let result: unknown;
@@ -71,10 +80,26 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
       const maxCostUsd = value("--max-budget-usd") === undefined ? undefined : Number(value("--max-budget-usd"));
       if (maxCostUsd !== undefined && (!Number.isFinite(maxCostUsd) || maxCostUsd <= 0)) throw new Error("Budget must be positive");
       const body = { action, commandId: value("--command-id") ?? randomUUID(), objective: args[1], mode: value("--mode") ?? "auto",
+        deadline: value("--deadline") === undefined ? undefined : parseDeadline(value("--deadline")!),
         configuration: { workspace, allowedWorkspaces: [workspace, ...values("--allow-workspace").map((path) => resolve(path))],
           allowWrite: args.includes("--allow-write"), allowShell: args.includes("--allow-shell"), checks: values("--check"),
           provider: value("--provider"), model: value("--model"), maxCostUsd, maxTurns: Number(value("--max-turns") ?? 200), maxRetries: 3, compactThreshold: 24000 } };
       if (options.originSessionId) Object.assign(body.configuration, { originSessionId: options.originSessionId });
+      try { result = await runtimeRequest(configDir, "/command", body); }
+      catch (error) { throw new Error(`${error instanceof Error ? error.message : String(error)}. Retry identical input with --command-id ${body.commandId}`); }
+    } else if (action === "limits") {
+      for (let index = 2; index < args.length; index += 2) {
+        if (!["--deadline", "--extend-hours", "--max-budget-usd", "--revision", "--command-id", "--config-dir"].includes(args[index]!)
+          || !args[index + 1] || args[index + 1]!.startsWith("--")) throw new Error("Limits accept only deadline, extension, total budget, revision and command/config IDs, each with a value");
+      }
+      if (value("--deadline") !== undefined && value("--extend-hours") !== undefined) throw new Error("Choose --deadline or --extend-hours");
+      const body = { action, runId: args[1], commandId: value("--command-id") ?? randomUUID(),
+        deadline: value("--deadline") === undefined ? undefined : parseDeadline(value("--deadline")!),
+        extendMs: value("--extend-hours") === undefined ? undefined : extensionMilliseconds(Number(value("--extend-hours"))),
+        maxCostUsd: value("--max-budget-usd") === undefined ? undefined : Number(value("--max-budget-usd")),
+        expectedRevision: value("--revision") === undefined ? undefined : Number(value("--revision")) };
+      if (body.deadline === undefined && body.extendMs === undefined && body.maxCostUsd === undefined) throw new Error("Supply a deadline extension or total budget ceiling");
+      if (body.expectedRevision !== undefined && (!Number.isSafeInteger(body.expectedRevision) || body.expectedRevision < 1)) throw new Error("Invalid Run revision");
       try { result = await runtimeRequest(configDir, "/command", body); }
       catch (error) { throw new Error(`${error instanceof Error ? error.message : String(error)}. Retry identical input with --command-id ${body.commandId}`); }
     } else if (action === "answer") {
@@ -96,10 +121,10 @@ export type RuntimeChatOptions = { args: string[]; cwd: string; workspace: strin
   env: Record<string, string | undefined>; provider: string; model: string; sessionId: string };
 export async function runRuntimeChatCommand(options: RuntimeChatOptions): Promise<string> {
   const args = options.args.length ? [...options.args] : ["list"]; const action = args[0]!;
-  if (!["submit", "list", "status", "result", "events", "questions", "answer", "pause", "resume", "cancel", "storage"].includes(action)) throw new Error("/runtime supports submit, list, status, result, events, questions, answer, pause, resume, cancel and storage.");
-  const valueFlags = new Set(["--cwd", "--mode", "--check", "--allow-workspace", "--provider", "--model", "--max-budget-usd", "--max-turns", "--command-id", "--config-dir", "--after", "--task", "--question", "--answer", "--version"]);
+  if (!["submit", "list", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel", "storage", "start", "restart", "stop"].includes(action)) throw new Error("/runtime supports submit, list, status, result, events, questions, answer, limits, pause, resume, cancel, storage, start, restart and stop.");
+  const valueFlags = new Set(["--cwd", "--mode", "--check", "--allow-workspace", "--provider", "--model", "--max-budget-usd", "--max-turns", "--command-id", "--config-dir", "--after", "--task", "--question", "--answer", "--version", "--deadline", "--extend-hours", "--revision"]);
   const flags = new Set(["--allow-write", "--allow-shell", "--no-start", "--help", "-h"]);
-  const hasTarget = ["submit", "status", "result", "events", "questions", "answer", "pause", "resume", "cancel"].includes(action);
+  const hasTarget = ["submit", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel"].includes(action);
   for (let index = hasTarget ? 2 : 1; index < args.length; index++) {
     const flag = args[index]!;
     if (valueFlags.has(flag)) { if (!args[index + 1] || args[index + 1]!.startsWith("--")) throw new Error(`${flag} requires a value`); index++; }
@@ -126,6 +151,8 @@ const LONG_TASK_HELP = `Long tasks · /longtask (aliases: /task, /long, /长任�
 /longtask status|result|events|pause|resume|cancel [run-id]
 /longtask questions [run-id]
 /longtask answer [run-id] --question ID --answer "text" --version N
+/longtask limits [run-id] [--extend-hours N | --deadline ISO-DATE] [--max-budget-usd N]
+  Pause first. Keeps recorded charges and stays paused until explicit resume.
 
 Starts a durable background task using the current workspace and model.
 Writing requires explicit --allow-write and replay-safe --check commands.
@@ -138,7 +165,7 @@ run-id to select another task. Closing the conversation does not cancel work.
 export async function runLongTaskChatCommand(options: RuntimeChatOptions): Promise<string> {
   let args = [...options.args];
   if (!args.length || args[0] === "help" || args.includes("--help") || args.includes("-h")) return LONG_TASK_HELP;
-  const actions = new Set(["submit", "list", "status", "result", "events", "questions", "answer", "pause", "resume", "cancel"]);
+  const actions = new Set(["submit", "list", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel"]);
   if (!actions.has(args[0]!)) args.unshift("submit");
   if (args[0] === "submit") {
     const flagAt = args.findIndex((value, index) => index > 0 && value.startsWith("--"));

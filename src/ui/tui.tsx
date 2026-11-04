@@ -38,6 +38,7 @@ export type TuiViewProps = {
   completionNotice?: string;
   tasks?: readonly TaskRecord[];
   durableQuestionCount?: number;
+  runtimeConnectionMessage?: string;
   management?: ManagementView;
   managementSelection?: number;
   sessionAction?: { type: "rename" | "delete"; input: string };
@@ -75,6 +76,7 @@ export const TuiView = memo(function TuiView({
   completionNotice,
   tasks = [],
   durableQuestionCount = 0,
+  runtimeConnectionMessage,
   management,
   managementSelection = 0,
   sessionAction,
@@ -120,6 +122,7 @@ export const TuiView = memo(function TuiView({
             {state.todos.length ? <TodoList todos={state.todos} /> : null}
             {tasks.length ? <TaskList tasks={tasks} /> : null}
             {durableQuestionCount ? <Text color="yellow">{durableQuestionCount} 个长任务问题待你决定 · 空闲时自动询问 · /task questions 查看</Text> : null}
+            {runtimeConnectionMessage ? <Text color="yellow">{runtimeConnectionMessage}</Text> : null}
             {state.busy && mcpActivity
               ? <McpActivityRow activity={mcpActivity} color={primaryColor} />
               : state.busy

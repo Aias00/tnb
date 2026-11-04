@@ -22,7 +22,7 @@ of implementing a second execution path:
 
 - `/longtask "objective" [options]` submits a durable background task using the
   current workspace and model; `/task`, `/long` and `/长任务` are aliases. `list`, `status`,
-  `result`, `events`, `questions`, `answer`, `pause`, `resume`, and `cancel` manage those tasks. Without
+  `result`, `events`, `questions`, `answer`, `limits`, `pause`, `resume`, and `cancel` manage those tasks. Without
   a Run ID, controls prefer the current conversation's latest Run, then the
   workspace's latest Run. Bare `/longtask` shows help without starting work.
   Writable tasks require `--allow-write` and replay-safe `--check` commands.
@@ -32,6 +32,12 @@ of implementing a second execution path:
   Open TUI/REPL sessions receive pending questions automatically: choose an option
   or type an answer directly. Existing drafts and dialogs are preserved; reopened
   sessions restore unanswered questions. Esc (TUI) or `/later` (REPL) defers locally.
+  Completion, failure, blocking and budget/deadline alerts are also delivered automatically;
+  acknowledged alerts survive reconnect without repeated display. Offline/old-owner states
+  are visible. `/runtime start|restart|stop` controls the local service explicitly.
+  After a drained pause, `/task limits --extend-hours 24 --max-budget-usd 10` extends
+  the deadline and sets a new total budget ceiling without resetting charges or resuming.
+  `/task resume` remains a separate explicit action. Submission accepts `--deadline ISO-DATE`.
   This entry works in both the TUI and terminal REPL;
 - `/about` reports the CLI/runtime/model/workspace identity;
 - `/reload` (alias `/refresh`) reloads Skills, Agents, commands, Plugins, and

@@ -2,8 +2,9 @@ import { randomUUID } from "node:crypto";
 import { digestJson, integer, text } from "./json";
 import { RuntimeStore, type RuntimeTransaction } from "./store";
 import { refreshWaits, type DurableWait } from "./waits";
+import { NOTICE_EVENTS } from "./notices";
 import { assertTaskTransition, type DurableAttempt, type DurableRun, type DurableTask,
-  type ExecutionPolicy, type RuntimeSignal, type TaskStatus, type WaitCondition, type WorkerIdentity } from "./types";
+  type ExecutionPolicy, type RuntimeSignal, type TaskStatus, type WaitCondition, type WorkerIdentity, type PauseReason, type RunLimits } from "./types";
 
 export type TaskDefinition = { key: string; objective: string; inputDigest: string; dependsOn?: string[] };
 type Command = { commandId: string };
@@ -139,16 +140,67 @@ export class RuntimeCommands {
   scanWaiting(input: Command & { runId: string }): string[] {
     return this.#command(input, "waiting.scan", (tx) => wakeWaiting(tx, requireRun(tx, input.runId)));
   }
+  acknowledgeNotice(input: Command & { runId: string; noticeId: string }): { acknowledged: boolean } {
+    return this.#command(input, "notice.acknowledge", (tx) => {
+      requireRun(tx, input.runId);
+      const event = tx.getEvent(input.runId, input.noticeId);
+      if (!event || !(NOTICE_EVENTS as readonly string[]).includes(event.type)) throw new Error("Notification not found in this Run");
+      if (!tx.record("attention-ack", input.noticeId)) {
+        tx.saveRecord({ kind: "attention-ack", id: input.noticeId, runId: input.runId, value: { eventId: input.noticeId, at: tx.now } }, 0);
+        tx.event(input.runId, "notice.acknowledged", { noticeId: input.noticeId });
+      }
+      return { acknowledged: true };
+    });
+  }
 
-  pauseRun(input: RunCommand): DurableRun {
+  updateLimits(input: RunCommand & { deadline?: number; extendMs?: number; maxCostUsd?: number }): DurableRun {
+    return this.#command(input, "run.limits", (tx) => {
+      const run = requireRun(tx, input.runId, input.expectedRevision);
+      if (run.status !== "paused" || run.cancelRequestedAt !== undefined || tx.activeAttempts(run.runId).length) throw new Error("Limits require a fully drained paused Run");
+      if (input.deadline === undefined && input.extendMs === undefined && input.maxCostUsd === undefined) throw new Error("No limit update supplied");
+      if (input.deadline !== undefined && input.extendMs !== undefined) throw new Error("Choose deadline or extension, not both");
+      let deadline = run.deadline;
+      if (input.extendMs !== undefined) deadline = Math.max(tx.now, run.deadline ?? tx.now) + integer(input.extendMs, "deadline extension", 1, 365 * 86400000);
+      else if (input.deadline !== undefined) deadline = integer(input.deadline, "deadline", tx.now + 1, 8640000000000000);
+      if (deadline !== undefined && (input.deadline !== undefined || input.extendMs !== undefined)
+        && (deadline <= tx.now || (run.deadline !== undefined && deadline <= run.deadline))) throw new Error("Deadline must increase and remain in the future");
+      if (input.deadline !== undefined || input.extendMs !== undefined) integer(deadline!, "deadline", tx.now + 1, 8640000000000000);
+      const limits = tx.record<RunLimits>("run-limits", run.runId);
+      const configuration = tx.record<{ maxCostUsd?: number } & Record<string, unknown>>("configuration", run.runId);
+      const oldCost = limits?.value.maxCostUsd ?? configuration?.value.maxCostUsd;
+      if (input.maxCostUsd !== undefined) {
+        if (!configuration) throw new Error("Run execution configuration is missing");
+        if (tx.tasks(run.runId).some((task) => tx.record<{ maxCostUsd?: number }>("task-configuration", task.taskId)?.value.maxCostUsd !== undefined)) throw new Error("Task-specific budget limits require explicit migration");
+        if (!Number.isFinite(input.maxCostUsd) || input.maxCostUsd <= 0 || (oldCost !== undefined && input.maxCostUsd <= oldCost)) throw new Error("Budget ceiling must be positive and increase");
+        const committed = tx.records<{ reserved: number; reported: number; state: string }>("model-request", run.runId).reduce((sum, record) => {
+          const charge = record.value; return sum + charge.reported + (charge.state === "complete" ? 0 : Math.max(0, charge.reserved - charge.reported));
+        }, 0);
+        if (input.maxCostUsd < committed) throw new Error("Budget cannot be below reported and reserved charges");
+        if (!tx.record("binding-limits", run.runId)) tx.saveRecord({ kind: "binding-limits", id: run.runId, runId: run.runId,
+          value: { maxCostUsd: configuration.value.maxCostUsd } }, 0);
+        // Older readers must also see the ceiling, including Runs that previously had no limit.
+        tx.saveRecord({ ...configuration, value: { ...configuration.value, maxCostUsd: input.maxCostUsd } }, configuration.revision);
+        tx.saveRecord({ kind: "run-limits", id: run.runId, runId: run.runId, value: { maxCostUsd: input.maxCostUsd } }, limits?.revision ?? 0);
+      }
+      const next = { ...run, deadline, revision: run.revision + 1, updatedAt: tx.now };
+      if ((run.pauseReason === "deadline" && deadline! > tx.now) || (run.pauseReason === "budget" && input.maxCostUsd !== undefined)) next.pauseReason = "user";
+      tx.saveRun(next, run.revision);
+      tx.event(run.runId, "run.limits-updated", { previousDeadline: run.deadline, deadline, previousBudget: oldCost, maxCostUsd: input.maxCostUsd ?? oldCost,
+        revision: next.revision, status: next.status, previousPauseReason: run.pauseReason, pauseReason: next.pauseReason });
+      return next;
+    });
+  }
+
+  pauseRun(input: RunCommand & { reason?: PauseReason }): DurableRun {
     return this.#command(input, "run.pause", (tx) => {
       const run = requireRun(tx, input.runId, input.expectedRevision);
       if (run.status === "paused" || run.status === "pausing") return run;
       requireActive(run, tx.now, false);
+      if (input.reason !== undefined && !["user", "deadline", "storage", "budget", "unknown-effects", "execution-error"].includes(input.reason)) throw new Error("Invalid pause reason");
       const previous = run.revision;
       run.status = tx.activeAttempts(run.runId).length ? "pausing" : "paused";
-      run.pauseRequestedAt = tx.now; run.revision++; run.updatedAt = tx.now;
-      tx.saveRun(run, previous); tx.event(run.runId, `run.${run.status}`, { revision: run.revision });
+      run.pauseRequestedAt = tx.now; run.pauseReason = input.reason ?? "user"; run.revision++; run.updatedAt = tx.now;
+      tx.saveRun(run, previous); tx.event(run.runId, `run.${run.status}`, { revision: run.revision, reason: run.pauseReason });
       control(tx, run, "pause");
       return run;
     });
@@ -161,7 +213,7 @@ export class RuntimeCommands {
       if (run.deadline !== undefined && run.deadline <= tx.now) throw new Error("Run deadline expired");
       if (tx.activeAttempts(run.runId).length) throw new Error("Run has an undrained attempt");
       const previous = run.revision;
-      run.status = "active"; run.revision++; run.updatedAt = tx.now; delete run.pauseRequestedAt;
+      run.status = "active"; run.revision++; run.updatedAt = tx.now; delete run.pauseRequestedAt; delete run.pauseReason;
       tx.saveRun(run, previous); tx.event(run.runId, "run.resumed", { revision: run.revision });
       for (const task of tx.tasks(run.runId)) {
         if (task.status === "paused") {

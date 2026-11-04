@@ -17,7 +17,7 @@ export type WaitView = DurableWait & { version: number };
 
 /** Runtime-owned waits do not grant filesystem, Shell or approval authority. */
 export class DurableWaits {
-  constructor(readonly store: RuntimeStore) {}
+  constructor(readonly store: RuntimeStore, private readonly clock: () => number = Date.now) {}
   current(taskId: string): DurableWait | undefined {
     const id = this.store.getTask(taskId)?.waitRequestId;
     return id ? this.store.record<DurableWait>("wait", id)?.value : undefined;
@@ -29,7 +29,7 @@ export class DurableWaits {
   }
   questions(runId: string): WaitView[] {
     const run = this.store.getRun(runId);
-    if (!run || !["active", "paused", "pausing"].includes(run.status)) return [];
+    if (!run || !["active", "paused", "pausing"].includes(run.status) || (run.deadline !== undefined && run.deadline <= this.clock())) return [];
     return this.store.records<DurableWait>("wait", runId)
       .filter((record) => record.value.proposal.kind === "question" && record.value.state === "open")
       .map((record) => ({ ...record.value, version: record.revision }));
@@ -38,7 +38,7 @@ export class DurableWaits {
     validateWaitProposal(proposal);
     const waitId = digestJson({ taskId, key: proposal.key });
     const digest = digestJson(proposal);
-    return this.store.command(randomUUID(), { kind: "wait.request", taskId, worker, proposal }, Date.now(), (tx) => {
+    return this.store.command(randomUUID(), { kind: "wait.request", taskId, worker, proposal }, this.clock(), (tx) => {
       const task = requireLiveTask(tx, taskId, worker);
       const previous = tx.record<DurableWait>("wait", waitId);
       if (previous) {
@@ -63,7 +63,7 @@ export class DurableWaits {
   }
   answer(input: { commandId: string; runId: string; waitId: string; expectedVersion: number; answer: string }): WaitView {
     text(input.answer, "question answer", 8000); integer(input.expectedVersion, "question version", 1);
-    return this.store.command(input.commandId, { kind: "wait.answer", input }, Date.now(), (tx) => {
+    return this.store.command(input.commandId, { kind: "wait.answer", input }, this.clock(), (tx) => {
       const record = tx.record<DurableWait>("wait", input.waitId);
       if (!record || record.runId !== input.runId || record.value.proposal.kind !== "question") throw new Error("Question not found in this Run");
       const value = record.value;
@@ -84,7 +84,7 @@ export class DurableWaits {
     });
   }
   consume(taskId: string, worker: WorkerIdentity, waitId: string): void {
-    this.store.command(randomUUID(), { kind: "wait.consume", taskId, worker, waitId }, Date.now(), (tx) => {
+    this.store.command(randomUUID(), { kind: "wait.consume", taskId, worker, waitId }, this.clock(), (tx) => {
       const task = requireLiveTask(tx, taskId, worker);
       const record = tx.record<DurableWait>("wait", waitId);
       if (!record || task.waitRequestId !== waitId || !["answered", "elapsed", "resolved"].includes(record.value.state)) throw new Error("Wait is not ready to resume");

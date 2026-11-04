@@ -3,6 +3,8 @@ export type RunStatus = "active" | "pausing" | "paused" | "cancelling" | "cancel
 export type TaskStatus = "pending" | "ready" | "running" | "waiting" | "reconciling" | "validating" | "paused" | "succeeded" | "failed" | "cancelled";
 export type WaitCondition = { kind: "message" | "approval" | "timer" | "resource"; key: string; afterGeneration: number };
 export type ExecutionPolicy = { mode: "single" | "auto" | "multi"; maxActiveAgents: number; maxDelegationDepth: number };
+export type PauseReason = "user" | "deadline" | "storage" | "budget" | "unknown-effects" | "execution-error";
+export type RunLimits = { maxCostUsd?: number };
 
 export type DurableRun = {
   runId: string;
@@ -14,6 +16,7 @@ export type DurableRun = {
   updatedAt: number;
   deadline?: number;
   pauseRequestedAt?: number;
+  pauseReason?: PauseReason;
   cancelRequestedAt?: number;
 };
 

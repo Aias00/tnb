@@ -20,7 +20,7 @@ export async function runtimePaths(configDir: string): Promise<{ root: string; s
 type ServerOptions = { configDir: string; env: Record<string, string | undefined>; signal: AbortSignal; runtime?: DurableRuntime; ready?(socket: string): void };
 export const RUNTIME_CAPABILITIES = Object.freeze({ protocol: 2, defaultMode: "auto", maxDelegationDepth: 2, maxParallelBranches: 4,
   readOnlyDelegation: true, parallelWrites: false, skills: false, mcp: false, remoteFederation: false, offlineBackup: true, conversationHandoff: true,
-  durableWaits: true, durableDelegation: true, deadlineScheduling: true, questionNotifications: true });
+  durableWaits: true, durableDelegation: true, deadlineScheduling: true, questionNotifications: true, lifecycleNotifications: true, adjustableLimits: true });
 export async function serveDurableRuntime(options: ServerOptions): Promise<void> {
   const paths = await runtimePaths(options.configDir);
   const release = await lock(paths.root, { realpath: true, stale: 5000, update: 1000, retries: 0 });
@@ -80,17 +80,20 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
                 result: task.resultRef ? await runtime.artifacts.get(task.resultRef) : null }))));
             }
             if (url.pathname === "/status") return Response.json({ run: store.getRun(runId), tasks: store.tasks(runId), budget: runtime.budget.totals(runId),
-              operations: store.operationHeaders(runId), questions: runtime.waits.questions(runId), waits: runtime.waits.pending(runId) });
+              operations: store.operationHeaders(runId), questions: runtime.waits.questions(runId), waits: runtime.waits.pending(runId),
+              limits: runtime.limits(runId) });
             throw new Error("Unknown runtime resource");
           }
           if (request.method !== "POST" || url.pathname !== "/command") throw new Error("Unknown runtime command endpoint");
           const input = await request.json() as { action: string; commandId: string; runId?: string; objective?: string;
             configuration?: RuntimeConfiguration; mode?: "single" | "auto" | "multi"; taskId?: string; operationId?: string; result?: string;
-            waitId?: string; expectedVersion?: number; answer?: string };
+            waitId?: string; expectedVersion?: number; answer?: string; noticeId?: string; expectedRevision?: number;
+            deadline?: number; extendMs?: number; maxCostUsd?: number };
           return await serialCommand(async () => {
             if (typeof input.commandId !== "string" || !input.commandId) throw new Error("commandId is required");
+            if (input.expectedRevision !== undefined && (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1)) throw new Error("Invalid expected Run revision");
             if (input.action === "stop") { setTimeout(() => stopped.resolve(), 20); return Response.json({ stopping: true }); }
-            if (input.action === "submit") return Response.json(await runtime.submit({ commandId: input.commandId, objective: input.objective!, configuration: input.configuration!, mode: input.mode }));
+            if (input.action === "submit") return Response.json(await runtime.submit({ commandId: input.commandId, objective: input.objective!, configuration: input.configuration!, mode: input.mode, deadline: input.deadline }));
             const run = input.runId && store.getRun(input.runId);
             if (!run) throw new Error("Run not found");
             type Receipt = { digest: string; expectedRevision: number; result?: unknown };
@@ -98,11 +101,14 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
             const receipt = store.command(randomUUID(), { kind: "http.prepare", id: input.commandId, digest }, Date.now(), (tx) => {
               const previous = tx.record<Receipt>("http-command", input.commandId);
               if (previous) { if (previous.value.digest !== digest) throw new Error("HTTP command ID has conflicting input"); return previous.value; }
-              const value: Receipt = { digest, expectedRevision: run.revision };
+              const value: Receipt = { digest, expectedRevision: input.expectedRevision ?? run.revision };
               tx.saveRecord({ kind: "http-command", id: input.commandId, runId: run.runId, value }, 0); return value;
             });
             if (receipt.result) return Response.json(receipt.result);
-            if (input.action === "answer") runtime.waits.answer({ commandId: input.commandId, runId: run.runId,
+            if (input.action === "ack") runtime.commands.acknowledgeNotice({ commandId: input.commandId, runId: run.runId, noticeId: input.noticeId! });
+            else if (input.action === "limits") runtime.commands.updateLimits({ commandId: input.commandId, runId: run.runId,
+              expectedRevision: receipt.expectedRevision, deadline: input.deadline, extendMs: input.extendMs, maxCostUsd: input.maxCostUsd });
+            else if (input.action === "answer") runtime.waits.answer({ commandId: input.commandId, runId: run.runId,
               waitId: input.waitId!, expectedVersion: input.expectedVersion!, answer: input.answer! });
             else if (input.action === "pause") runtime.commands.pauseRun({ commandId: input.commandId, runId: run.runId, expectedRevision: receipt.expectedRevision });
             else if (input.action === "cancel") runtime.commands.cancelRun({ commandId: input.commandId, runId: run.runId, expectedRevision: receipt.expectedRevision });
@@ -112,7 +118,8 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
               await runtime.reconcile(input.taskId!, input.operationId!, input.result!);
             } else throw new Error("Unknown runtime action");
             await runtime.tick();
-            const result = { run: store.getRun(run.runId), tasks: store.tasks(run.runId) };
+            const result = { run: store.getRun(run.runId), tasks: store.tasks(run.runId),
+              limits: runtime.limits(run.runId), budget: runtime.budget.totals(run.runId) };
             store.command(randomUUID(), { kind: "http.result", id: input.commandId }, Date.now(), (tx) => {
               const current = tx.record<Receipt>("http-command", input.commandId)!;
               tx.saveRecord({ ...current, value: { ...current.value, result } }, current.revision); return true;

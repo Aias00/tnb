@@ -11,11 +11,11 @@ import { compactConversation, createTransportSummarizer } from "../compact/compa
 import { RuntimeStore } from "./store";
 import { RuntimeCommands, wakeWaiting, type TaskDefinition } from "./commands";
 import { RuntimeArtifacts, workspaceManifest } from "./artifacts";
-import { DurableBudget } from "./budget";
+import { DurableBudget, DurableBudgetExhaustedError } from "./budget";
 import { DurableCallJournal, type Operation } from "./journal";
 import { DurableTranscript } from "./transcript";
 import { digestJson, text } from "./json";
-import type { DurableRun, DurableTask, ExecutionPolicy, WorkerIdentity } from "./types";
+import type { DurableRun, DurableTask, ExecutionPolicy, WorkerIdentity, RunLimits } from "./types";
 import type { BillingRoute } from "../usage/budget";
 import { runtimeStorageUsage } from "./maintenance";
 import { acquireWorkspace, workspaceIsLocked } from "./workspace";
@@ -107,11 +107,18 @@ export class DurableRuntime {
       deadline: input.deadline,
       policy: { mode, maxActiveAgents: mode === "single" ? 1 : 4, maxDelegationDepth: mode === "single" ? 0 : 2 } });
   }
-  configuration(runId: string, taskId?: string): RuntimeConfiguration {
+  configuration(runId: string, taskId?: string, originalLimits = false): RuntimeConfiguration {
     const config = this.store.record<RuntimeConfiguration>("configuration", runId)?.value;
     if (!config) throw new Error("Run configuration missing");
     const override = taskId && this.store.record<Partial<RuntimeConfiguration>>("task-configuration", taskId)?.value;
-    return { ...config, ...(override || {}) };
+    const limits = originalLimits ? undefined : this.store.record<RunLimits>("run-limits", runId)?.value;
+    const original = originalLimits ? this.store.record<RunLimits>("binding-limits", runId) : undefined;
+    return { ...config, ...(original ? { maxCostUsd: original.value.maxCostUsd } : {}), ...(override || {}), ...(limits || {}) };
+  }
+  limits(runId: string): { deadline?: number; maxCostUsd?: number } {
+    const run = this.store.getRun(runId); if (!run) throw new Error("Run not found");
+    return { deadline: run.deadline, maxCostUsd: this.store.record<RunLimits>("run-limits", runId)?.value.maxCostUsd
+      ?? this.store.record<Partial<RuntimeConfiguration>>("configuration", runId)?.value.maxCostUsd };
   }
   async tick(): Promise<void> {
     if (this.#closed || this.lastError) return;
@@ -123,7 +130,8 @@ export class DurableRuntime {
   async #tick(): Promise<void> {
     await this.#checkStorage();
     for (const run of this.store.runs()) {
-      if (((run.deadline && run.deadline <= Date.now()) || this.#storagePressure) && run.status === "active") this.commands.pauseRun({ commandId: randomUUID(), runId: run.runId, expectedRevision: run.revision });
+      if (((run.deadline && run.deadline <= Date.now()) || this.#storagePressure) && run.status === "active") this.commands.pauseRun({ commandId: randomUUID(), runId: run.runId, expectedRevision: run.revision,
+        reason: run.deadline && run.deadline <= Date.now() ? "deadline" : "storage" });
       const current = this.store.getRun(run.runId)!;
       if (current.status === "active" && this.store.tasks(run.runId).some((task) => task.status === "waiting" && (!task.currentAttemptId || this.store.getAttempt(task.currentAttemptId)?.status !== "active"))) {
         // The scan runs on state changes/deadlines, never on a model-owned polling loop.
@@ -202,7 +210,7 @@ export class DurableRuntime {
       tools.push(this.#waitTool(task, identity));
       if (run.policy.mode !== "single" && this.#depth(task) < run.policy.maxDelegationDepth) tools.push(this.#delegateTool(task, identity));
       const binding = digestJson({ protocol: 2, model: resources.model, resources: resources.binding, instructions: resources.projectInstructions,
-        tools: tools.map((tool) => ({ name: tool.name, access: tool.access, schema: tool.inputSchema })), config });
+        tools: tools.map((tool) => ({ name: tool.name, access: tool.access, schema: tool.inputSchema })), config: this.configuration(run.runId, taskId, true) });
       const oldBinding = this.store.record<string>("binding", taskId);
       if (oldBinding && oldBinding.value !== binding) throw new Error("Execution capabilities changed; explicit migration or a new Run is required");
       if (!oldBinding) this.store.command(randomUUID(), { kind: "binding", taskId }, Date.now(), (tx) => { tx.saveRecord({ kind: "binding", id: taskId, runId: run.runId, taskId, value: binding }, 0); return true; });
@@ -374,7 +382,7 @@ export class DurableRuntime {
         tx.saveTask(ready, next.revision);
         tx.enqueue({ runId: run.runId, taskId: task.taskId, kind: "schedule", key: task.taskId, dueAt: Date.now(), data: {} });
       } else if (unknown.length && run.status === "active") {
-        tx.saveRun({ ...run, status: "paused", revision: run.revision + 1, updatedAt: Date.now() }, run.revision);
+        tx.saveRun({ ...run, status: "paused", pauseReason: "unknown-effects", revision: run.revision + 1, updatedAt: Date.now() }, run.revision);
         tx.event(run.runId, "run.blocked", { reason: "unknown-effects", taskId: task.taskId });
       }
       return true;
@@ -423,7 +431,11 @@ export class DurableRuntime {
         tx.saveTask({ ...reconciled, status: "ready", revision: reconciled.revision + 1 }, reconciled.revision);
         if (!resourceBusy) tx.saveRecord({ kind: "execution-retries", id: taskId, runId: run.runId, taskId, value: retryCount }, retryRecord?.revision ?? 0);
         tx.enqueue({ runId: run.runId, taskId, kind: "schedule", key: taskId, dueAt: Date.now() + (resourceBusy ? 1000 : Math.min(60000, 2000 * 2 ** (retryCount - 1))), data: { retryCount } });
-      } else if (run.status === "active" && !this.#closed) { tx.saveRun({ ...run, status: "paused", revision: run.revision + 1, updatedAt: Date.now() }, run.revision); tx.event(run.runId, "run.blocked", { taskId }); }
+      } else if (run.status === "active" && !this.#closed) {
+        const reason = unresolved.length ? "unknown-effects" : error instanceof DurableBudgetExhaustedError ? "budget" : "execution-error";
+        tx.saveRun({ ...run, status: "paused", pauseReason: reason, revision: run.revision + 1, updatedAt: Date.now() }, run.revision);
+        tx.event(run.runId, "run.blocked", { taskId, reason });
+      }
       return true;
     });
   }

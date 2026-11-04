@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { serveDurableRuntime, runtimeRequest, runtimePaths } from "../../src/services/runtime/server";
 import { createRuntimeWorkerFactory } from "../../src/services/runtime/worker";
 import type { RuntimeConfiguration } from "../../src/services/runtime/engine";
+import { runRuntimeCommand } from "../../src/entrypoints/runtime";
+import { acquireWorkspace } from "../../src/services/runtime/workspace";
 
 const roots: string[] = []; const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); await Promise.all(roots.splice(0).map((r) => rm(r, { recursive: true, force: true }))); });
@@ -65,6 +67,37 @@ test("HTTP control command receipts survive duplicate pause, resume and cancella
   }
   expect((await terminal(f.configDir, runId)).run.status).toBe("cancelled");
 });
+
+test("explicit start/restart preserves paused work and resumes it only after the user's command", async () => {
+  const f = await fixture(); await service(f.configDir);
+  const oldPid = (await runtimeRequest(f.configDir, "/health") as { pid: number }).pid;
+  const release = await acquireWorkspace(f.workspace);
+  let runId: string;
+  try {
+    const submitted = await runtimeRequest(f.configDir, "/command", { action: "submit", commandId: "restart-run", objective: "Preserve my paused work", configuration: f.config }) as { run: { runId: string } };
+    runId = submitted.run.runId;
+    await runtimeRequest(f.configDir, "/command", { action: "pause", commandId: "pause-restart", runId });
+  } finally { await release(); }
+  cleanup.push(async () => {
+    try {
+      await runtimeRequest(f.configDir, "/command", { action: "stop", commandId: "stop-restarted-owner" });
+      const end = Date.now() + 5000;
+      while (Date.now() < end) { try { await runtimeRequest(f.configDir, "/health"); await Bun.sleep(20); } catch { break; } }
+    } catch { /* The test may have stopped it already. */ }
+  });
+  for (const action of ["start", "restart"]) {
+    let output = "", error = "";
+    expect(await runRuntimeCommand({ argv: ["runtime", action, "--config-dir", f.configDir], cwd: f.workspace, env: process.env,
+      stdout: { write: (text) => { output += text; } }, stderr: { write: (text) => { error += text; } } })).toBe(0);
+    expect(error).toBe(""); const health = JSON.parse(output);
+    expect(action === "start" ? health.pid === oldPid : health.pid !== oldPid).toBe(true);
+  }
+  expect(f.requests()).toBe(0);
+  const status = await runtimeRequest(f.configDir, `/status?runId=${runId!}`) as { run: { status: string } };
+  expect(status.run.status).toBe("paused");
+  await runtimeRequest(f.configDir, "/command", { action: "resume", commandId: "resume-restarted", runId: runId! });
+  expect((await terminal(f.configDir, runId!)).run.status).toBe("succeeded"); expect(f.requests()).toBe(1);
+}, 15000);
 
 const macTest = process.platform === "darwin" ? test : test.skip;
 macTest("production worker checks use native sandbox, strip model keys, and deny control state and sockets", async () => {

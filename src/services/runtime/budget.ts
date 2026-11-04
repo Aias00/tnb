@@ -1,9 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { ModelTransport, ModelRequest, ModelEvent } from "../../providers/types";
 import { UsageBudget, type BillingRoute } from "../usage/budget";
+
 import { calculateCostUsd } from "../usage/cost";
 import { RuntimeStore } from "./store";
 
+export class DurableBudgetExhaustedError extends Error {}
 type RequestCharge = { requestId: string; reserved: number; reported: number; state: "pending" | "complete" | "uncertain"; usageCount: number };
 export class DurableBudget {
   readonly #gate = new UsageBudget({ maxConcurrentRequests: 8 });
@@ -30,7 +32,7 @@ export class DurableBudget {
       if (context.maxCostUsd !== undefined && !context.route.pricing) throw new Error("Durable dollar budgets require configured model pricing");
       budget.store.command(randomUUID(), { kind: "budget.reserve", requestId }, Date.now(), (tx) => {
         const totals = budget.totals(context.runId);
-        if (context.maxCostUsd !== undefined && totals.reported + totals.reserved + reserve > context.maxCostUsd) throw new Error("Durable run budget exhausted (including uncertain reservations)");
+        if (context.maxCostUsd !== undefined && totals.reported + totals.reserved + reserve > context.maxCostUsd) throw new DurableBudgetExhaustedError("Durable run budget exhausted (including uncertain reservations)");
         tx.saveRecord<RequestCharge>({ kind: "model-request", id: requestId, runId: context.runId, taskId: context.taskId,
           value: { requestId, reserved: reserve, reported: 0, state: "pending", usageCount: 0 } }, 0);
         tx.event(context.runId, "budget.reserved", { requestId, reserve }, context.taskId);
@@ -57,7 +59,7 @@ export class DurableBudget {
           if (event.type === "response-end") complete = true;
           yield event;
           context.assertLive();
-          if (context.maxCostUsd !== undefined && budget.totals(context.runId).reported >= context.maxCostUsd) throw new Error("Durable run reported budget exhausted");
+          if (context.maxCostUsd !== undefined && budget.totals(context.runId).reported >= context.maxCostUsd) throw new DurableBudgetExhaustedError("Durable run reported budget exhausted");
         }
       } finally {
         budget.store.command(randomUUID(), { kind: "budget.finish", requestId, complete }, Date.now(), (tx) => {

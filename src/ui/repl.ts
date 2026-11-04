@@ -1,6 +1,6 @@
 import type { PermissionAskRequest, PermissionPromptDecision } from "../core/permissions";
 import type { AskUser, UserQuestion } from "../tools/interaction";
-import { durableUserQuestion, questionNoticeKey, type QuestionInbox, type QuestionNotice } from "../services/runtime/attention";
+import { durableUserQuestion, displayQuestionText, questionNoticeKey, type QuestionInbox, type QuestionNotice } from "../services/runtime/attention";
 
 export type ReplTurn = {
   prompt: string;
@@ -24,26 +24,35 @@ export async function runRepl(options: ReplOptions): Promise<number> {
   options.write("tnb interactive · /exit to quit\n");
   const inbox = options.durableQuestions, announced = new Set<string>();
   let awaitingInput = false, inputQuestion: QuestionNotice | undefined;
+  const displayedNotices = new Set<string>(); let connectionMessage = "";
+  const connected = () => !inbox?.connection || inbox.connection().state === "online";
   const show = (notice: QuestionNotice) => {
     const question = durableUserQuestion(notice);
     options.write(`\n${question.header}\n${question.question}\n`);
     question.options.forEach((option, index) => options.write(`  ${index + 1}. ${option.label}\n`));
   };
   const notify = () => {
+    const connection = inbox?.connection?.();
+    if (connection && ["offline", "stopped", "incompatible", "unauthorized"].includes(connection.state) && connection.message !== connectionMessage) {
+      connectionMessage = connection.message; options.write(`\n${connection.message}\n`);
+    } else if (connection?.state === "online" && connectionMessage) { options.write("\n长任务后台已连接。\n"); connectionMessage = ""; }
+    for (const notice of inbox?.notifications?.() ?? []) {
+      if (!displayedNotices.has(notice.noticeId)) { displayedNotices.add(notice.noticeId); options.write(`\n${displayQuestionText(notice.message)}\n`); }
+      if (connected()) void inbox?.acknowledge?.(notice).catch(() => undefined);
+    }
     const fresh = inbox?.current().filter((question) => !announced.has(questionNoticeKey(question))) ?? [];
     fresh.forEach((question) => announced.add(questionNoticeKey(question)));
-    if (!fresh.length) return;
-    if (awaitingInput && !inputQuestion && options.inputValue?.() === "") {
+    if (connected() && awaitingInput && !inputQuestion && options.inputValue?.() === "") {
       inputQuestion = inbox!.next();
       if (inputQuestion) { show(inputQuestion); options.write("直接输入选项编号或答案；/later 稍后处理："); }
-    } else {
+    } else if (fresh.length) {
       show(fresh[0]!); options.write(`有 ${inbox!.current().length} 个长任务问题待处理，当前输入和操作保留，结束后会询问。\n`);
     }
   };
   const unsubscribe = inbox?.subscribe(notify); notify();
   try {
     while (true) {
-      if (!inputQuestion) {
+      if (!inputQuestion && connected()) {
         inputQuestion = inbox?.next();
         if (inputQuestion) show(inputQuestion);
       }

@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runtimePaths, runtimeRequest } from "./server";
+import { lock } from "../../utils/lockfile";
 
 /** Start the same executable as a detached owner; all clients use one authenticated service. */
 export function assertConversationOwner(health: { capabilities?: { conversationHandoff?: boolean } }): void {
@@ -36,3 +37,14 @@ export async function ensureRuntime(configDir: string, env: Record<string, strin
   throw new Error(`Runtime did not start; inspect ${join(paths.root, "service.log")}`);
 }
 class RuntimeUnavailable extends Error {}
+
+/** Explicit user operation; ordinary notification subscribers never restart the owner. */
+export async function restartRuntime(configDir: string, env: Record<string, string | undefined>): Promise<void> {
+  let running = false;
+  try { await runtimeRequest(configDir, "/health"); running = true; } catch { /* Starting a stopped owner is also a restart. */ }
+  if (running) await runtimeRequest(configDir, "/command", { action: "stop", commandId: crypto.randomUUID() });
+  const paths = await runtimePaths(configDir);
+  const release = await lock(paths.root, { realpath: true, stale: 5000, update: 1000, retries: { retries: 100, factor: 1, minTimeout: 100, maxTimeout: 100 } });
+  await release();
+  await ensureRuntime(configDir, env);
+}

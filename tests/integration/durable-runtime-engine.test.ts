@@ -45,6 +45,18 @@ async function settled(runtime: DurableRuntime, runId: string) {
 }
 const report: ModelTransport = { async *stream() { yield { type: "text", index: 0, text: "Verified report" }; yield { type: "usage", usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 } }; yield { type: "response-end", reason: "end-turn" }; } };
 
+test("adding budget to a paused Run preserves its binding and lets the original task continue", async () => {
+  const f = await fixture(report);
+  const { run } = await f.runtime.submit({ commandId: "small-budget", objective: "Resume after budget increase", configuration: { ...f.config, maxCostUsd: 0.000000001 } });
+  expect((await settled(f.runtime, run.runId)).status).toBe("paused");
+  const binding = f.store.record("binding", f.store.tasks(run.runId)[0]!.taskId)!.value;
+  const paused = f.store.getRun(run.runId)!; expect(paused.pauseReason).toBe("budget");
+  f.runtime.commands.updateLimits({ commandId: "increase", runId: run.runId, expectedRevision: paused.revision, maxCostUsd: 2 });
+  expect(f.runtime.configuration(run.runId).maxCostUsd).toBe(2);
+  await f.runtime.resume(run.runId); expect((await settled(f.runtime, run.runId)).status).toBe("succeeded");
+  expect(f.store.record("binding", f.store.tasks(run.runId)[0]!.taskId)!.value).toBe(binding);
+});
+
 test("real Agent loop delivers and accepts a versioned report through durable scheduling", async () => {
   const f = await fixture(report); const { run, tasks } = await f.runtime.submit({ commandId: "submit", objective: "Inspect code", configuration: f.config });
   expect((await settled(f.runtime, run.runId)).status).toBe("succeeded");

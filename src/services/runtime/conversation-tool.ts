@@ -5,22 +5,24 @@ import type { DurableRun } from "./types";
 import { digestJson, text } from "./json";
 import { runtimeRequest } from "./server";
 import { ensureRuntime, assertConversationOwner } from "./client";
+import { parseDeadline, extensionMilliseconds } from "./limits";
 
-export const DURABLE_CONVERSATION_INSTRUCTIONS = "When the user explicitly asks to execute a long-running task durably or in the background, use durable_task submit. Include a self-contained objective and the relevant conversation decisions in context, a stable key, explicit write/Shell grants and replay-safe checks. It creates a separate persistent Run using the current model, with its own disclosed budget; do not use it as an ordinary subagent or to escape this invocation's budget. For progress, results or control, use durable_task with the existing runId. Read questions to show pending decisions; use answer with the question ID and version only for the user's actual decision, never invent an answer. An answer cannot expand permissions or resume a paused Run. Submission is acceptance, not completion. While the durable task owns this workspace, use its controls and wait for it to release the workspace before local file operations. Never infer completion from submission or promise parallel code writes.";
+export const DURABLE_CONVERSATION_INSTRUCTIONS = "When the user explicitly asks to execute a long-running task durably or in the background, use durable_task submit. Include a self-contained objective and the relevant conversation decisions in context, a stable key, explicit write/Shell grants and replay-safe checks. It creates a separate persistent Run using the current model, with its own disclosed budget; do not use it as an ordinary subagent or to escape this invocation's budget. For progress, results or control, use durable_task with the existing runId. Read questions to show pending decisions; use answer with the question ID and version only for the user's actual decision, never invent an answer. An answer cannot expand permissions or resume a paused Run. Use limits only for the user's explicit deadline or total-budget decision, after a fully drained pause and reading the current Run revision. Never increase limits autonomously; an update preserves all usage/reservations and stays paused until explicitly resumed. Submission is acceptance, not completion. While the durable task owns this workspace, use its controls and wait for it to release the workspace before local file operations. Never infer completion from submission or promise parallel code writes.";
 
 type Request = {
-  action: "submit" | "list" | "status" | "result" | "events" | "questions" | "answer" | "pause" | "resume" | "cancel";
+  action: "submit" | "list" | "status" | "result" | "events" | "questions" | "answer" | "limits" | "pause" | "resume" | "cancel";
   key?: string; runId?: string; objective?: string; context?: string;
   mode?: "single" | "auto" | "multi"; allowWrite?: boolean; allowShell?: boolean;
   checks?: string[]; maxCostUsd?: number; maxTurns?: number; after?: number;
   waitId?: string; expectedVersion?: number; answer?: string;
+  deadline?: string; extendHours?: number; expectedRevision?: number;
 };
 export type ConversationRuntimeContext = {
   configDir: string; env: Record<string, string | undefined>; sessionId: string;
   workspace(): string; roots(): string[]; provider: string; model: string;
 };
 const reads = new Set(["list", "status", "result", "events", "questions"]);
-const actions = [...reads, "submit", "pause", "resume", "cancel", "answer"];
+const actions = [...reads, "submit", "pause", "resume", "cancel", "answer", "limits"];
 
 /** User-facing main-conversation capability. It is deliberately excluded from child/Skill/Hook tools. */
 export function createDurableTaskTool(context: ConversationRuntimeContext): AgentTool {
@@ -37,11 +39,14 @@ export function createDurableTaskTool(context: ConversationRuntimeContext): Agen
       maxTurns: { type: "integer", minimum: 1, maximum: 2000 }, after: { type: "integer", minimum: 0 },
       waitId: { type: "string", description: "Question ID from questions." }, expectedVersion: { type: "integer", minimum: 1 },
       answer: { type: "string", maxLength: 8000, description: "The user's actual answer; never infer a decision." },
+      deadline: { type: "string", description: "An explicitly authorized future ISO deadline with timezone." },
+      extendHours: { type: "number", exclusiveMinimum: 0, description: "Explicitly authorized extension, only for a paused Run." },
+      expectedRevision: { type: "integer", minimum: 1, description: "Current Run revision from status, required for limits." },
     } },
     validate(value) {
       if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid durable task request");
       const input = value as Request;
-      if (!actions.includes(input.action) || Object.keys(input).some((key) => !["action", "key", "runId", "objective", "context", "mode", "allowWrite", "allowShell", "checks", "maxCostUsd", "maxTurns", "after", "waitId", "expectedVersion", "answer"].includes(key))) throw new Error("Unsupported durable task action or capability");
+      if (!actions.includes(input.action) || Object.keys(input).some((key) => !["action", "key", "runId", "objective", "context", "mode", "allowWrite", "allowShell", "checks", "maxCostUsd", "maxTurns", "after", "waitId", "expectedVersion", "answer", "deadline", "extendHours", "expectedRevision"].includes(key))) throw new Error("Unsupported durable task action or capability");
       if (input.action === "submit") {
         text(input.key!, "handoff key", 128); text(input.objective!, "durable objective");
         if (input.context !== undefined) text(input.context, "conversation context", 16384);
@@ -53,14 +58,25 @@ export function createDurableTaskTool(context: ConversationRuntimeContext): Agen
         if (input.allowShell && !input.allowWrite) throw new Error("Shell requires explicit write authority");
         if (input.maxCostUsd !== undefined && (!Number.isFinite(input.maxCostUsd) || input.maxCostUsd <= 0)) throw new Error("Invalid durable budget");
         if (input.maxTurns !== undefined && (!Number.isSafeInteger(input.maxTurns) || input.maxTurns < 1 || input.maxTurns > 2000)) throw new Error("Invalid turn limit");
+        if (input.deadline !== undefined) parseDeadline(input.deadline);
+        if (input.extendHours !== undefined || input.expectedRevision !== undefined) throw new Error("Submit cannot extend an existing Run");
         if ([input.runId, input.after, input.waitId, input.expectedVersion, input.answer].some((value) => value !== undefined)) throw new Error("Submit cannot target an existing Run or question");
       } else {
         if (input.runId !== undefined) text(input.runId, "Run ID", 128);
-        const controlFields = input.action === "answer" ? ["action", "runId", "waitId", "expectedVersion", "answer"] : ["action", "runId", "after"];
+        const controlFields = input.action === "answer" ? ["action", "runId", "waitId", "expectedVersion", "answer"]
+          : input.action === "limits" ? ["action", "runId", "deadline", "extendHours", "maxCostUsd", "expectedRevision"] : ["action", "runId", "after"];
         if (Object.keys(input).some((key) => !controlFields.includes(key))) throw new Error("Control cannot expand an existing Run's authority");
         if (input.action === "answer") {
           text(input.waitId!, "question ID", 128); text(input.answer!, "question answer", 8000);
           if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion! < 1) throw new Error("Answer requires the current question version");
+        }
+        if (input.action === "limits") {
+          if (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision! < 1) throw new Error("Limits require the current Run revision");
+          if (input.deadline === undefined && input.extendHours === undefined && input.maxCostUsd === undefined) throw new Error("No limit update supplied");
+          if (input.deadline !== undefined && input.extendHours !== undefined) throw new Error("Choose deadline or extension");
+          if (input.deadline !== undefined) parseDeadline(input.deadline);
+          if (input.extendHours !== undefined) extensionMilliseconds(input.extendHours);
+          if (input.maxCostUsd !== undefined && (!Number.isFinite(input.maxCostUsd) || input.maxCostUsd <= 0)) throw new Error("Invalid budget ceiling");
         }
         if (input.after !== undefined && (!Number.isSafeInteger(input.after) || input.after < 0 || input.action !== "events")) throw new Error("Invalid event cursor");
       }
@@ -78,6 +94,7 @@ export function createDurableTaskTool(context: ConversationRuntimeContext): Agen
         await ensureRuntime(context.configDir, context.env, true); signal.throwIfAborted();
         const result = await runtimeRequest(context.configDir, "/command", { action: "submit",
           commandId: `chat:${digestJson({ sessionId: context.sessionId, key: input.key })}`, objective: input.objective, mode: input.mode ?? "auto",
+          deadline: input.deadline === undefined ? undefined : parseDeadline(input.deadline),
           configuration: { workspace, allowedWorkspaces, provider: context.provider, model: context.model,
             allowWrite: input.allowWrite ?? false, allowShell: input.allowShell ?? false, checks: input.checks ?? [], maxCostUsd: input.maxCostUsd,
             maxTurns: input.maxTurns ?? 200, maxRetries: 3, compactThreshold: 24000,
@@ -96,6 +113,10 @@ export function createDurableTaskTool(context: ConversationRuntimeContext): Agen
       if (input.action === "answer") return JSON.stringify(await runtimeRequest(context.configDir, "/command", { action: "answer", runId,
         waitId: input.waitId, expectedVersion: input.expectedVersion, answer: input.answer,
         commandId: `chat:${digestJson({ sessionId: context.sessionId, runId, input })}` }));
+      if (input.action === "limits") return JSON.stringify(await runtimeRequest(context.configDir, "/command", { action: "limits", runId,
+        deadline: input.deadline === undefined ? undefined : parseDeadline(input.deadline),
+        extendMs: input.extendHours === undefined ? undefined : extensionMilliseconds(input.extendHours), maxCostUsd: input.maxCostUsd,
+        expectedRevision: input.expectedRevision, commandId: `chat:${digestJson({ sessionId: context.sessionId, runId, input })}` }));
       return JSON.stringify(await runtimeRequest(context.configDir, "/command", { action: input.action, runId,
         commandId: `chat:${digestJson({ sessionId: context.sessionId, action: input.action, runId, nonce: crypto.randomUUID() })}` }));
     },

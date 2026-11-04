@@ -25,7 +25,7 @@ import { useCopyOnSelect } from "./use-copy-on-select";
 import { mapTranscriptInput } from "./transcript/input";
 import { moveTranscriptMatch, searchTranscript, transcriptEntryText, type TranscriptSearchState } from "./transcript/search";
 import type { AskUser } from "../tools/interaction";
-import { durableUserQuestion, questionNoticeKey, type QuestionInbox } from "../services/runtime/attention";
+import { durableUserQuestion, displayQuestionText, questionNoticeKey, type QuestionInbox, type ConnectionStatus } from "../services/runtime/attention";
 import type { TaskManager } from "../services/tasks/manager";
 import type { ScheduleManager } from "../services/scheduler/manager";
 import type { ShellRuntimeSnapshot, ShellSessionManager } from "../services/shell/manager";
@@ -142,6 +142,11 @@ export function TuiApp(options: TuiAppOptions) {
   );
   const durableQuestions = useSyncExternalStore(options.durableQuestions?.subscribe ?? emptySubscribe,
     options.durableQuestions?.current ?? emptyTasks, options.durableQuestions?.current ?? emptyTasks);
+  const runNotifications = useSyncExternalStore(options.durableQuestions?.subscribe ?? emptySubscribe,
+    options.durableQuestions?.notifications ?? emptyTasks, options.durableQuestions?.notifications ?? emptyTasks);
+  const runtimeConnection = useSyncExternalStore(options.durableQuestions?.subscribe ?? emptySubscribe,
+    options.durableQuestions?.connection ?? onlineConnection, options.durableQuestions?.connection ?? onlineConnection);
+  const displayedRunNotifications = useRef(new Set<string>());
   const activeDurableQuestion = useRef<{ key: string; controller: AbortController; answering: boolean } | undefined>(undefined);
   const questionUiMounted = useRef(true);
   const announcedDurableQuestions = useRef(new Set<string>());
@@ -207,6 +212,21 @@ export function TuiApp(options: TuiAppOptions) {
   const imageToolPaths = useRef(new Map<string, string>());
 
   useEffect(() => {
+    for (const notice of runNotifications) {
+      if (!displayedRunNotifications.current.has(notice.noticeId)) {
+        displayedRunNotifications.current.add(notice.noticeId); dispatch({ type: "notice", message: displayQuestionText(notice.message), noticeId: notice.noticeId });
+      }
+    }
+  }, [runNotifications, runtimeConnection, options.durableQuestions]);
+  useEffect(() => {
+    if (runtimeConnection.state !== "online") return;
+    for (const notice of runNotifications) if (state.transcript.some((entry) => entry.id === `runtime-notice:${notice.noticeId}`)) {
+      // Acknowledge after the notice is committed to the view, never when merely received.
+      void options.durableQuestions?.acknowledge?.(notice).catch(() => undefined);
+    }
+  }, [runNotifications, runtimeConnection, options.durableQuestions, state.transcript]);
+
+  useEffect(() => {
     const fresh = durableQuestions.filter((notice) => !announcedDurableQuestions.current.has(questionNoticeKey(notice)));
     if (fresh.length) {
       fresh.forEach((notice) => announcedDurableQuestions.current.add(questionNoticeKey(notice)));
@@ -214,10 +234,10 @@ export function TuiApp(options: TuiAppOptions) {
     }
     const active = activeDurableQuestion.current;
     if (active) {
-      if (!active.answering && !durableQuestions.some((notice) => questionNoticeKey(notice) === active.key)) active.controller.abort();
+      if (!active.answering && (runtimeConnection.state !== "online" || !durableQuestions.some((notice) => questionNoticeKey(notice) === active.key))) active.controller.abort();
       return;
     }
-    if (!options.durableQuestions || state.busy || permission || question || questionController.current() || management
+    if (!options.durableQuestions || runtimeConnection.state !== "online" || state.busy || permission || question || questionController.current() || management
       || shellPanel || historySearch || transcriptSearch || editorActive.current || buffer.value.length) return;
     const notice = options.durableQuestions.next(); if (!notice) return;
     const pending = { key: questionNoticeKey(notice), controller: new AbortController(), answering: false };
@@ -238,7 +258,7 @@ export function TuiApp(options: TuiAppOptions) {
       if (questionUiMounted.current) setDurablePromptEpoch((value) => value + 1);
     });
   }, [durableQuestions, options.durableQuestions, state.busy, permission, question, questionController, management,
-    shellPanel, historySearch, transcriptSearch, buffer.value, durablePromptEpoch]);
+    shellPanel, historySearch, transcriptSearch, buffer.value, durablePromptEpoch, runtimeConnection]);
 
   useEffect(() => {
     questionUiMounted.current = true;
@@ -966,6 +986,7 @@ export function TuiApp(options: TuiAppOptions) {
       {...(completionNotice ? { completionNotice } : {})}
       tasks={tasks}
       durableQuestionCount={durableQuestions.length}
+      {...(["offline", "stopped", "incompatible", "unauthorized"].includes(runtimeConnection.state) ? { runtimeConnectionMessage: runtimeConnection.message } : {})}
       shellRuntimes={shellRuntimes}
       shellPanel={shellPanel}
       shellSelection={shellSelection}
@@ -995,6 +1016,8 @@ const EMPTY_TASKS: readonly never[] = [];
 const emptyTasks = () => EMPTY_TASKS;
 const emptySubscribe = () => () => undefined;
 const emptyActivity = () => undefined;
+const ONLINE_CONNECTION: ConnectionStatus = { state: "online", message: "" };
+const onlineConnection = () => ONLINE_CONNECTION;
 
 function resolveExternalCommands(
   commands: TuiAppOptions["externalCommands"],
