@@ -41,6 +41,7 @@ export type TuiState = {
 };
 
 export type TuiAction =
+  | { type: "notice"; message: string }
   | { type: "submit"; text: string }
   | { type: "command-start"; text: string }
   | {
@@ -102,6 +103,9 @@ function appendTranscript(
 }
 
 export function reduceTuiState(state: TuiState, action: TuiAction): TuiState {
+  if (action.type === "notice") return { ...state,
+    ...appendTranscript(state, { kind: "system", text: action.message, tone: "info" }),
+    messages: [...state.messages, { role: "system", text: action.message, tone: "info" }] };
   if (action.type === "permission-mode-change") {
     return { ...state, permissionMode: action.mode };
   }

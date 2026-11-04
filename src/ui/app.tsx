@@ -25,6 +25,7 @@ import { useCopyOnSelect } from "./use-copy-on-select";
 import { mapTranscriptInput } from "./transcript/input";
 import { moveTranscriptMatch, searchTranscript, transcriptEntryText, type TranscriptSearchState } from "./transcript/search";
 import type { AskUser } from "../tools/interaction";
+import { durableUserQuestion, questionNoticeKey, type QuestionInbox } from "../services/runtime/attention";
 import type { TaskManager } from "../services/tasks/manager";
 import type { ScheduleManager } from "../services/scheduler/manager";
 import type { ShellRuntimeSnapshot, ShellSessionManager } from "../services/shell/manager";
@@ -59,6 +60,7 @@ export type TuiAppOptions = {
   permissionMode: PermissionMode;
   permissionController?: PermissionController;
   questionController?: QuestionController;
+  durableQuestions?: QuestionInbox;
   mcpActivityController?: McpActivityController;
   taskManager?: TaskManager;
   scheduleManager?: ScheduleManager;
@@ -138,6 +140,12 @@ export function TuiApp(options: TuiAppOptions) {
     questionController.current,
     questionController.current,
   );
+  const durableQuestions = useSyncExternalStore(options.durableQuestions?.subscribe ?? emptySubscribe,
+    options.durableQuestions?.current ?? emptyTasks, options.durableQuestions?.current ?? emptyTasks);
+  const activeDurableQuestion = useRef<{ key: string; controller: AbortController; answering: boolean } | undefined>(undefined);
+  const questionUiMounted = useRef(true);
+  const announcedDurableQuestions = useRef(new Set<string>());
+  const [durablePromptEpoch, setDurablePromptEpoch] = useState(0);
   const mcpActivity = useSyncExternalStore(
     options.mcpActivityController?.subscribe ?? emptySubscribe,
     options.mcpActivityController?.current ?? emptyActivity,
@@ -150,6 +158,7 @@ export function TuiApp(options: TuiAppOptions) {
   );
   const [permissionSelection, setPermissionSelection] = useState<PermissionPromptDecision>("allow");
   const [questionSelection, setQuestionSelection] = useState(0);
+  const questionSelectionRef = useRef(0);
   const [questionSelected, setQuestionSelected] = useState<Set<number>>(() => new Set());
   const [questionOther, setQuestionOther] = useState<InputBuffer | undefined>();
   const [management, setManagement] = useState<ManagementView | undefined>(options.initialManagement);
@@ -198,6 +207,45 @@ export function TuiApp(options: TuiAppOptions) {
   const imageToolPaths = useRef(new Map<string, string>());
 
   useEffect(() => {
+    const fresh = durableQuestions.filter((notice) => !announcedDurableQuestions.current.has(questionNoticeKey(notice)));
+    if (fresh.length) {
+      fresh.forEach((notice) => announcedDurableQuestions.current.add(questionNoticeKey(notice)));
+      dispatch({ type: "notice", message: `${durableQuestions.length} 个长任务问题需要你决定，当前输入和操作会保留。` });
+    }
+    const active = activeDurableQuestion.current;
+    if (active) {
+      if (!active.answering && !durableQuestions.some((notice) => questionNoticeKey(notice) === active.key)) active.controller.abort();
+      return;
+    }
+    if (!options.durableQuestions || state.busy || permission || question || questionController.current() || management
+      || shellPanel || historySearch || transcriptSearch || editorActive.current || buffer.value.length) return;
+    const notice = options.durableQuestions.next(); if (!notice) return;
+    const pending = { key: questionNoticeKey(notice), controller: new AbortController(), answering: false };
+    activeDurableQuestion.current = pending;
+    void questionController.request(durableUserQuestion(notice), pending.controller.signal).then(async (answer) => {
+      if (pending.controller.signal.aborted) return;
+      pending.answering = true;
+      const result = await options.durableQuestions!.answer(notice, answer);
+      if (!pending.controller.signal.aborted) dispatch({ type: "notice", message: result.paused ? "回答已保存；任务保持暂停，恢复后继续。" : "回答已保存，长任务会继续执行。" });
+    }).catch((error: unknown) => {
+      if (pending.controller.signal.aborted) return;
+      options.durableQuestions!.dismiss(notice);
+      dispatch({ type: "notice", message: error instanceof Error && error.message === "User declined to answer questions"
+        ? "问题仍然保留，稍后可用 /task questions 处理；重新打开对话也会再次提醒。"
+        : `回答未提交：${error instanceof Error ? error.message : String(error)}。请核对当前问题后重试。` });
+    }).finally(() => {
+      if (activeDurableQuestion.current === pending) activeDurableQuestion.current = undefined;
+      if (questionUiMounted.current) setDurablePromptEpoch((value) => value + 1);
+    });
+  }, [durableQuestions, options.durableQuestions, state.busy, permission, question, questionController, management,
+    shellPanel, historySearch, transcriptSearch, buffer.value, durablePromptEpoch]);
+
+  useEffect(() => {
+    questionUiMounted.current = true;
+    return () => { questionUiMounted.current = false; activeDurableQuestion.current?.controller.abort(); };
+  }, []);
+
+  useEffect(() => {
     const updateSize = () => setTerminalSize({
       columns: stdout.columns || 80,
       rows: stdout.rows || 24,
@@ -217,9 +265,10 @@ export function TuiApp(options: TuiAppOptions) {
   }, [permissionController, questionController]);
 
   useEffect(() => {
+    questionSelectionRef.current = 0;
     setQuestionSelection(0);
     setQuestionSelected(new Set());
-    setQuestionOther(undefined);
+    setQuestionOther(question?.options.length === 0 ? createInputBuffer() : undefined);
   }, [question]);
 
   useEffect(() => {
@@ -452,30 +501,34 @@ export function TuiApp(options: TuiAppOptions) {
       }
       const count = question.options.length + 1;
       if (key.upArrow || key.leftArrow) {
-        setQuestionSelection((value) => (value + count - 1) % count);
+        questionSelectionRef.current = (questionSelectionRef.current + count - 1) % count;
+        setQuestionSelection(questionSelectionRef.current);
       } else if (key.downArrow || key.rightArrow) {
-        setQuestionSelection((value) => (value + 1) % count);
+        questionSelectionRef.current = (questionSelectionRef.current + 1) % count;
+        setQuestionSelection(questionSelectionRef.current);
       } else if (key.escape || (key.ctrl && input === "c")) {
         questionController.reject(new Error("User declined to answer questions"));
       } else if (question.multiSelect && input === " ") {
-        if (questionSelection === question.options.length) {
+        const selectedIndex = questionSelectionRef.current;
+        if (selectedIndex === question.options.length) {
           setQuestionOther(createInputBuffer());
         } else {
           setQuestionSelected((current) => {
             const next = new Set(current);
-            if (next.has(questionSelection)) next.delete(questionSelection);
-            else next.add(questionSelection);
+            if (next.has(selectedIndex)) next.delete(selectedIndex);
+            else next.add(selectedIndex);
             return next;
           });
         }
       } else if (key.return) {
-        if (questionSelection === question.options.length) {
+        const selectedIndex = questionSelectionRef.current;
+        if (selectedIndex === question.options.length) {
           setQuestionOther(createInputBuffer());
         } else if (question.multiSelect) {
-          const indexes = questionSelected.size ? [...questionSelected] : [questionSelection];
+          const indexes = questionSelected.size ? [...questionSelected] : [selectedIndex];
           questionController.resolve(indexes.sort().map((index) => question.options[index]!.label).join(", "));
         } else {
-          questionController.resolve(question.options[questionSelection]!.label);
+          questionController.resolve(question.options[selectedIndex]!.label);
         }
       }
       return;
@@ -912,6 +965,7 @@ export function TuiApp(options: TuiAppOptions) {
       inputCompletionIndex={inputCompletions?.index ?? 0}
       {...(completionNotice ? { completionNotice } : {})}
       tasks={tasks}
+      durableQuestionCount={durableQuestions.length}
       shellRuntimes={shellRuntimes}
       shellPanel={shellPanel}
       shellSelection={shellSelection}

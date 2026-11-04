@@ -29,6 +29,9 @@ of implementing a second execution path:
   `/task questions` lists pending decisions; `/task answer --question ID
   --answer "text" --version N` records the user's answer. Waiting releases execution
   resources; answering a paused Run does not resume it or change its permissions.
+  Open TUI/REPL sessions receive pending questions automatically: choose an option
+  or type an answer directly. Existing drafts and dialogs are preserved; reopened
+  sessions restore unanswered questions. Esc (TUI) or `/later` (REPL) defers locally.
   This entry works in both the TUI and terminal REPL;
 - `/about` reports the CLI/runtime/model/workspace identity;
 - `/reload` (alias `/refresh`) reloads Skills, Agents, commands, Plugins, and

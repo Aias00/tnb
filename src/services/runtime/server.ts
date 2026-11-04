@@ -6,6 +6,7 @@ import { DurableRuntime, type RuntimeConfiguration } from "./engine";
 import { RuntimeStore } from "./store";
 import { createRuntimeWorkerFactory } from "./worker";
 import { lock } from "../../utils/lockfile";
+import { questionAttentionResponse } from "./attention-stream";
 
 export async function runtimePaths(configDir: string): Promise<{ root: string; socket: string; token: string }> {
   const root = resolve(configDir, "runtime"); await mkdir(root, { recursive: true, mode: 0o700 });
@@ -19,7 +20,7 @@ export async function runtimePaths(configDir: string): Promise<{ root: string; s
 type ServerOptions = { configDir: string; env: Record<string, string | undefined>; signal: AbortSignal; runtime?: DurableRuntime; ready?(socket: string): void };
 export const RUNTIME_CAPABILITIES = Object.freeze({ protocol: 2, defaultMode: "auto", maxDelegationDepth: 2, maxParallelBranches: 4,
   readOnlyDelegation: true, parallelWrites: false, skills: false, mcp: false, remoteFederation: false, offlineBackup: true, conversationHandoff: true,
-  durableWaits: true, durableDelegation: true, deadlineScheduling: true });
+  durableWaits: true, durableDelegation: true, deadlineScheduling: true, questionNotifications: true });
 export async function serveDurableRuntime(options: ServerOptions): Promise<void> {
   const paths = await runtimePaths(options.configDir);
   const release = await lock(paths.root, { realpath: true, stale: 5000, update: 1000, retries: 0 });
@@ -55,6 +56,10 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
           const url = new URL(request.url);
           if (request.method === "GET") {
             if (url.pathname === "/health") return Response.json({ ready: !runtime.lastError, pid: process.pid, error: runtime.lastError, capabilities: RUNTIME_CAPABILITIES });
+            if (url.pathname === "/attention") {
+              const workspace = url.searchParams.get("workspace"); if (!workspace) throw new Error("Notification workspace is required");
+              return questionAttentionResponse(runtime, workspace, request.signal);
+            }
             if (url.pathname === "/runs") {
               const workspace = url.searchParams.get("workspace"); const sessionId = url.searchParams.get("sessionId");
               return Response.json(store.runs().filter((run) => {

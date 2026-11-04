@@ -203,6 +203,7 @@ import { setShutdownResumeHint, setupGracefulShutdown } from "../utils/graceful-
 import { McpActivityController } from "../ui/mcp-activity-controller";
 import { PermissionController } from "../ui/permission-controller";
 import { QuestionController } from "../ui/question-controller";
+import { DurableQuestionInbox } from "../services/runtime/attention";
 import { parseSlashCommand, type ManagementView, type SlashCommandRequest, type SlashCommandResult } from "../ui/slash-commands";
 import packageJson from "../../package.json";
 import { createDurableTaskTool, DURABLE_CONVERSATION_INSTRUCTIONS } from "../services/runtime/conversation-tool";
@@ -2261,6 +2262,7 @@ export async function runCli(options: CliOptions): Promise<number> {
 
 export type InteractiveCliOptions = Omit<CliOptions, "permissionPrompt" | "interactive"> & {
   question(prompt: string): Promise<string>;
+  inputValue?(): string;
 };
 
 export async function runInteractiveCli(options: InteractiveCliOptions): Promise<number> {
@@ -2375,6 +2377,7 @@ export async function runInteractiveCli(options: InteractiveCliOptions): Promise
   });
   const workspaceState = new WorkspaceState(options.cwd);
   applyAdditionalWorkspaceRoots(workspaceState, parsed.additionalDirectories);
+  const durableQuestions = new DurableQuestionInbox({ configDir, workspace: workspaceState.current });
   const sharedPluginToolRuntime = new PluginToolRuntimeManager(options.env);
   let interactiveMcp: McpConnections | undefined;
   try {
@@ -2417,7 +2420,10 @@ export async function runInteractiveCli(options: InteractiveCliOptions): Promise
       },
     });
     const mcp = interactiveMcp;
+    durableQuestions.start();
     return await runRepl({
+      durableQuestions,
+      ...(options.inputValue ? { inputValue: options.inputValue } : {}),
       question: options.question,
       write: (text) => void options.stdout.write(text),
       sessionIdFactory: () => sessionId,
@@ -2468,6 +2474,7 @@ export async function runInteractiveCli(options: InteractiveCliOptions): Promise
       },
     });
   } finally {
+    await durableQuestions.close();
     await interactiveHooks.end("prompt_input_exit");
     await interactiveMcp?.close();
     await sharedPluginToolRuntime.close();
@@ -2493,6 +2500,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
   let activeHooks: HookRunner | undefined;
   let scheduleManager: ScheduleManager | undefined;
   let extensionRefreshTimer: ReturnType<typeof setInterval> | undefined;
+  let durableQuestions: DurableQuestionInbox | undefined;
   const sharedPluginToolRuntime = new PluginToolRuntimeManager(options.env);
   let cleanupPromise: Promise<void> | undefined;
   let clearResumeHint: () => void = () => undefined;
@@ -2500,6 +2508,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
     if (extensionRefreshTimer) clearInterval(extensionRefreshTimer);
     extensionRefreshTimer = undefined;
     await Promise.allSettled([
+      durableQuestions?.close(),
       activeHooks?.end("prompt_input_exit"),
       interactiveMcp?.close(),
       interactiveTaskManager?.shutdown(),
@@ -2694,6 +2703,8 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
     let activeVimMode = settings.general?.vimMode === true;
     let activeTheme = settings.ui?.theme ?? "magenta";
     const questionController = new QuestionController();
+    durableQuestions = new DurableQuestionInbox({ configDir, workspace: () => activeWorkspaceState.current() });
+    durableQuestions.start();
     const mcpActivityController = new McpActivityController();
     const samplingPermission = createPermissionChecker({
       mode: activePermissionMode,
@@ -2788,6 +2799,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
       ...(initialManagement ? { initialManagement } : {}),
       permissionController,
       questionController,
+      durableQuestions,
       mcpActivityController,
       taskManager,
       shellManager: activeShellManager,
@@ -6127,6 +6139,7 @@ if (import.meta.main) {
           stdout: process.stdout,
           stderr: process.stderr,
           question: (prompt) => readline.question(prompt),
+          inputValue: () => readline.line,
         });
       } finally {
         readline.close();

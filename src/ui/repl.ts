@@ -1,5 +1,6 @@
 import type { PermissionAskRequest, PermissionPromptDecision } from "../core/permissions";
 import type { AskUser, UserQuestion } from "../tools/interaction";
+import { durableUserQuestion, questionNoticeKey, type QuestionInbox, type QuestionNotice } from "../services/runtime/attention";
 
 export type ReplTurn = {
   prompt: string;
@@ -13,20 +14,68 @@ export type ReplOptions = {
   runTurn(turn: ReplTurn): Promise<number>;
   handleCommand?(input: string): Promise<boolean>;
   sessionIdFactory(): string;
+  durableQuestions?: QuestionInbox;
+  inputValue?(): string;
 };
 
 export async function runRepl(options: ReplOptions): Promise<number> {
   const sessionId = options.sessionIdFactory();
   let hasRun = false;
   options.write("tnb interactive · /exit to quit\n");
-  while (true) {
-    const input = (await options.question("› ")).trim();
-    if (!input) continue;
-    if (input === "/exit" || input === "/quit") return 0;
-    if (await options.handleCommand?.(input)) continue;
-    const exitCode = await options.runTurn({ prompt: input, sessionId, resume: hasRun });
-    if (exitCode === 0) hasRun = true;
-  }
+  const inbox = options.durableQuestions, announced = new Set<string>();
+  let awaitingInput = false, inputQuestion: QuestionNotice | undefined;
+  const show = (notice: QuestionNotice) => {
+    const question = durableUserQuestion(notice);
+    options.write(`\n${question.header}\n${question.question}\n`);
+    question.options.forEach((option, index) => options.write(`  ${index + 1}. ${option.label}\n`));
+  };
+  const notify = () => {
+    const fresh = inbox?.current().filter((question) => !announced.has(questionNoticeKey(question))) ?? [];
+    fresh.forEach((question) => announced.add(questionNoticeKey(question)));
+    if (!fresh.length) return;
+    if (awaitingInput && !inputQuestion && options.inputValue?.() === "") {
+      inputQuestion = inbox!.next();
+      if (inputQuestion) { show(inputQuestion); options.write("直接输入选项编号或答案；/later 稍后处理："); }
+    } else {
+      show(fresh[0]!); options.write(`有 ${inbox!.current().length} 个长任务问题待处理，当前输入和操作保留，结束后会询问。\n`);
+    }
+  };
+  const unsubscribe = inbox?.subscribe(notify); notify();
+  try {
+    while (true) {
+      if (!inputQuestion) {
+        inputQuestion = inbox?.next();
+        if (inputQuestion) show(inputQuestion);
+      }
+      awaitingInput = true;
+      let input: string;
+      try { input = (await options.question(inputQuestion ? "输入选项编号或答案（/later 稍后处理）：" : "› ")).trim(); }
+      finally { awaitingInput = false; }
+      if (!input) continue;
+      if (input === "/exit" || input === "/quit") return 0;
+      const asked = inputQuestion; inputQuestion = undefined;
+      if (asked) {
+        if (input === "/later") { inbox!.dismiss(asked); options.write("问题仍然保留，稍后可用 /task questions 处理。\n"); continue; }
+        if (input.startsWith("/") && await options.handleCommand?.(input)) continue;
+        if (!inbox!.current().some((question) => questionNoticeKey(question) === questionNoticeKey(asked))) {
+          options.write("这个问题已处理或已失效，刚才的输入没有提交；请重新输入。\n"); continue;
+        }
+        const question = durableUserQuestion(asked), index = Number(input);
+        const answer = Number.isInteger(index) && index >= 1 && index <= question.options.length ? question.options[index - 1]!.label : input;
+        try {
+          const result = await inbox!.answer(asked, answer);
+          options.write(result.paused ? "回答已保存；任务保持暂停，恢复后继续。\n" : "回答已保存，长任务会继续执行。\n");
+        } catch (error) {
+          inbox!.dismiss(asked);
+          options.write(`回答未提交：${error instanceof Error ? error.message : String(error)}。问题保留，可用 /task questions 核对并重试。\n`);
+        }
+        continue;
+      }
+      if (await options.handleCommand?.(input)) continue;
+      const exitCode = await options.runTurn({ prompt: input, sessionId, resume: hasRun });
+      if (exitCode === 0) hasRun = true;
+    }
+  } finally { unsubscribe?.(); }
 }
 
 export function createTerminalPermissionPrompt(options: {
