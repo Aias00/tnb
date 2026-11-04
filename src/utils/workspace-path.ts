@@ -26,7 +26,9 @@ export async function assertToolPathInsideWorkspace(
   path: string,
   operation: "read" | "write",
 ): Promise<void> {
-  const root = resolveWorkspaceRoot(workspaceRoot);
+  // Bun/Windows sync realpath may retain an 8.3 alias while async realpath
+  // expands it. Use the same canonicalization for both sides of this guard.
+  const root = await realpath(resolveWorkspaceRoot(workspaceRoot));
   const candidate = resolve(root, path);
   assertInsideWorkspace(root, candidate, operation);
 
@@ -65,7 +67,7 @@ export async function assertToolPathInsideAllowedRoots(
   additionalRoots: readonly string[],
 ): Promise<void> {
   const candidate = await canonicalCandidate(resolve(workspaceRoot, path), operation);
-  const roots = [workspaceRoot, ...additionalRoots].map(resolveWorkspaceRoot);
+  const roots = await Promise.all([workspaceRoot, ...additionalRoots].map(root => realpath(resolveWorkspaceRoot(root))));
   const matchingRoot = roots.find((root) => isInside(root, candidate));
   if (!matchingRoot) throw new Error(`Cannot ${operation} outside the workspace or approved roots: ${candidate}`);
   await assertToolPathInsideWorkspace(matchingRoot, candidate, operation);
