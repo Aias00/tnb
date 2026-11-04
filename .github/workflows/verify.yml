@@ -38,8 +38,11 @@ jobs:
         with:
           bun-version: 1.3.14
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y bubblewrap curl
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap curl ripgrep util-linux
       - run: bun install --frozen-lockfile --ignore-scripts
       - run: bun run typecheck
-      - run: bun test tests/unit/sandbox-runtime.test.ts tests/unit/usage-budget.test.ts tests/unit/execution-binding.test.ts tests/integration/sandbox-native.test.ts
+      - if: runner.os == 'Linux'
+        run: bun test
+      - if: runner.os == 'Windows'
+        run: bun test tests/unit/sandbox-runtime.test.ts tests/unit/usage-budget.test.ts tests/unit/execution-binding.test.ts tests/integration/sandbox-native.test.ts
       - run: bun run build

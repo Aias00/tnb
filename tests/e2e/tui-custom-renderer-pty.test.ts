@@ -2,16 +2,16 @@ import { describe, expect, test } from 'bun:test'
 import { resolve } from 'node:path'
 import { rm } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
+import { ptyCommand } from '../helpers/pty-command'
 
 describe('custom renderer PTY lifecycle', () => {
   test('owns alternate screen, terminal events, and clean exit', async () => {
     const fixture = resolve(import.meta.dir, '../fixtures/custom-renderer-tui.tsx')
     const bunExecutable = process.execPath
     const transcript = `/tmp/tnb-custom-renderer-${process.pid}.typescript`
-    const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'"
-    // BSD script rejects socketpair stdin; cat gives it a normal pipe.
+    const terminal = ptyCommand(transcript, [bunExecutable, fixture])
     const child = spawn(
-      'sh', ['-c', `cat | script -q -F ${quote(transcript)} ${quote(bunExecutable)} ${quote(fixture)}`],
+      terminal.file, terminal.args,
       {
         cwd: resolve(import.meta.dir, '../..'),
         env: { ...process.env, TERM: 'xterm-256color' },

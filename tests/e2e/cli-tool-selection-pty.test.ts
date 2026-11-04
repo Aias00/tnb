@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
+import { ptyCommand } from "../helpers/pty-command";
 
 test("full CLI TUI retains an explicit provider-facing tool restriction", async () => {
   const root = await mkdtemp(join(tmpdir(), "tnb-cli-tools-")), cwd = join(root, "work"), configDir = join(root, "config");
@@ -18,7 +19,8 @@ test("full CLI TUI retains an explicit provider-facing tool restriction", async 
   const command = [process.execPath, resolve(import.meta.dir, "../../src/entrypoints/cli.ts"), "--provider", "fixture", "--model", "fixture", "--tools", "read"].map(quote).join(" ");
   const pidFile = join(root, "terminal.pid");
   const wrapped = `echo $$ > ${quote(pidFile)}; exec ${command}`;
-  const child = spawn("/bin/sh", ["-c", `cat | script -q -F ${quote(join(root, "terminal.log"))} /bin/sh -c ${quote(wrapped)}`], {
+  const terminal = ptyCommand(join(root, "terminal.log"), ["/bin/sh", "-c", wrapped]);
+  const child = spawn(terminal.file, terminal.args, {
     cwd, env: { ...process.env, TNB_HOME: configDir, TERM: "xterm-256color" }, detached: true, stdio: ["pipe", "pipe", "pipe"],
   });
   let output = ""; child.stdout.on("data", chunk => { output += chunk.toString(); }); child.stderr.resume();

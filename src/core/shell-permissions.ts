@@ -168,7 +168,7 @@ export function resolveShellInvocation(
 
   return {
     family: "posix",
-    file: "/bin/zsh",
+    file: platformName === "darwin" ? "/bin/zsh" : "/bin/sh",
     args: (command) => ["-lc", command],
   };
 }

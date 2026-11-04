@@ -1,6 +1,4 @@
-import { watch } from "node:fs";
-import { appendFile, readFile } from "node:fs/promises";
-import { dirname } from "node:path";
+import { appendFile, writeFile } from "node:fs/promises";
 import { runTui } from "../../src/ui/app";
 import type { QuestionInbox, QuestionNotice, ConnectionStatus } from "../../src/services/runtime/attention";
 import type { RunNotice } from "../../src/services/runtime/notices";
@@ -27,9 +25,7 @@ const inbox: QuestionInbox = {
     return { paused: false };
   },
 };
-const watcher = watch(dirname(trigger), async (_event, file) => {
-  if (file !== trigger.split("/").at(-1)) return;
-  const action = await readFile(trigger, "utf8").catch(() => "");
+async function applyAction(action: string) {
   if (action === "offline") connection = { state: "offline", message: "后台服务离线，请重启服务" };
   else if (action === "online") connection = { state: "online", message: "" };
   else if (action === "done") notifications = acknowledged.has("completed-one") ? [] : [{ noticeId: "completed-one", runId: "run-one", objective: "长任务", kind: "succeeded", message: "长任务已完成并通过验收", at: 1 }];
@@ -39,8 +35,16 @@ const watcher = watch(dirname(trigger), async (_event, file) => {
   if (action === "ask-two") questions.push({ waitId: "question-two", runId: "run-two", taskId: "task-two", version: 1, digest: "fixture", state: "open", createdAt: 2,
     runObjective: "另一个长任务", runStatus: "active", proposal: { kind: "question", key: "cache", question: "选择缓存", options: ["Redis", "Memory"], about: "继续分析" } });
   listeners.forEach((listener) => listener());
-});
+  await appendFile(trigger + ".actions", action + "\n");
+}
+// A request acknowledges delivery; filesystem notifications can expose a partial
+// write or omit a rename differently across the host test platforms.
+const control = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+  if (request.method !== "POST") return new Response(null, { status: 405 });
+  await applyAction(await request.text()); return new Response("ok");
+} });
+await writeFile(trigger + ".control", String(control.url));
 try {
   await runTui({ model: "fixture-model", permissionMode: "default", sessionIdFactory: () => "question-ui", durableQuestions: inbox,
     runTurn: async (turn) => { await appendFile(trigger + ".turns", turn.input.expanded + "\n"); }, fullscreen: true });
-} finally { watcher.close(); }
+} finally { await control.stop(true); }

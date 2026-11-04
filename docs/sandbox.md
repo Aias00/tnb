@@ -88,7 +88,8 @@ exit or input EOF also terminates its terminal child.
 `tests/integration/macos-shell-lifecycle.test.ts` checks these lifecycle paths
 on macOS, including real Seatbelt file restrictions for foreground, background
 and PTY execution, cancellation of a live launch probe, terminal exit, and
-commands that ignore SIGTERM. Current local verification targets macOS.
+commands that ignore SIGTERM. Platform-neutral sandbox and Worker control-state
+checks also run on Linux; POSIX TUI tests support both BSD and util-linux `script`.
 
 `tests/integration/sandbox-native.test.ts` executes real processes. It checks
 successful workspace writes, denied writes by a descendant outside grants,
@@ -115,5 +116,26 @@ These results verify the tested Linux policies under the stated privileges;
 they do not establish launch availability on every unprivileged Linux host.
 The dedicated CI jobs still need remote execution, and Windows enforcement
 has not been locally verified.
+
+The current runtime has additionally passed full verification directly on a
+Colima Ubuntu 24.04.4 ARM64 VM, as an ordinary UID 501 user: **806 pass / 7 skip /
+0 fail** with `TNB_REQUIRE_NATIVE_SANDBOX=1`, type checking, build, isolated
+installation, nine real Magpie free-group scenarios and a durable-task restart
+flow. This run did not use a privileged container. The skipped tests cover
+macOS-specific Shell lifecycle behavior and the Windows-specific sandbox case.
+
+The VM initially rejected bubblewrap namespace setup. Its
+`kernel.apparmor_restrict_unprivileged_userns` and
+`kernel.unprivileged_userns_clone` both remained `1`; a test-specific AppArmor
+profile granted `userns` only to `/usr/bin/bwrap`. Ubuntu supports granting this
+permission per executable through an AppArmor profile; see its
+[user namespace policy explanation](https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces).
+An unprofiled backend copy still failed the tnb launch probe, and the requested
+command did not run. Successful confinement checks therefore establish the
+tested policy under this explicit prerequisite, rather than universal launch
+availability on an unmodified Ubuntu system. Linux x86_64, other distributions
+and Windows remain outside this local run. The Linux CI job now runs the full
+suite; these changes have not yet been executed by remote GitHub Actions.
+
 File tools, Hook commands, plugins, MCP servers and model HTTP calls run in the
 tnb host process or their own runtimes and are outside this shell sandbox.

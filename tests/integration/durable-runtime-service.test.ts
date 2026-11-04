@@ -99,8 +99,8 @@ test("explicit start/restart preserves paused work and resumes it only after the
   expect((await terminal(f.configDir, runId!)).run.status).toBe("succeeded"); expect(f.requests()).toBe(1);
 }, 15000);
 
-const macTest = process.platform === "darwin" ? test : test.skip;
-macTest("production worker checks use native sandbox, strip model keys, and deny control state and sockets", async () => {
+const nativeWorkerTest = process.platform === "darwin" || process.platform === "linux" ? test : test.skip;
+nativeWorkerTest("production worker checks use native sandbox, strip model keys, and deny control state and sockets", async () => {
   const f = await fixture(); const paths = await runtimePaths(f.configDir);
   await service(f.configDir);
   const command = `test -z "$ANTHROPIC_API_KEY" && test -z "$OPENAI_API_KEY" && printf checked > checked.txt`;

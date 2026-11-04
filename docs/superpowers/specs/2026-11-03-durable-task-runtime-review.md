@@ -306,3 +306,36 @@ macOS / Bun 1.3.14 最终结果：类型检查、构建通过；要求原生沙�
 - 真实调用均为短流程；不代表连续数小时稳定性、Linux/Windows、全部 free 成员或任意项目已经验证。
 
 汇总为仓库外 `/Volumes/data/tnb-review-2026-11-03/full-functional-verification.json`，列出 29 组各自通过的证据目录、全部探索/失败/复测记录、实际路由和限制。测试驱动为 full-live.ts、full-live-extra.ts、full-live-tui.ts；每个目录保留请求/响应、JSONL、服务器协议日志、真实终端原始及还原文本。最终 TUI 证据在 `full-live-2026-11-04T04-13-02-973Z/`；最终 durable 证据在 `magpie-free-live-2026-11-04T04-13-23-143Z/`。完整回归日志为 full-regression.log，类型检查与构建日志为 full-typecheck.log、full-build.log。
+
+## 11 Linux 原生与真实模型补充验证
+
+本轮使用独立 Colima `tnb-verify` 虚拟机，在 Ubuntu **24.04.4 LTS / Linux 6.8.0-117-generic / aarch64** 内直接执行，使用普通 UID 501，Bun 1.3.14、Node 18.19.1、bubblewrap 0.9.0。没有使用特权容器，没有切换主机默认 Docker context。源代码以 `95512f0` 为基线传入，再同步本轮明确列出的修复；主机和 guest 没有共享整个用户目录。
+
+| 验证项 | 结果 |
+| --- | --- |
+| Linux 类型检查、全量测试、构建、隔离安装 | **806 pass / 7 skip / 0 fail，813 tests / 128 files**，其余检查通过。7 项跳过为 6 项 macOS 专用 Shell 生命周期测试及 1 项 Windows 沙箱测试。 |
+| Linux bubblewrap 实际效果 | 工作区写入成功；restrictive/strict 模式下后代越界写入被拒绝；网络 blocked 与 open 行为不同；子进程 effective capabilities 为零；Worker 不能读取控制凭据、访问控制 socket 或无关文件，且 Shell 环境没有模型密钥。 |
+| 不可启动后端的保守拒绝 | 未获命名空间许可的后端副本被 launch probe 拒绝，目标文件未创建。没有静默转为无沙箱执行。 |
+| Linux 编译产物真实模型 | **9 组通过**：普通 JSON 对话；文件/Notebook/Shell 编码与测试；SDK 允许/拒绝；resume/fork/continue；Skill 按需资源与 fork；stdio MCP；HTTP MCP；后台 Shell 和 PTY 输入/resize/停止；真实 TUI 问答、BLUE 选择、允许一次写入、工具目录限制和干净退出。 |
+| Linux 长任务重启恢复 | 实际提出问题、关闭对话、重启 owner、原 Task/wait 恢复、不在等待期间调用模型、直接回答、写文件、原生 grep 验收及完成提醒通过。Run succeeded，约 23 秒，6 次真实请求。 |
+| macOS 回归 | **811 pass / 2 skip / 0 fail**，类型检查、构建通过。 |
+
+Linux 真实调用仍仅通过现有 Magpie `group/free-models`，实际响应头为 `workbuddy-ai/hy3`。9 组初次验证及会话复测共 41 次请求，durable 回归 6 次，共 **47 次真实请求**。使用只转发到主机原网关的 SSH loopback 通道，没有向 VM 复制真实 Provider 密钥，也没有把新的代理端口暴露到局域网。
+
+Ubuntu VM 的 AppArmor 默认策略起初拒绝 bubblewrap 设置 UID map。按其逐程序许可机制，只在该独立 VM 为 `/usr/bin/bwrap` 加载测试 profile 的 `userns` 许可；全局 `kernel.apparmor_restrict_unprivileged_userns=1` 与 `kernel.unprivileged_userns_clone=1` 保持不变。普通用户在该前提下运行所有测试；不能据此声称未配置许可的 Ubuntu 24.04 会自动工作。策略依据见 [Ubuntu 官方说明](https://ubuntu.com/blog/ubuntu-23-10-restricted-unprivileged-user-namespaces)，实际设置、用户与版本保存在 environment.log。
+
+首轮 Linux 全量测试为 794 pass / 14 skip / 5 fail。本轮关闭的差异：
+
+- 未设置 `TNB_SHELL`/`SHELL` 时，原 POSIX 默认路径固定 `/bin/zsh`，Ubuntu 没有该程序，导致 3 个实际 Shell 执行测试失败。现在 Linux 回退 `/bin/sh`，macOS 保留原选择，显式配置仍优先。
+- 两个真实终端测试使用 BSD `script -F`，GNU util-linux 参数不同。新增共享 PTY 启动 helper，分别使用 BSD 和 util-linux 参数，Linux CLI 工具目录与终端生命周期测试实际执行通过。
+- 六项自动提问/提醒测试和生产 Worker 凭据/控制面沙箱测试原来只在 macOS 运行，现对 Linux 同样开启，没有通过跳过消除问题。
+- 原问题测试夹具依赖对触发文件的 watch 通知，Linux 上可能在完整内容可读前通知、或不能按原假设观察 rename。夹具改为带响应确认的本地控制请求，测试核对实际输入草稿、选项和回答；清理时撤回问题并回收实际 TUI PID。生产自动提醒仍走原持久协议和 SSE。
+- Linux CI 从局部原生沙箱回归扩展为 `bun test` 全量，安装 ripgrep/util-linux；Windows 保留原局部检查。本轮未推送或触发远程 CI。
+
+会话首轮真实模型曾输出文本形式的伪工具调用，未返回要求的代号。没有把这种文本当执行或会话恢复成功；复测使用“仅在本会话保留的临时数据”明确区分长期记忆，重新核对原 session、分支父子关系、来源消息不变与 continue 选择后通过。失败原始请求和响应均保留。模型指令遵循和长期记忆策略仍不能替代确定性验收。
+
+仍未覆盖：真实连续数小时与多任务并发的 soak；真实模型驱动的多层 Workflow/Team/goal loop；第三方 OAuth/MCP/IDE、Brave、图像生成/多模态真实服务及更新/反馈发布；Linux x86_64、其他发行版、Windows，以及任意挂载/内核策略组合。这些维度中已有的 fixture、故障注入与协议测试不提升为真实外部联通或所有平台保证。持久 Skill/MCP 和并行编码等尚未开放的能力，也不列为已验证。
+
+Linux 本轮真实模型为上述 9 组及 durable 恢复，没有将 macOS 的 29 组真实模型矩阵全部重跑。Linux 上的真实模型自动/手动压缩、Hook/插件、Agent/Plan、工作区分支、公共网页读取和其余 SDK 控制组合等，仍只有本轮 Linux 自动化回归及此前 macOS 真实调用证据；不能据此标为 Linux 真实联通均已完成。
+
+证据根目录为仓库外 `/Volumes/data/tnb-review-2026-11-03/linux/`：verification.json 汇总条件与通过场景；environment.log 记录实际捕获的平台、用户、版本和策略，未取得构建/安装二进制 SHA256；evidence/logs 保存全量回归、构建、安装、fail-closed 与真实调用日志；evidence/live 保存请求/响应、工具回执、终端及状态记录；evidence.tar.gz 是 guest 证据归档。全部必需验证完成、证据归档后发现主机系统盘空间紧张，已停止并删除本轮 VM 和专用 SSH 通道，释放其磁盘占用；原 Docker context 保持 default。额外的根挂载补充探针因主机空间问题未执行，未将其算作通过项。

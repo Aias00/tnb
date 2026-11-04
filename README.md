@@ -427,6 +427,9 @@ starts a persistent 160x50 terminal for interactive commands. Use
 TUI session owns these processes and terminates any still running when the
 session exits.
 
+Shell selection prefers `TNB_SHELL`, then `SHELL`. Without either variable,
+macOS uses `/bin/zsh`, Linux uses `/bin/sh`, and Windows uses PowerShell.
+
 Main, delegated, Skill, Hook, compaction, memory, and MCP sampling model
 requests share an invocation limit of four active streams and 64 queued
 requests. Set `TNB_MAX_CONCURRENT_MODEL_REQUESTS` to a positive integer to
