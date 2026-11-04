@@ -22,6 +22,7 @@ import { buildPromptLayout, promptContentColumns, type PromptLayout } from "./in
 import { DEFAULT_KEYBINDINGS, type KeybindingMap } from "./keybindings";
 import { KeybindingProvider, useKeybindingLabel } from "./keybinding-context";
 import type { PromptInputSubmit } from "./prompt-input/types";
+import { ACTIVITY_FRAMES, activityLabel as waitingLabel } from "./activity";
 import { Ansi } from "./ink/Ansi";
 import { AccentProvider, UI_COLORS, useAccent } from "./theme";
 
@@ -231,8 +232,12 @@ export const TuiView = memo(function TuiView({
 
 function WorkingStatus({ label, startedAt, color }: { label: string; startedAt?: number; color: "cyan" | "magenta" | "blue" | "green" }) {
   const [now, setNow] = useState(Date.now());
-  useEffect(() => { const timer = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(timer); }, []);
-  return <Text color={color} wrap="truncate-end">{figures.star} {label}{startedAt ? ` · ${Math.max(0, Math.floor((now - startedAt) / 1000))}s` : ""}</Text>;
+  const phaseStartedAt = useRef(Date.now());
+  useEffect(() => { phaseStartedAt.current = Date.now(); }, [label]);
+  useEffect(() => { const timer = setInterval(() => setNow(Date.now()), 120); return () => clearInterval(timer); }, []);
+  const shown = waitingLabel(label, Math.max(0, (now - phaseStartedAt.current) / 1000));
+  const frame = ACTIVITY_FRAMES[Math.floor(now / 120) % ACTIVITY_FRAMES.length];
+  return <Text color={color} wrap="truncate-end">{frame} {shown}{startedAt ? ` · ${Math.max(0, Math.floor((now - startedAt) / 1000))}s` : ""}</Text>;
 }
 
 function QueuePanel({ prompts, selection, columns, rows, notice }: { prompts: readonly PromptInputSubmit[]; selection: number; columns: number; rows: number; notice?: string }) {

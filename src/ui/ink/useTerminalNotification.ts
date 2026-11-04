@@ -9,6 +9,12 @@ export const TerminalWriteContext = createContext<WriteRaw | null>(null)
 
 export const TerminalWriteProvider = TerminalWriteContext.Provider
 
+export const TerminalScreenContext = createContext<{
+  setAltScreenActive(active: boolean, mouseTracking?: boolean): void
+  clearTextSelection(): void
+} | null>(null)
+
+
 export type TerminalNotification = {
   notifyITerm2: (opts: { message: string; title?: string }) => void
   notifyKitty: (opts: { message: string; title: string; id: number }) => void

@@ -1,14 +1,14 @@
 type Writer = { write(text: string): unknown };
 
-const COMMANDS = [
-  "agents", "completion", "config", "doctor", "goal-loop", "goal-loop-stop", "hooks", "jobs",
-  "feedback", "mcp", "models", "plugins", "provider", "remote-control", "rollback", "security-scan",
-  "sessions", "skills", "status", "update",
-] as const;
+import { CLI_COMMANDS as COMMANDS } from "./commands";
+
 const PROVIDER_ACTIONS = ["list", "show", "add", "set", "use", "test", "remove", "model"] as const;
 const MCP_ACTIONS = ["list", "show", "add", "remove", "enable", "disable", "auth", "logout", "tools", "prompts", "resources", "templates", "complete"] as const;
 
 export function runCompletionCommand(options: { argv: string[]; stdout: Writer; stderr: Writer }): number {
+  if (options.argv.includes("--help") || options.argv.includes("-h")) {
+    options.stdout.write("Usage: tnb completion <bash|zsh|fish>\n"); return 0;
+  }
   const shell = options.argv[1];
   if (shell === "bash") options.stdout.write(bashCompletion());
   else if (shell === "zsh") options.stdout.write(zshCompletion());

@@ -50,7 +50,7 @@ of implementing a second execution path:
   input;
 - `~/.tnb/keybindings.json` can override `historySearch`, `transcriptSearch`,
   `externalEditor`, `toggleTranscript`, `toggleTasks`, `pasteImage`, `promptQueue`,
-  `previousTool`, `nextTool`, and `toggleTool` under a
+  `previousTool`, `nextTool`, `toggleTool`, and `redraw` under a
   `bindings` object. Set an action to `null` to disable it. Ctrl+C and Esc remain
   fixed safety controls;
 - the status line shows the latest Provider-reported input as a percentage of
@@ -137,3 +137,33 @@ rather than automatically attaching file content.
 untracked files. Up/Down selects a file, PgUp/PgDn scrolls its patch, Enter toggles
 a full-width preview, Esc returns/closes, and R refreshes. `/diff "file name"`
 opens a single changed file. Reviewing does not alter files or the Git index.
+
+
+### Starting with a saved session
+
+`tnb resume` is the command form of `tnb --resume`: in a terminal it opens the
+current workspace's session picker. `tnb resume <session-id>` restores that
+session directly. Runtime flags can follow the command, for example
+`tnb resume <session-id> --model <model>`. Existing `-r`, `--resume` and interactive
+`/resume` syntax remains supported.
+
+
+### Command routing and terminal recovery
+
+`tnb continue` is the command form of `tnb --continue`. CLI commands and
+interactive slash commands are separate: enter `/clear`, `/diff` or `/theme`
+inside tnb. Unknown shell commands now return an error instead of opening a new
+session. `tnb <command> --help` prints usage without loading provider credentials
+or performing the command's action. Shell completion includes all top-level
+commands and aliases.
+
+`Ctrl+L` redraws a disturbed screen without clearing the conversation or draft;
+customize/disable it with the `redraw` keybinding. Structural transitions such as
+changing themes, opening dialogs and starting/ending turns invalidate stale
+screen pixels. The TUI uses the renderer's terminal-size context.
+
+Activity now shows a rotating spinner and distinguishes waiting for a model,
+thinking, preparing tool arguments, tool execution and response output. An
+extended wait is described as waiting, not claimed to be hidden model reasoning.
+Markdown tables render aligned cell columns, a header separator, wrapped content
+and inline formatting rather than literal Markdown punctuation.

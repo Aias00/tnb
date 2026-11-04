@@ -116,7 +116,7 @@ import {
   supportsTabStatus,
   wrapForMultiplexer,
 } from './termio/osc.js'
-import { TerminalWriteProvider } from './useTerminalNotification.js'
+import { TerminalWriteProvider, TerminalScreenContext } from './useTerminalNotification.js'
 
 // Alt-screen: renderer.ts sets cursor.visible = !isTTY || screen.height===0,
 // which is always false in alt-screen (TTY + content fills screen).
@@ -1680,7 +1680,7 @@ export default class Ink {
         dispatchKeyboardEvent={this.dispatchKeyboardEvent}
       >
         <TerminalWriteProvider value={this.writeRaw}>
-          {node}
+          <TerminalScreenContext.Provider value={this}>{node}</TerminalScreenContext.Provider>
         </TerminalWriteProvider>
       </App>
     )

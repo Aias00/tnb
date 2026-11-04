@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promis
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { createResumeManagement, parseArguments, prepareInteractiveSession, runCli, runInteractiveCli, runModelsCli, runStreamJsonCli } from "../../src/entrypoints/cli";
+import { createResumeManagement, normalizeCliArguments, parseArguments, prepareInteractiveSession, runCli, runInteractiveCli, runModelsCli, runStreamJsonCli } from "../../src/entrypoints/cli";
 import type { ConversationMessage } from "../../src/core/message";
 import type { ModelEvent, ModelRequest, ModelTransport } from "../../src/providers/types";
 import { ProviderHttpError } from "../../src/providers/retry";
@@ -46,6 +46,16 @@ function toolTurn(name: string, input: unknown): ModelEvent[][] {
 }
 
 describe("tnb session arguments", () => {
+  test("routes the resume subcommand to the existing resume option", () => {
+    expect(normalizeCliArguments(["resume"])).toEqual(["--resume"]);
+    expect(normalizeCliArguments(["resume", "session-123", "--model", "test"])).toEqual(["--resume", "session-123", "--model", "test"]);
+    expect(normalizeCliArguments(["resume", "--help"])).toEqual(["--help"]);
+    expect(normalizeCliArguments(["-p", "resume"])).toEqual(["-p", "resume"]);
+    const picker = parseArguments(["-p", "__interactive__", ...normalizeCliArguments(["resume"])], {}, { allowBareResume: true });
+    expect(picker.resumePicker).toBe(true);
+    expect(parseArguments(["resume", "session-123", "-p", "hello"], {}).resume).toBe("session-123");
+  });
+
   test("opens the session picker for bare --resume in interactive mode", () => {
     const parsed = parseArguments(["-p", "__interactive__", "--resume"], {}, { allowBareResume: true });
     expect(parsed.resumePicker).toBe(true);

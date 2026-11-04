@@ -1,6 +1,8 @@
 import React, {
   useCallback,
+  useContext,
   useEffect,
+  useLayoutEffect,
   useReducer,
   useRef,
   useState,
@@ -13,6 +15,8 @@ import type { PermissionMode, PermissionPromptDecision } from "../core/permissio
 import type { ModelEvent } from "../providers/types";
 import { applyInputKey, createInputBuffer, searchInputHistory, type InputBuffer, type InputHistorySearch } from "./input-buffer";
 import { promptContentColumns } from "./input/prompt-layout";
+import { TerminalSizeContext } from "./ink/components/TerminalSizeContext";
+import inkInstances from "./ink/instances";
 import { workspaceCompletionToken, completionLabel, completionCursor } from "./file-completion";
 import { filterSessionView } from "./session-filter";
 import { createPromptEditorState } from "./prompt-input/editor-state";
@@ -203,29 +207,22 @@ export function TuiApp(options: TuiAppOptions) {
   const [vimInsert, setVimInsert] = useState(!options.vimMode);
   const [promptMouse, setPromptMouse] = useState<{ row: number; column: number; nonce: number; maxVisibleLines?: number } | undefined>();
   const bufferRef = useRef(buffer);
-  const [terminalSize, setTerminalSize] = useState(() => ({
-    columns: stdout.columns || 80,
-    rows: stdout.rows || 24,
-  }));
+  const terminalSize = useContext(TerminalSizeContext) ?? { columns: stdout.columns || 80, rows: stdout.rows || 24 };
   const abortController = useRef<AbortController | undefined>(undefined);
   const lastCtrlCPress = useRef(0);
   const ctrlCExitTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const hasRun = useRef(options.initialResume === true);
   const imageToolPaths = useRef(new Map<string, string>());
+  const preparingTool = useRef<string | undefined>(undefined);
+
+  // Structural transitions move the prompt/footer; never reuse their old pixels.
+  useLayoutEffect(() => {
+    inkInstances.get(stdout)?.invalidatePrevFrame();
+  }, [stdout, state.busy, theme, management, queuePanel, shellPanel, permission, question]);
 
   useEffect(() => { setSessionFilter(""); setSessionFilterEditing(false); setManagementSelection(0); setManagementDetailOnly(false); }, [management]);
   useEffect(() => { if (!state.busy) { setCancelling(false); setTurnStartedAt(undefined); } }, [state.busy]);
 
-  useEffect(() => {
-    const updateSize = () => setTerminalSize({
-      columns: stdout.columns || 80,
-      rows: stdout.rows || 24,
-    });
-    stdout.on("resize", updateSize);
-    return () => {
-      stdout.off("resize", updateSize);
-    };
-  }, [stdout]);
 
   useEffect(() => () => {
     abortController.current?.abort();
@@ -360,6 +357,7 @@ export function TuiApp(options: TuiAppOptions) {
     setCancelling(false);
     setTurnStartedAt(Date.now());
     setPhase("Requesting model");
+    preparingTool.current = undefined;
     dispatch({ type: "submit", text: structured.display });
     const controller = new AbortController();
     abortController.current = controller;
@@ -371,6 +369,8 @@ export function TuiApp(options: TuiAppOptions) {
       onModelEvent(event) {
         if (event.type === "text") setPhase("Writing response");
         if (event.type === "thinking") setPhase("Thinking");
+        if (event.type === "tool-start") { preparingTool.current = event.name; setPhase(`Preparing ${event.name}`); }
+        if (event.type === "tool-input") setPhase(preparingTool.current ? `Preparing ${preparingTool.current} arguments` : "Preparing tool arguments");
         if (event.type === "response-end") setPhase(event.reason === "tool-use" ? "Preparing tools" : "Finishing response");
         dispatch({ type: "model-event", event });
       },
@@ -766,6 +766,9 @@ export function TuiApp(options: TuiAppOptions) {
       setHistorySearch({ query: original.value, original, matchIndex: match.index });
       setCompletionNotice(undefined);
       return;
+    }
+    if (matchesKeybinding(keybindings, "redraw", input, key) && !matchesKeybinding(keybindings, "externalEditor", input, key) && !matchesKeybinding(keybindings, "pasteImage", input, key)) {
+      inkInstances.get(stdout)?.forceRedraw(); return;
     }
     if (matchesKeybinding(keybindings, "promptQueue", input, key)) {
       setQueueSelection(0); setQueuePanel(true); return;

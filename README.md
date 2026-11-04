@@ -423,6 +423,9 @@ Continue the most recently used session for the current workspace:
 bun run src/entrypoints/cli.ts -p "Continue the previous task" --continue
 ```
 
+Open the session picker with `tnb resume` (also `tnb --resume`). To restore
+a known session, use `tnb resume <session-id>` in the same workspace.
+
 Resume a known session explicitly:
 
 ```bash
