@@ -10,11 +10,20 @@ import type { ModelTransport } from "../../src/providers/types";
 
 const roots: string[] = []; const runtimes: DurableRuntime[] = []; const stores: RuntimeStore[] = [];
 afterEach(async () => { for (const runtime of runtimes.splice(0)) await runtime.close(); stores.splice(0).forEach((store) => store.close()); await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))); });
-async function fixture(transport: ModelTransport, check?: (command: string) => Promise<string>) {
+async function fixture(transport: ModelTransport, check?: (command: string) => Promise<string>, holdValidation = false) {
   const root = await mkdtemp(join(tmpdir(), "tnb-runtime-engine-")); roots.push(root);
   const workspace = join(root, "work"); await mkdir(workspace);
   const state = join(root, "control", "runtime"); const store = new RuntimeStore(join(state, "state.sqlite")); stores.push(store);
-  const factory: RuntimeWorkerFactory = async () => {
+  const validation = Promise.withResolvers<void>();
+  if (!holdValidation) validation.resolve();
+  const factory: RuntimeWorkerFactory = async ({ task, signal }) => {
+    // A real async boundary keeps interruption tests independent of scheduler speed.
+    if (task.status === "validating") {
+      await Promise.race([validation.promise, new Promise<void>((resolve) => {
+        if (signal.aborted) resolve(); else signal.addEventListener("abort", () => resolve(), { once: true });
+      })]);
+      signal.throwIfAborted();
+    }
     const cache = createFileStateCacheWithSizeLimit(100);
     return { transport, model: "fixture", tools: [createReadTool(workspace, undefined, undefined, cache), createWriteTool(workspace, undefined, cache)],
       route: { provider: "fixture", model: "fixture", pricing: { input: 1, output: 1 } }, maxOutputTokens: 100,
@@ -23,7 +32,7 @@ async function fixture(transport: ModelTransport, check?: (command: string) => P
   const runtime = new DurableRuntime(store, state, factory); runtimes.push(runtime); await runtime.start();
   const config: RuntimeConfiguration = { workspace, allowedWorkspaces: [workspace], allowWrite: false, allowShell: false, checks: [],
     maxTurns: 10, maxRetries: 1, compactThreshold: 10000, maxCostUsd: 1 };
-  return { runtime, store, config, workspace, state, factory };
+  return { runtime, store, config, workspace, state, factory, releaseValidation: () => validation.resolve() };
 }
 async function settled(runtime: DurableRuntime, runId: string) {
   const deadline = Date.now() + 10000;
@@ -92,11 +101,12 @@ function restart(f: Awaited<ReturnType<typeof fixture>>, factory = f.factory) {
 }
 
 test("restart accepts an already durable terminal report without another model request", async () => {
-  const f = await fixture(report);
+  const f = await fixture(report, undefined, true);
   const submitted = await f.runtime.submit({ commandId: "saved-report", objective: "Saved candidate", configuration: f.config });
   // Stop before the validation wake; the durable terminal transcript must be sufficient on restart.
   await until(() => f.store.getTask(submitted.tasks[0]!.taskId)?.status === "validating", f.runtime);
   await f.runtime.close();
+  f.releaseValidation();
   f.store.command("interrupt-before-candidate", {}, Date.now(), (tx) => {
     const task = tx.getTask(submitted.tasks[0]!.taskId)!;
     tx.saveTask({ ...task, status: "reconciling", revision: task.revision + 1, candidateRef: undefined }, task.revision); return true;
@@ -117,7 +127,7 @@ test("failed verification feeds the failure back to the model and retries a boun
 });
 
 test("a queued validating task cancels cleanly without accepting its candidate", async () => {
-  const f = await fixture(report);
+  const f = await fixture(report, undefined, true);
   const { run, tasks } = await f.runtime.submit({ commandId: "cancel-validation", objective: "cancel candidate", configuration: f.config });
   await until(() => f.store.getTask(tasks[0]!.taskId)?.status === "validating", f.runtime);
   f.runtime.commands.cancelRun({ commandId: "cancel", runId: run.runId, expectedRevision: f.store.getRun(run.runId)!.revision });
@@ -127,10 +137,11 @@ test("a queued validating task cancels cleanly without accepting its candidate",
 
 test("stale report inputs fail validation and require a fresh model inspection", async () => {
   let calls = 0;
-  const f = await fixture({ async *stream() { calls++; yield { type: "text", index: 0, text: "current report" }; yield { type: "response-end", reason: "end-turn" }; } });
+  const f = await fixture({ async *stream() { calls++; yield { type: "text", index: 0, text: "current report" }; yield { type: "response-end", reason: "end-turn" }; } }, undefined, true);
   const { run, tasks } = await f.runtime.submit({ commandId: "stale-input", objective: "inspect version", configuration: f.config });
   await until(() => f.store.getTask(tasks[0]!.taskId)?.status === "validating", f.runtime);
   await writeFile(join(f.workspace, "changed.ts"), "new input");
+  f.releaseValidation();
   expect((await settled(f.runtime, run.runId)).status).toBe("succeeded"); expect(calls).toBe(2);
 });
 

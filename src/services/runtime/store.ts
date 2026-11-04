@@ -20,6 +20,7 @@ export class RuntimeStore {
   readonly #db: Database;
   readonly #limits: StoreLimits;
   #closed = false;
+  readonly #listeners = new Set<() => void>();
 
   constructor(readonly path: string, limits: Partial<StoreLimits> = {}) {
     this.#limits = { maxEffects: limits.maxEffects ?? 256, maxEffectsPerRun: limits.maxEffectsPerRun ?? 64, maxActiveRuns: limits.maxActiveRuns ?? 64 };
@@ -86,6 +87,16 @@ export class RuntimeStore {
   tasks(runId: string): DurableTask[] { return this.#reader().tasks(runId); }
   getAttempt(attemptId: string): DurableAttempt | undefined { return this.#reader().getAttempt(attemptId); }
   activeAttempts(runId: string): DurableAttempt[] { return this.#reader().activeAttempts(runId); }
+  onChange(listener: () => void): () => void { this.#listeners.add(listener); return () => { this.#listeners.delete(listener); }; }
+  nextDueAt(): number | undefined {
+    this.#assertOpen();
+    const row = this.#db.query(`SELECT MIN(at) AS at FROM (
+      SELECT CASE WHEN e.lease_token IS NOT NULL THEN MAX(e.due_at, e.lease_expires_at) ELSE e.due_at END AS at
+      FROM effects e JOIN runs r ON r.run_id = e.run_id WHERE e.kind = 'control' OR r.status = 'active'
+      UNION ALL SELECT json_extract(data, '$.deadline') AS at FROM runs WHERE status = 'active'
+    )`).get() as { at: number | null };
+    return row.at ?? undefined;
+  }
   getSignal(runId: string, kind: RuntimeSignal["kind"], key: string): RuntimeSignal | undefined {
     return this.#reader().getSignal(runId, kind, key);
   }
@@ -123,7 +134,8 @@ export class RuntimeStore {
   command<T>(commandId: string, input: unknown, now: number, apply: (tx: RuntimeTransaction) => T): T {
     text(commandId, "command ID", 128); integer(now, "command time");
     const digest = digestJson({ version: 1, input }, 256 * 1024);
-    return this.#write(() => {
+    let committed = false;
+    const result = this.#write(() => {
       const receipt = this.#db.query("SELECT digest, result FROM commands WHERE command_id = ?").get(commandId) as { digest: string; result: string } | null;
       if (receipt) {
         if (receipt.digest !== digest) throw new Error("Command ID was already used with different input");
@@ -139,8 +151,11 @@ export class RuntimeStore {
       }
       const encoded = encodeJson(result);
       this.#db.query("INSERT INTO commands(command_id, digest, result, committed_at) VALUES (?, ?, ?, ?)").run(commandId, digest, encoded, now);
+      committed = tx.mutated;
       return JSON.parse(encoded) as T;
     });
+    if (committed) for (const listener of this.#listeners) { try { listener(); } catch { /* Observers cannot roll back committed work. */ } }
+    return result;
   }
 
   /** Storage leases only. Claiming a row does not authorize its effect or execute it. */
@@ -191,6 +206,7 @@ export class RuntimeStore {
 /** Only handed to internal synchronous command handlers; not an RPC or authorization API. */
 export class RuntimeTransaction {
   #expired = false;
+  mutated = false;
   constructor(private readonly db: Database, private readonly limits: StoreLimits, readonly commandId: string, readonly now: number) {}
   expire(): void { this.#expired = true; }
 
@@ -319,7 +335,7 @@ export class RuntimeTransaction {
         data = excluded.data, due_at = excluded.due_at, attempts = 0`)
       .run(randomUUID(), effect.runId, effect.taskId ?? null, effect.kind, effect.key, effect.dueAt, encodeJson(effect.data, 16 * 1024));
   }
-  #mutable(): void { if (!this.commandId || this.#expired) throw new Error("Runtime transaction is no longer writable"); }
+  #mutable(): void { if (!this.commandId || this.#expired) throw new Error("Runtime transaction is no longer writable"); this.mutated = true; }
   #read<T>(sql: string, key: string): T | undefined {
     const row = this.db.query(sql).get(key) as DataRow | null;
     return row ? JSON.parse(row.data) as T : undefined;

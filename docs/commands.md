@@ -22,10 +22,13 @@ of implementing a second execution path:
 
 - `/longtask "objective" [options]` submits a durable background task using the
   current workspace and model; `/task`, `/long` and `/长任务` are aliases. `list`, `status`,
-  `result`, `events`, `pause`, `resume`, and `cancel` manage those tasks. Without
+  `result`, `events`, `questions`, `answer`, `pause`, `resume`, and `cancel` manage those tasks. Without
   a Run ID, controls prefer the current conversation's latest Run, then the
   workspace's latest Run. Bare `/longtask` shows help without starting work.
   Writable tasks require `--allow-write` and replay-safe `--check` commands.
+  `/task questions` lists pending decisions; `/task answer --question ID
+  --answer "text" --version N` records the user's answer. Waiting releases execution
+  resources; answering a paused Run does not resume it or change its permissions.
   This entry works in both the TUI and terminal REPL;
 - `/about` reports the CLI/runtime/model/workspace identity;
 - `/reload` (alias `/refresh`) reloads Skills, Agents, commands, Plugins, and

@@ -8,12 +8,14 @@ import type { DurableRun } from "../services/runtime/types";
 import { registerCleanup } from "../utils/cleanup-registry";
 import { withOfflineRuntime, backupRuntime, restoreRuntime, pruneRuntime, runtimeStorageUsage } from "../services/runtime/maintenance";
 
-const HELP = `Usage: tnb runtime <submit|status|result|list|events|pause|resume|cancel|reconcile|serve|stop|backup|restore|prune|storage> [options]
+const HELP = `Usage: tnb runtime <submit|status|result|list|events|questions|answer|pause|resume|cancel|reconcile|serve|stop|backup|restore|prune|storage> [options]
 
 submit <objective> [--cwd PATH] [--mode single|auto|multi] [--allow-write] [--allow-shell]
   [--check COMMAND]... [--allow-workspace PATH]... [--provider ID] [--model ID]
   [--max-budget-usd N] [--max-turns N] [--command-id ID] [--no-start]
 status|result|events|pause|resume|cancel <run-id>  (result accepts --task TASK-ID)
+questions <run-id>  Show outstanding questions and their versions.
+answer <run-id> --question ID --answer TEXT --version N  Answer without changing permissions.
 reconcile <run-id> --task TASK-ID --operation OPERATION-ID --result CONFIRMED-RESULT
 serve  Run the local owner in the foreground (normally started on demand).
 stop   Drain and stop the service; accepted tasks remain recoverable.
@@ -63,7 +65,7 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
     let result: unknown;
     if (action === "list") result = await runtimeRequest(configDir, "/runs");
     else if (action === "stop") result = await runtimeRequest(configDir, "/command", { action: "stop", commandId: randomUUID() });
-    else if (["status", "events", "result"].includes(action)) result = await runtimeRequest(configDir, `/${action}?runId=${encodeURIComponent(args[1] ?? "")}&after=${value("--after") ?? "0"}&taskId=${encodeURIComponent(value("--task") ?? "")}`);
+    else if (["status", "events", "result", "questions"].includes(action)) result = await runtimeRequest(configDir, `/${action}?runId=${encodeURIComponent(args[1] ?? "")}&after=${value("--after") ?? "0"}&taskId=${encodeURIComponent(value("--task") ?? "")}`);
     else if (action === "submit") {
       const workspace = resolve(value("--cwd") ?? options.cwd);
       const maxCostUsd = value("--max-budget-usd") === undefined ? undefined : Number(value("--max-budget-usd"));
@@ -73,6 +75,12 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
           allowWrite: args.includes("--allow-write"), allowShell: args.includes("--allow-shell"), checks: values("--check"),
           provider: value("--provider"), model: value("--model"), maxCostUsd, maxTurns: Number(value("--max-turns") ?? 200), maxRetries: 3, compactThreshold: 24000 } };
       if (options.originSessionId) Object.assign(body.configuration, { originSessionId: options.originSessionId });
+      try { result = await runtimeRequest(configDir, "/command", body); }
+      catch (error) { throw new Error(`${error instanceof Error ? error.message : String(error)}. Retry identical input with --command-id ${body.commandId}`); }
+    } else if (action === "answer") {
+      const version = Number(value("--version"));
+      if (!value("--question") || !value("--answer") || !Number.isSafeInteger(version) || version < 1) throw new Error("Answer requires --question ID --answer TEXT --version N; read questions first");
+      const body = { action, commandId: value("--command-id") ?? randomUUID(), runId: args[1], waitId: value("--question"), answer: value("--answer"), expectedVersion: version };
       try { result = await runtimeRequest(configDir, "/command", body); }
       catch (error) { throw new Error(`${error instanceof Error ? error.message : String(error)}. Retry identical input with --command-id ${body.commandId}`); }
     } else if (["pause", "resume", "cancel", "reconcile"].includes(action)) result = await runtimeRequest(configDir, "/command", {
@@ -88,10 +96,10 @@ export type RuntimeChatOptions = { args: string[]; cwd: string; workspace: strin
   env: Record<string, string | undefined>; provider: string; model: string; sessionId: string };
 export async function runRuntimeChatCommand(options: RuntimeChatOptions): Promise<string> {
   const args = options.args.length ? [...options.args] : ["list"]; const action = args[0]!;
-  if (!["submit", "list", "status", "result", "events", "pause", "resume", "cancel", "storage"].includes(action)) throw new Error("/runtime supports submit, list, status, result, events, pause, resume, cancel and storage.");
-  const valueFlags = new Set(["--cwd", "--mode", "--check", "--allow-workspace", "--provider", "--model", "--max-budget-usd", "--max-turns", "--command-id", "--config-dir", "--after", "--task"]);
+  if (!["submit", "list", "status", "result", "events", "questions", "answer", "pause", "resume", "cancel", "storage"].includes(action)) throw new Error("/runtime supports submit, list, status, result, events, questions, answer, pause, resume, cancel and storage.");
+  const valueFlags = new Set(["--cwd", "--mode", "--check", "--allow-workspace", "--provider", "--model", "--max-budget-usd", "--max-turns", "--command-id", "--config-dir", "--after", "--task", "--question", "--answer", "--version"]);
   const flags = new Set(["--allow-write", "--allow-shell", "--no-start", "--help", "-h"]);
-  const hasTarget = ["submit", "status", "result", "events", "pause", "resume", "cancel"].includes(action);
+  const hasTarget = ["submit", "status", "result", "events", "questions", "answer", "pause", "resume", "cancel"].includes(action);
   for (let index = hasTarget ? 2 : 1; index < args.length; index++) {
     const flag = args[index]!;
     if (valueFlags.has(flag)) { if (!args[index + 1] || args[index + 1]!.startsWith("--")) throw new Error(`${flag} requires a value`); index++; }
@@ -116,6 +124,8 @@ const LONG_TASK_HELP = `Long tasks · /longtask (aliases: /task, /long, /长任�
   [--check "command"]... [--max-budget-usd N] [--max-turns N]
 /longtask list
 /longtask status|result|events|pause|resume|cancel [run-id]
+/longtask questions [run-id]
+/longtask answer [run-id] --question ID --answer "text" --version N
 
 Starts a durable background task using the current workspace and model.
 Writing requires explicit --allow-write and replay-safe --check commands.
@@ -128,7 +138,7 @@ run-id to select another task. Closing the conversation does not cancel work.
 export async function runLongTaskChatCommand(options: RuntimeChatOptions): Promise<string> {
   let args = [...options.args];
   if (!args.length || args[0] === "help" || args.includes("--help") || args.includes("-h")) return LONG_TASK_HELP;
-  const actions = new Set(["submit", "list", "status", "result", "events", "pause", "resume", "cancel"]);
+  const actions = new Set(["submit", "list", "status", "result", "events", "questions", "answer", "pause", "resume", "cancel"]);
   if (!actions.has(args[0]!)) args.unshift("submit");
   if (args[0] === "submit") {
     const flagAt = args.findIndex((value, index) => index > 0 && value.startsWith("--"));

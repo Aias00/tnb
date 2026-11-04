@@ -18,7 +18,8 @@ export async function runtimePaths(configDir: string): Promise<{ root: string; s
 
 type ServerOptions = { configDir: string; env: Record<string, string | undefined>; signal: AbortSignal; runtime?: DurableRuntime; ready?(socket: string): void };
 export const RUNTIME_CAPABILITIES = Object.freeze({ protocol: 2, defaultMode: "auto", maxDelegationDepth: 2, maxParallelBranches: 4,
-  readOnlyDelegation: true, parallelWrites: false, skills: false, mcp: false, remoteFederation: false, offlineBackup: true, conversationHandoff: true });
+  readOnlyDelegation: true, parallelWrites: false, skills: false, mcp: false, remoteFederation: false, offlineBackup: true, conversationHandoff: true,
+  durableWaits: true, durableDelegation: true, deadlineScheduling: true });
 export async function serveDurableRuntime(options: ServerOptions): Promise<void> {
   const paths = await runtimePaths(options.configDir);
   const release = await lock(paths.root, { realpath: true, stale: 5000, update: 1000, retries: 0 });
@@ -65,6 +66,7 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
             const runId = url.searchParams.get("runId") ?? "";
             if (!store.getRun(runId)) throw new Error("Run not found");
             if (url.pathname === "/events") return Response.json(store.events(runId, Number(url.searchParams.get("after") ?? 0), 100));
+            if (url.pathname === "/questions") return Response.json(runtime.waits.questions(runId));
             if (url.pathname === "/result") {
               const taskId = url.searchParams.get("taskId");
               const tasks = store.tasks(runId).filter((task) => taskId ? task.taskId === taskId : !task.parentTaskId);
@@ -73,12 +75,13 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
                 result: task.resultRef ? await runtime.artifacts.get(task.resultRef) : null }))));
             }
             if (url.pathname === "/status") return Response.json({ run: store.getRun(runId), tasks: store.tasks(runId), budget: runtime.budget.totals(runId),
-              operations: store.operationHeaders(runId) });
+              operations: store.operationHeaders(runId), questions: runtime.waits.questions(runId), waits: runtime.waits.pending(runId) });
             throw new Error("Unknown runtime resource");
           }
           if (request.method !== "POST" || url.pathname !== "/command") throw new Error("Unknown runtime command endpoint");
           const input = await request.json() as { action: string; commandId: string; runId?: string; objective?: string;
-            configuration?: RuntimeConfiguration; mode?: "single" | "auto" | "multi"; taskId?: string; operationId?: string; result?: string };
+            configuration?: RuntimeConfiguration; mode?: "single" | "auto" | "multi"; taskId?: string; operationId?: string; result?: string;
+            waitId?: string; expectedVersion?: number; answer?: string };
           return await serialCommand(async () => {
             if (typeof input.commandId !== "string" || !input.commandId) throw new Error("commandId is required");
             if (input.action === "stop") { setTimeout(() => stopped.resolve(), 20); return Response.json({ stopping: true }); }
@@ -94,7 +97,9 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
               tx.saveRecord({ kind: "http-command", id: input.commandId, runId: run.runId, value }, 0); return value;
             });
             if (receipt.result) return Response.json(receipt.result);
-            if (input.action === "pause") runtime.commands.pauseRun({ commandId: input.commandId, runId: run.runId, expectedRevision: receipt.expectedRevision });
+            if (input.action === "answer") runtime.waits.answer({ commandId: input.commandId, runId: run.runId,
+              waitId: input.waitId!, expectedVersion: input.expectedVersion!, answer: input.answer! });
+            else if (input.action === "pause") runtime.commands.pauseRun({ commandId: input.commandId, runId: run.runId, expectedRevision: receipt.expectedRevision });
             else if (input.action === "cancel") runtime.commands.cancelRun({ commandId: input.commandId, runId: run.runId, expectedRevision: receipt.expectedRevision });
             else if (input.action === "resume") await runtime.resume(run.runId, input.commandId, receipt.expectedRevision);
             else if (input.action === "reconcile") {

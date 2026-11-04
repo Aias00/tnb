@@ -23,6 +23,30 @@ async function fixture(limits?: Partial<StoreLimits>) {
 }
 const definition = (key: string, dependsOn: string[] = []) => ({ key, objective: `Do ${key}`, inputDigest: digestJson({ key }), dependsOn });
 const identity = (attempt: DurableAttempt) => ({ attemptId: attempt.attemptId, ownerId: attempt.ownerId, epoch: attempt.epoch });
+
+test("owner notifications follow committed mutations only and deadlines respect leases and paused Runs", async () => {
+  const f = await fixture(); let changes = 0;
+  const remove = f.store.onChange(() => { changes++; });
+  f.store.command("noop", {}, 1000, () => true); expect(changes).toBe(0);
+  expect(() => f.store.command("rollback", {}, 1000, (tx) => {
+    tx.insertRun({ runId: "rollback", objective: "rollback", revision: 1, status: "active", policy: { mode: "single", maxActiveAgents: 1, maxDelegationDepth: 0 }, createdAt: 1000, updatedAt: 1000 });
+    throw new Error("rollback");
+  })).toThrow("rollback"); expect(changes).toBe(0);
+  const input = { commandId: "due", objective: "Wait for due work" };
+  const { run } = f.commands.createRun(input); expect(changes).toBe(1);
+  f.commands.createRun(input); expect(changes).toBe(1);
+  expect(f.store.nextDueAt()).toBe(1000);
+  const effect = f.store.claimEffects({ ownerId: "owner", now: 1000, leaseMs: 4000 })[0]!;
+  expect(f.store.nextDueAt()).toBe(5000);
+  f.store.settleEffect(effect.effectId, effect.leaseToken!, 1001, 6000);
+  expect(f.store.nextDueAt()).toBe(6000);
+  f.commands.pauseRun({ commandId: "pause-due", runId: run.runId, expectedRevision: run.revision });
+  expect(f.store.nextDueAt()).toBe(1000); // The control row remains eligible.
+  const control = f.store.claimEffects({ ownerId: "owner", now: 1001, leaseMs: 1000 })[0]!;
+  expect(control.kind).toBe("control"); f.store.settleEffect(control.effectId, control.leaseToken!, 1002);
+  expect(f.store.nextDueAt()).toBeUndefined();
+  remove();
+});
 function counts(path: string) {
   const db = new Database(path, { readonly: true });
   try { return Object.fromEntries(["runs", "tasks", "commands", "events", "effects", "attempts"].map((table) =>

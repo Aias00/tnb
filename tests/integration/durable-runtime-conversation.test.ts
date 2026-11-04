@@ -15,7 +15,7 @@ afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await c
 function call(action: string, input: object, id = action): ModelEvent[] { return [{ type: "tool-start", index: 0, id, name: action },
   { type: "tool-input", index: 0, json: JSON.stringify(input) }, { type: "response-end", reason: "tool-use" }]; }
 const done: ModelEvent[] = [{ type: "text", index: 0, text: "已记录" }, { type: "response-end", reason: "end-turn" }];
-async function fixture() {
+async function fixture(workerTransport?: ModelTransport) {
   const root = await mkdtemp(join(tmpdir(), "tnb-durable-chat-")); roots.push(root);
   const workspace = join(root, "workspace"); const configDir = join(root, "config"); const state = join(configDir, "runtime");
   await mkdir(workspace); await mkdir(configDir);
@@ -24,7 +24,7 @@ async function fixture() {
   let finish = Promise.withResolvers<void>();
   const runtime = new DurableRuntime(store, state, async () => ({ model: "fixture", tools: [], maxOutputTokens: 100,
     route: { provider: "fixture", model: "fixture", pricing: { input: 1, output: 1 } }, authorize: async () => ({ behavior: "allow" }),
-    transport: { async *stream(_request, signal) {
+    transport: workerTransport ?? { async *stream(_request, signal) {
       workerCalls++;
       await Promise.race([finish.promise, new Promise<void>((resolve) => {
         if (signal?.aborted) resolve(); else signal?.addEventListener("abort", () => resolve(), { once: true });
@@ -249,4 +249,58 @@ test("bare long-task command shows help without starting or accepting work", asy
     provider: "fixture", model: "fixture", sessionId: "help-session" };
   const help = await runLongTaskChatCommand(options);
   expect(help).toContain("/longtask"); expect(help).toContain("--check"); expect(f.store.runs()).toHaveLength(0); expect(f.workerCalls()).toBe(0);
+});
+
+test("task question/answer slash commands bypass the chat model and reuse the persisted Run", async () => {
+  let calls = 0;
+  const f = await fixture({ async *stream(request) {
+    if (!calls++) yield* call("durable_wait", { kind: "question", key: "choice", question: "数据库用哪个", options: ["SQLite", "其他"], about: "按答案完成报告" });
+    else { expect(JSON.stringify(request.messages)).toContain("SQLite"); yield* done; }
+  } });
+  let output = "", error = "", chatCalls = 0, step = 0;
+  const options = { cwd: f.workspace, workspace: f.workspace, configDir: f.configDir, env: process.env, provider: "fixture", model: "fixture", sessionId: "question-slash" };
+  const code = await runInteractiveCli({ cwd: f.workspace, configDir: f.configDir, env: process.env,
+    argv: ["--provider", "fixture", "--model", "fixture"], sessionIdFactory: () => options.sessionId,
+    transport: { async *stream() { chatCalls++; throw new Error("Slash commands must not invoke the chat model"); } },
+    question: async () => {
+      if (step++ === 0) return '/task "选择存储并完成报告"';
+      if (step === 2) {
+        await until(() => !!f.store.runs()[0] && f.runtime.waits.questions(f.store.runs()[0]!.runId).length === 1);
+        return "/task questions";
+      }
+      if (step === 3) {
+        const question = f.runtime.waits.questions(f.store.runs()[0]!.runId)[0]!;
+        return `/task answer --question ${question.waitId} --answer "SQLite" --version ${question.version}`;
+      }
+      if (step === 4) { await until(() => f.store.runs()[0]?.status === "succeeded"); return "/task result"; }
+      return "/exit";
+    }, stdout: { write: (value) => { output += value; } }, stderr: { write: (value) => { error += value; } } });
+  expect(code).toBe(0); expect(error).toBe(""); expect(chatCalls).toBe(0); expect(calls).toBe(2);
+  expect(output).toContain("数据库用哪个"); expect(output).toContain("report-delivered"); expect(f.store.runs()).toHaveLength(1);
+  const runId = f.store.runs()[0]!.runId;
+  expect(JSON.parse(await runLongTaskChatCommand({ ...options, args: ["questions", runId] }))).toEqual([]);
+});
+
+test("conversational answers require approval, question version and the original workspace scope", async () => {
+  let calls = 0;
+  const f = await fixture({ async *stream() {
+    if (!calls++) yield* call("durable_wait", { kind: "question", key: "chat-choice", question: "继续吗", about: "完成报告" });
+    else yield* done;
+  } });
+  const tool = createDurableTaskTool(f.context);
+  const submitted = JSON.parse(await tool.execute(tool.validate({ action: "submit", key: "answer-test", objective: "Ask before continuing" }), new AbortController().signal) as string);
+  const runId = submitted.run.runId;
+  await until(() => f.runtime.waits.questions(runId).length === 1);
+  const question = f.runtime.waits.questions(runId)[0]!;
+  const answer = { action: "answer", runId, waitId: question.waitId, answer: "继续", expectedVersion: question.version };
+  expect(() => tool.validate({ ...answer, expectedVersion: undefined })).toThrow("version");
+  expect(() => tool.validate({ ...answer, allowWrite: true })).toThrow("expand");
+  const denied = await f.chat((_request, index) => index ? done : call("durable_task", answer), false, false, "回答刚才的问题：继续");
+  expect(denied.approvals).toBe(1); expect(f.runtime.waits.questions(runId)).toHaveLength(1);
+  const other = join(f.root, "answer-other-workspace"); await mkdir(other);
+  const scoped = createDurableTaskTool({ ...f.context, workspace: () => other, roots: () => [other] });
+  await expect(scoped.execute(scoped.validate(answer), new AbortController().signal)).rejects.toThrow("conversation workspace");
+  const accepted = await f.chat((_request, index) => index ? done : call("durable_task", answer), true, true, "回答刚才的问题：继续");
+  expect(accepted.approvals).toBe(1);
+  await until(() => f.store.getRun(runId)?.status === "succeeded"); expect(calls).toBe(2);
 });

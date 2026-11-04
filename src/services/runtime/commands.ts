@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { digestJson, integer, text } from "./json";
 import { RuntimeStore, type RuntimeTransaction } from "./store";
+import { refreshWaits, type DurableWait } from "./waits";
 import { assertTaskTransition, type DurableAttempt, type DurableRun, type DurableTask,
   type ExecutionPolicy, type RuntimeSignal, type TaskStatus, type WaitCondition, type WorkerIdentity } from "./types";
 
@@ -188,6 +189,7 @@ export class RuntimeCommands {
       const previous = run.revision;
       run.status = "cancelling"; run.cancelRequestedAt = tx.now; run.revision++; run.updatedAt = tx.now;
       tx.saveRun(run, previous); tx.event(run.runId, "run.cancel_requested", { revision: run.revision });
+      refreshWaits(tx, run);
       control(tx, run, "cancel");
       // Cleanup/reconciliation belongs to the worker runtime, so this layer never claims cancellation is complete.
       return run;
@@ -234,6 +236,7 @@ function control(tx: RuntimeTransaction, run: DurableRun, action: string): void 
   tx.enqueue({ runId: run.runId, kind: "control", key: "run-control", dueAt: tx.now, data: { runId: run.runId, revision: run.revision, action } });
 }
 export function wakeWaiting(tx: RuntimeTransaction, run: DurableRun): string[] {
+  refreshWaits(tx, run);
   if (run.status !== "active" || run.cancelRequestedAt !== undefined || (run.deadline !== undefined && run.deadline <= tx.now)) return [];
   const woken: string[] = [];
   for (const task of tx.tasks(run.runId)) {
@@ -241,6 +244,10 @@ export function wakeWaiting(tx: RuntimeTransaction, run: DurableRun): string[] {
     if (task.currentAttemptId && tx.getAttempt(task.currentAttemptId)?.status === "active") continue;
     const signal = task.wait && tx.getSignal(run.runId, task.wait.kind, task.wait.key);
     if (task.wait ? !signal || signal.generation <= task.wait.afterGeneration : !task.dependsOn.length) continue;
+    if (task.waitRequestId) {
+      const request = tx.record<DurableWait>("wait", task.waitRequestId)?.value;
+      if (!request || !["answered", "elapsed", "resolved"].includes(request.state)) continue;
+    }
     const previous = task.revision;
     assertTaskTransition(task.status, "ready");
     task.status = "ready"; task.revision++; task.updatedAt = tx.now; delete task.wait;

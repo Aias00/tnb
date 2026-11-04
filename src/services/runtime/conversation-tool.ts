@@ -6,20 +6,21 @@ import { digestJson, text } from "./json";
 import { runtimeRequest } from "./server";
 import { ensureRuntime, assertConversationOwner } from "./client";
 
-export const DURABLE_CONVERSATION_INSTRUCTIONS = "When the user explicitly asks to execute a long-running task durably or in the background, use durable_task submit. Include a self-contained objective and the relevant conversation decisions in context, a stable key, explicit write/Shell grants and replay-safe checks. It creates a separate persistent Run using the current model, with its own disclosed budget; do not use it as an ordinary subagent or to escape this invocation's budget. For progress, results or control, use durable_task with the existing runId. Submission is acceptance, not completion. While the durable task owns this workspace, use its controls and wait for it to release the workspace before local file operations. Never infer completion from submission or promise parallel code writes.";
+export const DURABLE_CONVERSATION_INSTRUCTIONS = "When the user explicitly asks to execute a long-running task durably or in the background, use durable_task submit. Include a self-contained objective and the relevant conversation decisions in context, a stable key, explicit write/Shell grants and replay-safe checks. It creates a separate persistent Run using the current model, with its own disclosed budget; do not use it as an ordinary subagent or to escape this invocation's budget. For progress, results or control, use durable_task with the existing runId. Read questions to show pending decisions; use answer with the question ID and version only for the user's actual decision, never invent an answer. An answer cannot expand permissions or resume a paused Run. Submission is acceptance, not completion. While the durable task owns this workspace, use its controls and wait for it to release the workspace before local file operations. Never infer completion from submission or promise parallel code writes.";
 
 type Request = {
-  action: "submit" | "list" | "status" | "result" | "events" | "pause" | "resume" | "cancel";
+  action: "submit" | "list" | "status" | "result" | "events" | "questions" | "answer" | "pause" | "resume" | "cancel";
   key?: string; runId?: string; objective?: string; context?: string;
   mode?: "single" | "auto" | "multi"; allowWrite?: boolean; allowShell?: boolean;
   checks?: string[]; maxCostUsd?: number; maxTurns?: number; after?: number;
+  waitId?: string; expectedVersion?: number; answer?: string;
 };
 export type ConversationRuntimeContext = {
   configDir: string; env: Record<string, string | undefined>; sessionId: string;
   workspace(): string; roots(): string[]; provider: string; model: string;
 };
-const reads = new Set(["list", "status", "result", "events"]);
-const actions = [...reads, "submit", "pause", "resume", "cancel"];
+const reads = new Set(["list", "status", "result", "events", "questions"]);
+const actions = [...reads, "submit", "pause", "resume", "cancel", "answer"];
 
 /** User-facing main-conversation capability. It is deliberately excluded from child/Skill/Hook tools. */
 export function createDurableTaskTool(context: ConversationRuntimeContext): AgentTool {
@@ -34,11 +35,13 @@ export function createDurableTaskTool(context: ConversationRuntimeContext): Agen
       mode: { type: "string", enum: ["single", "auto", "multi"] }, allowWrite: { type: "boolean" }, allowShell: { type: "boolean" },
       checks: { type: "array", items: { type: "string" }, maxItems: 16 }, maxCostUsd: { type: "number", exclusiveMinimum: 0 },
       maxTurns: { type: "integer", minimum: 1, maximum: 2000 }, after: { type: "integer", minimum: 0 },
+      waitId: { type: "string", description: "Question ID from questions." }, expectedVersion: { type: "integer", minimum: 1 },
+      answer: { type: "string", maxLength: 8000, description: "The user's actual answer; never infer a decision." },
     } },
     validate(value) {
       if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid durable task request");
       const input = value as Request;
-      if (!actions.includes(input.action) || Object.keys(input).some((key) => !["action", "key", "runId", "objective", "context", "mode", "allowWrite", "allowShell", "checks", "maxCostUsd", "maxTurns", "after"].includes(key))) throw new Error("Unsupported durable task action or capability");
+      if (!actions.includes(input.action) || Object.keys(input).some((key) => !["action", "key", "runId", "objective", "context", "mode", "allowWrite", "allowShell", "checks", "maxCostUsd", "maxTurns", "after", "waitId", "expectedVersion", "answer"].includes(key))) throw new Error("Unsupported durable task action or capability");
       if (input.action === "submit") {
         text(input.key!, "handoff key", 128); text(input.objective!, "durable objective");
         if (input.context !== undefined) text(input.context, "conversation context", 16384);
@@ -50,10 +53,15 @@ export function createDurableTaskTool(context: ConversationRuntimeContext): Agen
         if (input.allowShell && !input.allowWrite) throw new Error("Shell requires explicit write authority");
         if (input.maxCostUsd !== undefined && (!Number.isFinite(input.maxCostUsd) || input.maxCostUsd <= 0)) throw new Error("Invalid durable budget");
         if (input.maxTurns !== undefined && (!Number.isSafeInteger(input.maxTurns) || input.maxTurns < 1 || input.maxTurns > 2000)) throw new Error("Invalid turn limit");
-        if (input.runId !== undefined || input.after !== undefined) throw new Error("Submit cannot target an existing Run");
+        if ([input.runId, input.after, input.waitId, input.expectedVersion, input.answer].some((value) => value !== undefined)) throw new Error("Submit cannot target an existing Run or question");
       } else {
         if (input.runId !== undefined) text(input.runId, "Run ID", 128);
-        if (Object.keys(input).some((key) => !["action", "runId", "after"].includes(key))) throw new Error("Control cannot expand an existing Run's authority");
+        const controlFields = input.action === "answer" ? ["action", "runId", "waitId", "expectedVersion", "answer"] : ["action", "runId", "after"];
+        if (Object.keys(input).some((key) => !controlFields.includes(key))) throw new Error("Control cannot expand an existing Run's authority");
+        if (input.action === "answer") {
+          text(input.waitId!, "question ID", 128); text(input.answer!, "question answer", 8000);
+          if (!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion! < 1) throw new Error("Answer requires the current question version");
+        }
         if (input.after !== undefined && (!Number.isSafeInteger(input.after) || input.after < 0 || input.action !== "events")) throw new Error("Invalid event cursor");
       }
       return structuredClone(input);
@@ -85,6 +93,9 @@ export function createDurableTaskTool(context: ConversationRuntimeContext): Agen
       if (!runId || !runs.some((run) => run.runId === runId)) throw new Error("No matching durable Run in this conversation workspace");
       signal.throwIfAborted();
       if (reads.has(input.action)) return JSON.stringify(await runtimeRequest(context.configDir, `/${input.action}?runId=${encodeURIComponent(runId)}&after=${input.after ?? 0}`));
+      if (input.action === "answer") return JSON.stringify(await runtimeRequest(context.configDir, "/command", { action: "answer", runId,
+        waitId: input.waitId, expectedVersion: input.expectedVersion, answer: input.answer,
+        commandId: `chat:${digestJson({ sessionId: context.sessionId, runId, input })}` }));
       return JSON.stringify(await runtimeRequest(context.configDir, "/command", { action: input.action, runId,
         commandId: `chat:${digestJson({ sessionId: context.sessionId, action: input.action, runId, nonce: crypto.randomUUID() })}` }));
     },

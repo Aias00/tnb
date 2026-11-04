@@ -30,6 +30,7 @@ export type DurableTask = {
   currentAttemptId?: string;
   parentTaskId?: string;
   wait?: WaitCondition;
+  waitRequestId?: string;
   resumeState?: "ready" | "waiting" | "validating" | "reconciling";
   checkpointRef?: string;
   candidateRef?: string;

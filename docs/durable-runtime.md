@@ -54,6 +54,8 @@ tnb runtime stop
 /longtask "修复重试逻辑并补测试" --allow-write --allow-shell --check "bun run typecheck"
 /longtask status
 /longtask result
+/task questions
+/task answer --question QUESTION_ID --answer "采用 SQLite，继续" --version 1
 /longtask pause
 /longtask resume
 /longtask cancel RUN_ID
@@ -82,6 +84,27 @@ tnb runtime stop
 
 更新二进制后要重启原来打开的 tnb 对话；如果旧后台 owner 尚在运行，先用 `tnb runtime stop` 停止，再提交。对话入口检查 owner capability，旧服务不会静默忽略工作区筛选、上下文或资源等待协议。已有持久任务保留，重新启动后依原恢复规则处理。
 
+## 持久提问、定时复查与挂起
+
+参考 [agent-autoloop 的固定源码版本](https://github.com/KKKKhazix/agent-autoloop/tree/cecec75be3ca26e6ca1d6833b50152ee9450088d)，采用“一轮不等人”的机制。worker 的 `durable_wait` 工具支持 `question` 和 `timer`：稳定 key 标识一次等待，`about` 保存已完成的工作、剩余步骤和核实条件；定时复查需要带时区的 ISO 时间，且必须早于 Run 截止时间。相同 key、相同输入复用原等待，相同 key 改内容拒绝；新的问题或下一次复查使用新 key。每 Task 最多 256 次等待，每 Run 最多 4096 次。
+
+等待请求先落 SQLite；工具回执经原 journal/transcript 持久化后，Attempt 以 `waiting` 结束，保存检查点并释放模型、worker 资源和工作区租约。该批后续业务工具会被拒绝。**Attempt 结束不表示 Task 完成**，不会因此生成已验收的业务结果。根、中间、叶 Agent 使用同一机制，single 也能提问和定时续接，不需要先开启多 Agent。
+
+```sh
+tnb runtime questions RUN_ID
+tnb runtime answer RUN_ID --question QUESTION_ID --answer "采用 SQLite" --version 1
+```
+
+`/task questions [RUN_ID]` 返回问题、选项、背景、waitId 和 version；`/task answer [RUN_ID] --question ID --answer "回答" --version N` 使用同一接口。自然语言也可读取问题并提交用户明确的决定；`durable_task answer` 经正常审批，模型不得代用户编造答案。回答核对 Run、问题身份与版本；同一回答重复交付只产生一次信号，不同回答或旧版本被拒绝。回答与信号同事务提交，先到的回答不会因稍后才登记 waiting 而丢失。
+
+暂停期间可以保存回答，但不会自动恢复 Run；仍需显式 resume。取消后拒绝迟到回答。用户答案仅是原任务内的继续输入，不能开放写入、Shell 或增加预算。等待期间用户可使用已释放的工作区，恢复时重新读取当前文件，最终仍通过版本绑定的验收。
+
+定时唤醒通过持久 outbox 和信号实现，服务重启扫描已到期条件；不会为了等待时间而调用模型。调度采用状态提交通知与最近到期定时器，保留 30 秒磁盘容量检查，不再每 100 ms 扫描调度队列，也不保留父任务每 25 ms 的轮询。父任务等待子结果时也会结束 Attempt；子任务全部验收后，结果和引用作为持久 continuation 交给原父任务。
+
+同一 Run 的无写入、无验收命令的只读执行可以共享受引用计数保护的工作区租约；最后一个持有者退出才释放。编码与有验收命令的执行仍独占工作区，不会借用已挂起祖先的锁。等待不占活跃 Agent 名额，也不额外领取预算。
+
+该功能复用现有 schema v2 的 records/signals/outbox，没有引入第二套调度或模型循环。旧任务仍受能力指纹检查：工具集、模型或权限与保存指纹不一致时保守停止，需核对并新建 Run，不会自动放宽能力。外部 Webhook 接入、可撤回/编辑的问题、推送通知、任意事件链与跨机器协调未在本次开放。
+
 ## 业务流程与验收
 
 ```mermaid
@@ -109,7 +132,7 @@ Run 接纳、任务、事件、命令回执和调度 outbox 同事务提交。SQ
 
 默认 `auto` 不预建角色。模型可提出一个调查或一批最多四个独立调查，并说明理由；运行时检查 single 约束、祖先身份、深度、授权工作区、任务数和并发额度。每个接纳事件记录只读权限、模式、理由和计划修订号。判定不依赖未经评测的固定收益分数；尚未进行真实付费模型的质量/费用对比，不宣称多 Agent 一定更快或更好。
 
-委派以 `(parent_task_id, key)` 固定业务身份，并核对 prompt/workspace 的输入摘要。相同 key、相同输入沿用已有任务；同 key 改输入会拒绝。父任务等待期间保留恢复身份、释放业务执行槽和模型流槽，子任务验收后才返回结果；父恢复时重新申请并发名额。中间 Agent 使用相同机制，最多到根—中间—叶三级。孙级 Agent 不再获得 `agent` 工具。
+委派以 `(parent_task_id, key)` 固定业务身份，并核对 prompt/workspace 的输入摘要。相同 key、相同输入沿用已有任务；同 key 改输入会拒绝。父任务等待期间结束 Attempt、保留 Task 身份和持久恢复条件，释放执行资源；子任务验收后向原父任务交付结果，父恢复时重新申请并发名额。中间 Agent 使用相同机制，最多到根—中间—叶三级。孙级 Agent 不再获得 `agent` 工具。
 
 子结果通过工具 operation 和 transcript delivery 去重；重启不会重新创建已经接纳的子任务。并行只读批次同事务接纳，失败不会留下半个批次。对子项目的调查只允许显式 `--allow-workspace /path` 注册的工作区，仍使用同一 owner、Run ID、预算和结果关联，不是远端服务间的消息协议。各工作区的报告是其已记录输入版本的证据，不保证多个项目在同一个物理时刻形成联合快照。
 

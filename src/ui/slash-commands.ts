@@ -4,13 +4,13 @@ export const SLASH_COMMANDS = [
   {
     name: "longtask",
     aliases: ["task", "long", "长任务"] as const,
-    usage: '/longtask "objective" [options] | list|status|result|events|pause|resume|cancel [run-id]',
+    usage: '/longtask "objective" [options] | list|status|result|events|questions|answer|pause|resume|cancel [run-id]',
     description: "Submit and manage durable long tasks; aliases: /task, /long and /长任务.",
   },
   {
     name: "runtime",
     aliases: [] as const,
-    usage: '/runtime submit "objective" [options] | list|status|result|events|pause|resume|cancel|storage [run-id]',
+    usage: '/runtime submit "objective" [options] | list|status|result|events|questions|answer|pause|resume|cancel|storage [run-id]',
     description: "Submit durable background tasks, inspect their results, and control their execution.",
   },
   {
