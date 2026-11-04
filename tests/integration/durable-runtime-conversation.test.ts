@@ -211,7 +211,7 @@ test("busy control hooks cannot reuse a prior foreground handler with workspace 
 
 test("long-task slash commands and aliases submit directly without a chat model call", async () => {
   const f = await fixture(); let output = ""; let error = ""; let modelCalls = 0;
-  const answers = ['/longtask "Inspect durable execution" --mode single', "/long status", "/长任务 list", "/exit"];
+  const answers = ['/task "Inspect durable execution" --mode single', "/task status", "/long status", "/长任务 list", "/exit"];
   const code = await runInteractiveCli({ cwd: f.workspace, configDir: f.configDir, env: process.env,
     argv: ["--provider", "fixture", "--model", "fixture"], sessionIdFactory: () => "longtask-session",
     transport: { async *stream() { modelCalls++; throw new Error("Long-task slash commands must bypass model interpretation"); } },

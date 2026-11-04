@@ -110,7 +110,7 @@ export async function runRuntimeChatCommand(options: RuntimeChatOptions): Promis
   return action === "submit" ? `Durable task accepted; it continues in the background. Use /runtime status <run-id> or /runtime result <run-id>.\n${output.trim()}` : output.trim();
 }
 
-const LONG_TASK_HELP = `Long tasks · /longtask (aliases: /long, /长任务)
+const LONG_TASK_HELP = `Long tasks · /longtask (aliases: /task, /long, /长任务)
 
 /longtask "objective" [--mode single|auto|multi] [--allow-write] [--allow-shell]
   [--check "command"]... [--max-budget-usd N] [--max-turns N]

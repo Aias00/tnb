@@ -21,7 +21,7 @@ The Ink session exposes operational commands for the existing runtime instead
 of implementing a second execution path:
 
 - `/longtask "objective" [options]` submits a durable background task using the
-  current workspace and model; `/long` and `/长任务` are aliases. `list`, `status`,
+  current workspace and model; `/task`, `/long` and `/长任务` are aliases. `list`, `status`,
   `result`, `events`, `pause`, `resume`, and `cancel` manage those tasks. Without
   a Run ID, controls prefer the current conversation's latest Run, then the
   workspace's latest Run. Bare `/longtask` shows help without starting work.

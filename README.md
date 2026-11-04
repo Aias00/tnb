@@ -270,7 +270,7 @@ tnb runtime cancel RUN_ID
 You can also say “run this as a durable background task” in a conversation.
 The main Agent uses `durable_task` through the normal permission checks, with the
 current workspace/model and relevant conversation context. Or enter
-`/longtask "objective" --mode auto` directly (`/long` and `/长任务` are aliases).
+`/longtask "objective" --mode auto` directly (`/task`, `/long` and `/长任务` are aliases).
 Use `/longtask status`, `/longtask result`, `/longtask pause` and
 `/longtask resume` to manage the latest task in this conversation;
 `/runtime submit` remains available. While the worker owns the
