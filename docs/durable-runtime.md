@@ -16,7 +16,7 @@ tnb runtime submit '修复重试逻辑，补回归测试并通过类型检查' \
   --cwd /path/to/project --allow-write --allow-shell \
   --check 'bun run typecheck' --check 'bun test' --max-budget-usd 5
 
-# 不允许委派时使用 single；multi 表示优先考虑独立分工，不强制创建角色。
+# 不允许委派时使用 single；当前 multi 与 auto 的准入规则基本相同。
 tnb runtime submit '修复一个边界条件' --cwd /path/to/project --mode single \
   --allow-write --check 'bun test tests/retry.test.ts'
 
@@ -177,6 +177,8 @@ Run 接纳、任务、事件、命令回执和调度 outbox 同事务提交。SQ
 这套机制允许多次压缩续跑，不承诺无限任务、摘要无损或连续数小时稳定性。Provider 的实际窗口必须正确配置；遇到网关实际路由容量小于配置仍可能有限恢复后暂停。每 Task transcript 的 64 MiB 上限、服务存储限制、Run 截止时间、轮次及费用预算仍生效。丢失于摘要中的语义约束应通过原始记录和当前事实复核，最终结果仍由独立验收接纳。
 
 ## 单 Agent 与多 Agent
+
+当前 `single` 已有委派限制；`auto` 与 `multi` 的容量和准入基本相同，尚无 `multi` 优先评估分工的实现步骤。输入续接识别、通用 followup inbox、独立路由决策记录和执行策略差异属于[后续修订设计](superpowers/specs/2026-11-04-task-routing-and-delegation-design.md)，不表示当前已有统一 Router。现有 submit、answer、控制和委派功能仍按下文运行。
 
 默认 `auto` 不预建角色。模型可提出一个调查或一批最多四个独立调查，并说明理由；运行时检查 single 约束、祖先身份、深度、授权工作区、任务数和并发额度。每个接纳事件记录只读权限、模式、理由和计划修订号。判定不依赖未经评测的固定收益分数；尚未进行真实付费模型的质量/费用对比，不宣称多 Agent 一定更快或更好。
 

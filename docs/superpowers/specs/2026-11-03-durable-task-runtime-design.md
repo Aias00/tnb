@@ -1,8 +1,10 @@
 # tnb 长任务运行时与按需 Agent 协作设计
 
-日期：2026-11-03。版本：1.1。状态：已完成文档级审阅及层级恢复补充，可按 P0 开始实现；实现验收尚未开始。
+初版日期：2026-11-03。修订日期：2026-11-04。版本：1.2。状态：P0 与受限只读委派已有实现；新增输入路由、执行策略差异和对应验收要求尚未实现。
 
 审阅基线为 `844f7744c3c8a1961efcbf539b2bc8e155c2d096`，问题与修订见[设计审阅记录](2026-11-03-durable-task-runtime-review.md)。
+
+上述为历史审阅基线。本次路由复核以实现提交 `d7cb45e` 为准，补充规格见[输入路由与委派策略修订](2026-11-04-task-routing-and-delegation-design.md)。该修订明确原第 7.2 节尚未落实的协议与退出条件；本次仅更新文档，不表示已增加 Router 或修改运行行为。
 
 本方案为 tnb 建立统一的持久任务运行时：先保证单 Agent 任务可以中断恢复，再按任务结构选择临时委派、并行工作流或跨工作区协作。用户控制授权、成本和协作偏好；模型提出分工，运行时决定是否准入。本文规定目标行为与实施顺序，不表示下述接口已经实现。
 
@@ -28,6 +30,7 @@ tnb 基线提交为 `49b8586f68582ccb92bacf81162ded0824563998`。设计采用机
 | Claude Code 本地提取 `AgentTool.tsx`、`sessionMemoryCompact.ts` | worktree、后台 Agent、上下文压缩与 Session Memory | 参考隔离与上下文分层；提取版本和功能门控不构成通用恢复保证 |
 | [Superagent 领域模型](https://github.com/deepseek-ai/dsh-superagent-prototype/blob/8c32a9dc5d72c033816c6a8110b37f40cf94fba4/src/core/model.ts#L126) | Ticket、Mandate、Assignment 分离 | 对应工作身份、授权与执行尝试；不原样引入其 GitHub/飞书业务模型 |
 | [Superagent Effects](https://github.com/deepseek-ai/dsh-superagent-prototype/blob/8c32a9dc5d72c033816c6a8110b37f40cf94fba4/src/app/effects.ts#L40) | SQLite 持久副作用队列，顺序、退避和 generation | 事务中保存待办，提交后执行；不能推导外部 exactly-once |
+| [Superagent Router](https://github.com/deepseek-ai/dsh-superagent-prototype/blob/8c32a9dc5d72c033816c6a8110b37f40cf94fba4/src/app/tools/main.ts#L47)、[dispatch](https://github.com/deepseek-ai/dsh-superagent-prototype/blob/8c32a9dc5d72c033816c6a8110b37f40cf94fba4/prompts/dispatch.md#L5) | 原始 Trigger 对应 accept/attach/ignore/stop；关联既有工作需要具体引用，Router 不替 Worker 制订技术方案 | 明确输入归属、决策记录和原文交付协议，与单/多 Agent 执行策略分层；不照搬 IM/GitHub 通信流程 |
 | [Pizza Reactor](https://github.com/pizza-agent/pizza/blob/ffa72f018e35ec556a71299dfede3fa3884cdbcb/src/core/runtime/reactor.ts#L397) | 事件驱动处理模型、工具和回合生命周期 | UI 与执行视图共用提交事件；不把内存 Promise 视作可持久化状态 |
 | [Pizza crash recovery](https://github.com/pizza-agent/pizza/blob/ffa72f018e35ec556a71299dfede3fa3884cdbcb/src/core/runtime/crash-recovery.ts#L135) | 补齐中断工具结果，修复会话配平 | 会话配平与外部效果核对分别实现 |
 | [Pizza checkpoint](https://github.com/pizza-agent/pizza/blob/ffa72f018e35ec556a71299dfede3fa3884cdbcb/src/core/runtime/checkpoint.ts#L27) | 文件清单与哈希；restore 当前只读取清单 | 仅参考指纹；不能作为可恢复文件快照 |
@@ -62,9 +65,10 @@ tnb 当前可复用的边界：
 
 ```mermaid
 flowchart TD
-    C[CLI TUI 客户端] --> A[命令接纳与身份路由]
+    C[CLI TUI 客户端] --> R[输入路由：对话 新任务 续接 回答 控制]
+    R --> A[命令接纳与身份校验]
     A --> D[(SQLite 任务状态 事件 队列)]
-    P[规划 Agent 提交分工建议] --> A
+    P[执行策略：单 Agent 或结构化委派提案] --> A
     D --> S[持久调度器]
     S --> W[有界 Agent Worker]
     W --> T[现有模型与工具运行时]
@@ -168,6 +172,10 @@ P0 的 auto/multi 降为单 Agent 并向客户端报告 capability 限制；P1 �
 ### 7.3 运行中调整
 
 可在没有在途操作的检查点增加、减少或重新分配任务。正在写入的旧 worker 必须排空，或隔离为不能整合的旧 attempt。输入或公共接口变化时，使受影响任务与验证结果失效，创建新工作修订。已付模型费用和旧产物保留。
+
+### 7.4 输入路由与执行策略修订
+
+第 7 节补充：输入路由和执行策略分别接纳；原始输入、路由决定、关联任务与待办同事务提交，followup 在安全工具轮次边界交付，不改写在途调用的 history scope。auto/multi 的可执行差异、模糊归属澄清、任务终态补充输入、跨终端容量及 R01–R09 故障验收，以[2026-11-04 修订规格](2026-11-04-task-routing-and-delegation-design.md)为后续实施依据。这些是待实现要求，不能从旧测试通过推导已经兑现。
 
 ## 8 存储与事务
 
