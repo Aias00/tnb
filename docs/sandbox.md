@@ -120,8 +120,12 @@ has not been locally verified.
 The current runtime has additionally passed full verification directly on a
 Colima Ubuntu 24.04.4 ARM64 VM, as an ordinary UID 501 user: **806 pass / 7 skip /
 0 fail** with `TNB_REQUIRE_NATIVE_SANDBOX=1`, type checking, build, isolated
-installation, nine real Magpie free-group scenarios and a durable-task restart
-flow. This run did not use a privileged container. The skipped tests cover
+installation, the same **29-case functional matrix** used on macOS, and a
+durable-task restart flow. Model-dependent cases used real Magpie free-group
+requests; management commands were checked locally. Supplementary native probes
+verified the read-only strict root, sandboxed PTY input/resize/workspace writes
+and outside-secret isolation, and fail-closed behavior with an unprofiled
+backend. This run did not use a privileged container. The skipped tests cover
 macOS-specific Shell lifecycle behavior and the Windows-specific sandbox case.
 
 The VM initially rejected bubblewrap namespace setup. Its
@@ -136,6 +140,9 @@ tested policy under this explicit prerequisite, rather than universal launch
 availability on an unmodified Ubuntu system. Linux x86_64, other distributions
 and Windows remain outside this local run. The Linux CI job now runs the full
 suite; these changes have not yet been executed by remote GitHub Actions.
+The matrix is not an hours-long soak or exhaustive coverage of all integrations;
+see the [full verification review](superpowers/specs/2026-11-03-durable-task-runtime-review.md#12-linux-完整功能矩阵补齐)
+for evidence, environment corrections, and remaining boundaries.
 
 File tools, Hook commands, plugins, MCP servers and model HTTP calls run in the
 tnb host process or their own runtimes and are outside this shell sandbox.

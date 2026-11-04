@@ -309,6 +309,8 @@ macOS / Bun 1.3.14 最终结果：类型检查、构建通过；要求原生沙�
 
 ## 11 Linux 原生与真实模型补充验证
 
+本节记录首轮验证。下文“9 组、未重跑其余 20 组”和未执行的补充探针是当时状态；第 12 节已补齐同一份 29 组矩阵和原生探针，并保留首轮证据。
+
 本轮使用独立 Colima `tnb-verify` 虚拟机，在 Ubuntu **24.04.4 LTS / Linux 6.8.0-117-generic / aarch64** 内直接执行，使用普通 UID 501，Bun 1.3.14、Node 18.19.1、bubblewrap 0.9.0。没有使用特权容器，没有切换主机默认 Docker context。源代码以 `95512f0` 为基线传入，再同步本轮明确列出的修复；主机和 guest 没有共享整个用户目录。
 
 | 验证项 | 结果 |
@@ -339,3 +341,35 @@ Ubuntu VM 的 AppArmor 默认策略起初拒绝 bubblewrap 设置 UID map。按�
 Linux 本轮真实模型为上述 9 组及 durable 恢复，没有将 macOS 的 29 组真实模型矩阵全部重跑。Linux 上的真实模型自动/手动压缩、Hook/插件、Agent/Plan、工作区分支、公共网页读取和其余 SDK 控制组合等，仍只有本轮 Linux 自动化回归及此前 macOS 真实调用证据；不能据此标为 Linux 真实联通均已完成。
 
 证据根目录为仓库外 `/Volumes/data/tnb-review-2026-11-03/linux/`：verification.json 汇总条件与通过场景；environment.log 记录实际捕获的平台、用户、版本和策略，未取得构建/安装二进制 SHA256；evidence/logs 保存全量回归、构建、安装、fail-closed 与真实调用日志；evidence/live 保存请求/响应、工具回执、终端及状态记录；evidence.tar.gz 是 guest 证据归档。全部必需验证完成、证据归档后发现主机系统盘空间紧张，已停止并删除本轮 VM 和专用 SSH 通道，释放其磁盘占用；原 Docker context 保持 default。额外的根挂载补充探针因主机空间问题未执行，未将其算作通过项。
+
+## 12 Linux 完整功能矩阵补齐
+
+在冻结的产品提交 **`63cb7ac`** 上，重新建立独立 Colima `tnb-full` VM，执行与第 10 节 macOS 相同的 **29 组功能矩阵，最终 29/29 通过**，通过名称集合比较确认没有遗漏。此轮不修改产品代码。Linux 首轮只执行 9 组，不能当作平台完整矩阵；本节补齐该缺口。
+
+环境为 Ubuntu 24.04.4 LTS、Linux 6.8.0-117-generic、ARM64，普通 UID 501，Bun 1.3.14、Node 18.19.1、bubblewrap 0.9.0。直接在 VM 执行，没有使用特权容器。再次执行类型检查、`TNB_REQUIRE_NATIVE_SANDBOX=1` 全量测试、构建及隔离安装，结果 **806 pass / 7 skip / 0 fail，813 tests / 128 files**，其他检查通过。跳过项仍为平台专用测试。实际产物为 Linux ARM64 ELF，构建与安装二进制 SHA256 相同：
+
+```text
+160bd57ca4a810186ba9e53ddbc899421e7e0117d39be2bfc138a4847e4994b0
+```
+
+29 组包括：管理命令、普通 JSON 对话、文件/Notebook/Shell 编码与验收、SDK 允许/拒绝、Plan/显式拒绝、resume/fork/continue、Skill 发现/fork/资源、前台 Agent、结构化输出、自动压缩与恢复、stdio MCP、HTTP MCP、Hook 生命周期、SDK 多轮运行控制、沙箱越界拒绝、文件 symlink 逃逸防护、Task/Todo 工具、隔离 Git worktree、Plan 审批切换、后台 Shell/PTY、语义索引与安全扫描、SDK 有限多轮审批、真实取消、插件信任与工具、公共网页读取、自定义命令展开、文本 REPL 对话与 `/task`、真实 TUI 提问/权限/退出、TUI slash/session/手动压缩/export。管理命令本身无需模型；依赖模型的场景均使用真实请求，并核对结构化执行回执、文件或状态结果。
+
+真实调用仅经守卫转发到已有 Magpie **`group/free-models`**，响应路由出现 `workbuddy-ai/hy3` 和 `tokenharbor/deepseek-v4.1-flash:free`。核心批次 36 次、扩展初测 45 次、终端批次 11 次、三项复测 6 次、durable 7 次，总计 **105 次真实请求**，包含失败与复测。没有复制真实 Provider 凭据到 VM；SSH 通道仅绑定 guest loopback，未更改原 Magpie 路由配置。
+
+扩展批次初测有 3 项未通过，原始失败均保留，修正测试/环境后逐项复测通过：
+
+- 沙箱负向断言原先只识别 macOS 错误文本，Linux 实际返回 `Read-only file system`。改为核对真实 bash `tool-execution-end`、`isError`、EPERM/EACCES/EROFS 对应错误和目标文件不存在。
+- worktree 夹具缺少 Git identity。只在夹具仓库设置 `Verification / verification@localhost`，不修改主机或 guest 全局 Git identity。
+- VM 的 `/etc/resolv.conf` 指向缺失的 systemd-resolved stub，公共 HTTPS 解析失败。备份原链接，确认 DNS 可达后仅在 VM 配置有效解析器；实际读取 example.com 成功，没有绕过 TLS 或 SSRF 检查。
+
+驱动也收紧了成功判断：Task 工具必须有成功执行回执；REPL 临时数据记忆核对最终持久化 assistant 消息，不从包含提示回显的整段终端文本匹配。没有把模型文字中提到工具当作已调用工具。
+
+长任务独立验证实际提问、等待期间不请求模型、关闭前台并重启 owner、恢复原 Task/wait、回答、写文件、原生验收与完成提醒，Run succeeded，约 24 秒、7 次真实请求。补充原生探针验证 strict 根挂载为只读、未授权根路径写入报 EROFS；沙箱 PTY 隐藏工作区外秘密、允许工作区写入、resize 至 90x24 并正常关闭；未获许可的后端副本被 launch probe 拒绝且命令效果不存在。首轮探针驱动误用了 `writePty` 参数 `input`，更正为实际 API 的 `chars` 后执行通过，旧日志保留。
+
+本轮仍需第 11 节所述逐程序 AppArmor `userns` 许可，全局两项 sysctl 保持 `1`。这验证该环境前提下的隔离效果，不保证未配置的 Ubuntu 默认可启动。
+
+证据目录：仓库外 **`/Volumes/data/tnb-review-2026-11-03/linux-full/`**。`verification.json` 汇总全部 29 组证据与请求统计，`matrix.json` 保存基准名称；`evidence.tar.gz` 与 `evidence/` 保留初测、失败、复测、请求/响应、终端及全部原生回归日志；`environment.log` 记录环境、ELF 与两份哈希；`tnb-linux-arm64-63cb7ac.tar.gz` 保存完整安装运行包，归档内二进制亦已校验相同 SHA256。
+
+VM 存储及临时目录均置于 `/Volumes/data/tnb-linux-vm/`，避免继续占用紧张的系统卷。归档完成后关闭本轮专用 SSH 通道并停止 `tnb-full`，保留数据卷中的已停止磁盘供复查；主机默认 Docker context 仍为 `default`，未操作其他用户 VM。
+
+剩余边界：29 组是完整执行已定义矩阵，不是所有功能穷尽覆盖。仍未实际执行连续数小时、多任务并发 soak，真实多层 Workflow/Team/goal loop，第三方 OAuth/IDE/Brave、其余 MCP 协议、图像与多模态、更新/反馈发布，也没有验证 Linux x86_64、其他发行版/内核/挂载组合及 Windows。已有 fixture 和故障注入测试不提升为这些维度的真实联通保证。长任务当前也不开放持久 Skill/MCP 或并行编码能力。
