@@ -1262,6 +1262,7 @@ describe("tnb print mode", () => {
       "enter_plan_mode",
       "exit_plan_mode",
       "skill",
+      "durable_task",
     ]);
   });
 

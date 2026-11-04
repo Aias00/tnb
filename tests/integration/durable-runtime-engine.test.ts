@@ -300,3 +300,24 @@ test("cross-workspace delegation requires explicit authorization and shares the 
   expect((await settled(runtime, run.runId)).status).toBe("succeeded"); expect(f.store.tasks(run.runId)).toHaveLength(2);
   expect(f.store.records("model-request", run.runId)).toHaveLength(3);
 });
+
+test("foreground workspace ownership is a resource wait and consumes neither attempts nor retry budget", async () => {
+  const f = await fixture(report); const { acquireWorkspace } = await import("../../src/services/runtime/workspace");
+  const release = await acquireWorkspace(f.workspace);
+  const { run, tasks } = await f.runtime.submit({ commandId: "foreground-handoff", objective: "Continue after chat", configuration: { ...f.config, maxRetries: 0 } });
+  try {
+    await f.runtime.tick(); await Bun.sleep(1100); await f.runtime.tick();
+    expect(f.store.getRun(run.runId)?.status).toBe("active"); expect(f.store.getTask(tasks[0]!.taskId)?.status).toBe("ready");
+    expect(f.store.activeAttempts(run.runId)).toHaveLength(0); expect(f.store.records("model-request", run.runId)).toHaveLength(0);
+    expect(f.store.record("execution-retries", tasks[0]!.taskId)).toBeUndefined();
+    expect(f.store.events(run.runId).filter((event) => event.type === "task.resource-wait")).toHaveLength(1);
+  } finally { await release(); }
+  expect((await settled(f.runtime, run.runId)).status).toBe("succeeded");
+});
+
+test("an unavailable workspace pauses its Run without stopping other service dispatch", async () => {
+  const f = await fixture(report);
+  const { run } = await f.runtime.submit({ commandId: "missing-workspace", objective: "Handle unavailable workspace", configuration: f.config });
+  await rm(f.workspace, { recursive: true, force: true });
+  expect((await settled(f.runtime, run.runId)).status).toBe("paused"); expect(f.runtime.lastError).toBeUndefined();
+});

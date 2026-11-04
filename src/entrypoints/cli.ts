@@ -205,13 +205,14 @@ import { PermissionController } from "../ui/permission-controller";
 import { QuestionController } from "../ui/question-controller";
 import type { ManagementView, SlashCommandRequest, SlashCommandResult } from "../ui/slash-commands";
 import packageJson from "../../package.json";
+import { createDurableTaskTool, DURABLE_CONVERSATION_INSTRUCTIONS } from "../services/runtime/conversation-tool";
 
 type Writer = { write(text: string): unknown };
 
 const BUILT_IN_TOOL_NAMES = [
   "agent", "ask_user_question", "bash", "bash_input", "bash_kill", "bash_output", "bash_resize",
   "checkpoint_create", "checkpoint_list", "checkpoint_rollback", "codebase_investigator",
-  "complete_task", "cron_create", "cron_delete", "cron_list", "edit", "enter_plan_mode",
+  "complete_task", "cron_create", "cron_delete", "cron_list", "durable_task", "edit", "enter_plan_mode",
   "enter_worktree", "exit_plan_mode", "exit_worktree", "glob", "goal_create", "goal_get",
   "goal_update", "grep", "monitor", "notebook_edit", "read", "schedule_wakeup", "send_message", "skill", "task_create", "task_get",
   "task_list", "task_output", "task_stop", "task_update", "todo_write", "update_topic", "web_fetch",
@@ -254,7 +255,7 @@ export type CliOptions = {
   contextWindowOverride?: number;
 };
 
-type ParsedArguments = {
+export type ParsedArguments = {
   prompt: string;
   provider?: string;
   model?: string;
@@ -1007,13 +1008,21 @@ export async function runCli(options: CliOptions): Promise<number> {
   let completed = false;
   try {
     const parsed = parseArguments(options.argv, options.env);
-    await lockWorkspace(options.cwd);
-    await loadPromptFiles(parsed, options.cwd);
     const configDir =
       options.configDir ?? options.env.TNB_HOME ?? join(homedir(), ".tnb");
     const workspace = options.workspaceState ?? new WorkspaceState(options.cwd);
     applyAdditionalWorkspaceRoots(workspace, parsed.additionalDirectories);
-    for (const root of workspace.roots()) await lockWorkspace(root);
+    try { for (const root of [options.cwd, ...workspace.roots()]) await lockWorkspace(root); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ELOCKED") throw error;
+      const { runtimeRequest } = await import("../services/runtime/server");
+      try { await runtimeRequest(configDir, "/health"); } catch { throw error; }
+      for (const release of workspaceReleases.splice(0).reverse()) await release();
+      const { runRuntimeControlTurn } = await import("../services/runtime/conversation");
+      return await runRuntimeControlTurn(options, parsed, { workspace: workspace.current(), roots: workspace.roots(),
+        prepare: () => prepareInteractiveSession({ parsed, configDir, cwd: options.cwd, sessionIdFactory: options.sessionIdFactory ?? randomUUID }) });
+    }
+    await loadPromptFiles(parsed, options.cwd);
     const [providerCatalog, settings] = await Promise.all([
       loadProviderCatalog({ configDir, env: options.env }),
       loadSettings({ configDir, cwd: options.cwd, ...(parsed.settingsInput ? { additional: parsed.settingsInput } : {}) }),
@@ -1471,7 +1480,8 @@ export async function runCli(options: CliOptions): Promise<number> {
       });
       const prompt = parsed.systemPrompt ?? mainAgentProfile?.prompt ?? defaultPrompt;
       const goalReminder = goalManager.reminder();
-      return [prompt, parsed.appendSystemPrompt, memory.prompt(), sessionMemory.prompt(), goalReminder].filter(Boolean).join("\n\n");
+      return [prompt, parsed.appendSystemPrompt, memory.prompt(), sessionMemory.prompt(), goalReminder,
+        enabledTools.some((tool) => tool.name === "durable_task") ? DURABLE_CONVERSATION_INSTRUCTIONS : undefined].filter(Boolean).join("\n\n");
     };
     const runAgentTask = async ({
       prompt, description, profile, model, runInBackground, name, teamName, taskId, resume, signal, existingRuntimeTaskId, existingAgentId, restoreTranscript,
@@ -1835,9 +1845,11 @@ export async function runCli(options: CliOptions): Promise<number> {
       : undefined;
     const workflowTool = createWorkflowTool(agentTool);
     const planModeTools = createPlanModeTools(permissionModeState);
+    const durableTool = createDurableTaskTool({ configDir, env: options.env, sessionId: session.sessionId,
+      workspace: workspace.current, roots: workspace.roots, provider: selection.provider.id, model: selectedModel });
     const availableTools = skillTool
-      ? [...baseTools, agentTool, workflowTool, ...planModeTools, skillTool]
-      : [...baseTools, agentTool, workflowTool, ...planModeTools];
+      ? [...baseTools, agentTool, workflowTool, ...planModeTools, skillTool, durableTool]
+      : [...baseTools, agentTool, workflowTool, ...planModeTools, durableTool];
     if (options.taskManager && !options.teamRecoveryActive) {
       const recoverTask = async (task: TaskRecord, cause: "recovery" | "message") => {
         const metadata = task.metadata ?? {};
@@ -1929,7 +1941,7 @@ export async function runCli(options: CliOptions): Promise<number> {
       ? undefined
       : createDeferredToolCatalog(tools, {
           threshold: deferredThreshold,
-          eagerNames: ["agent", "skill", "workflow", "enter_plan_mode", "exit_plan_mode", "structured_output"],
+          eagerNames: ["agent", "skill", "workflow", "durable_task", "enter_plan_mode", "exit_plan_mode", "structured_output"],
         });
     if (toolCatalog) {
       toolCatalog.setAuxiliaryTools([createToolSearchTool(toolCatalog)]);
@@ -1948,9 +1960,9 @@ export async function runCli(options: CliOptions): Promise<number> {
         executionContext,
         transport,
         model: selectedModel,
-        tools,
+        tools: tools.filter((tool) => tool.name !== "durable_task"),
         authorize: hookedPermission,
-        systemPrompt: () => systemPromptFor(tools),
+        systemPrompt: () => systemPromptFor(tools.filter((tool) => tool.name !== "durable_task")),
       }),
     });
     const compactThresholdTokens = positiveInteger(
@@ -2409,6 +2421,16 @@ export async function runInteractiveCli(options: InteractiveCliOptions): Promise
       question: options.question,
       write: (text) => void options.stdout.write(text),
       sessionIdFactory: () => sessionId,
+      async handleCommand(input) {
+        if (!/^\/runtime(?:\s|$)/.test(input)) return false;
+        try {
+          const { runRuntimeChatCommand } = await import("./runtime");
+          options.stdout.write(`${await runRuntimeChatCommand({ args: splitCommandWords(input.replace(/^\/runtime\s*/, "")),
+            cwd: options.cwd, workspace: workspaceState.current(), configDir, env: options.env,
+            provider: selection.provider.id, model: selection.model.id, sessionId })}\n`);
+        } catch (error) { options.stderr.write(`tnb: ${error instanceof Error ? error.message : String(error)}\n`); }
+        return true;
+      },
       async runTurn(turn) {
         try {
           const promptContent = await expandMcpPromptInput(
@@ -3176,12 +3198,10 @@ async function runInteractiveSlashCommand(
   context: InteractiveSlashCommandContext,
 ): Promise<SlashCommandResult> {
   if (command.name === "runtime") {
-    const args = splitCommandWords(command.argument); const action = args[0] ?? "list";
-    if (!["list", "status", "result", "events", "pause", "resume", "cancel", "storage"].includes(action)) throw new Error("Use tnb runtime submit from a terminal to create work; /runtime supports list, status, result, events, pause, resume, cancel and storage.");
-    const { runRuntimeCommand } = await import("./runtime"); let output = ""; let error = "";
-    const code = await runRuntimeCommand({ argv: ["runtime", ...(args.length ? args : [action]), "--config-dir", context.configDir], cwd: context.cwd,
-      env: context.env, stdout: { write: (value) => { output += value; } }, stderr: { write: (value) => { error += value; } } });
-    if (code) throw new Error(error.trim()); return { message: output.trim() };
+    const { runRuntimeChatCommand } = await import("./runtime"); const selection = context.currentSelection();
+    return { message: await runRuntimeChatCommand({ args: splitCommandWords(command.argument), cwd: context.cwd,
+      workspace: context.currentWorkspaceRoots()[0] ?? context.cwd, configDir: context.configDir, env: context.env,
+      provider: selection.provider.id, model: selection.model.id, sessionId: command.sessionId }) };
   }
   if (command.name === "about") {
     requireNoCommandArgument(command);

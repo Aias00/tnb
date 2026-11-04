@@ -4,8 +4,8 @@ export const SLASH_COMMANDS = [
   {
     name: "runtime",
     aliases: [] as const,
-    usage: "/runtime [list|status|result|events|pause|resume|cancel|storage] [run-id]",
-    description: "Inspect and control durable tasks owned by the local background service.",
+    usage: '/runtime submit "objective" [options] | list|status|result|events|pause|resume|cancel|storage [run-id]',
+    description: "Submit durable background tasks, inspect their results, and control their execution.",
   },
   {
     name: "help",

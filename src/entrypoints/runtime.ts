@@ -1,9 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { openSync, closeSync, statSync, renameSync } from "node:fs";
-import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { runtimePaths, runtimeRequest, serveDurableRuntime } from "../services/runtime/server";
+import { ensureRuntime } from "../services/runtime/client";
 import { registerCleanup } from "../utils/cleanup-registry";
 import { withOfflineRuntime, backupRuntime, restoreRuntime, pruneRuntime, runtimeStorageUsage } from "../services/runtime/maintenance";
 
@@ -28,7 +27,7 @@ Reconciliation asserts an already observed external result and never reruns the 
 `;
 
 export async function runRuntimeCommand(options: { argv: string[]; cwd: string; env: Record<string, string | undefined>;
-  stdout: { write(value: string): unknown }; stderr: { write(value: string): unknown } }): Promise<number> {
+  originSessionId?: string; stdout: { write(value: string): unknown }; stderr: { write(value: string): unknown } }): Promise<number> {
   const args = options.argv.slice(1); const action = args[0];
   const value = (name: string) => { const index = args.indexOf(name); return index < 0 ? undefined : args[index + 1]; };
   const values = (name: string) => args.flatMap((item, index) => item === name && args[index + 1] ? [args[index + 1]!] : []);
@@ -71,6 +70,7 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
         configuration: { workspace, allowedWorkspaces: [workspace, ...values("--allow-workspace").map((path) => resolve(path))],
           allowWrite: args.includes("--allow-write"), allowShell: args.includes("--allow-shell"), checks: values("--check"),
           provider: value("--provider"), model: value("--model"), maxCostUsd, maxTurns: Number(value("--max-turns") ?? 200), maxRetries: 3, compactThreshold: 24000 } };
+      if (options.originSessionId) Object.assign(body.configuration, { originSessionId: options.originSessionId });
       try { result = await runtimeRequest(configDir, "/command", body); }
       catch (error) { throw new Error(`${error instanceof Error ? error.message : String(error)}. Retry identical input with --command-id ${body.commandId}`); }
     } else if (["pause", "resume", "cancel", "reconcile"].includes(action)) result = await runtimeRequest(configDir, "/command", {
@@ -81,19 +81,28 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
   } catch (error) { options.stderr.write(`tnb runtime: ${error instanceof Error ? error.message : String(error)}\n`); return 1; }
 }
 
-async function ensureRuntime(configDir: string, env: Record<string, string | undefined>): Promise<void> {
-  try { await runtimeRequest(configDir, "/health"); return; } catch { /* No live owner; start one. */ }
-  const paths = await runtimePaths(configDir);
-  try { if (statSync(join(paths.root, "service.log")).size > 4 * 1024 * 1024) renameSync(join(paths.root, "service.log"), join(paths.root, "service.log.1")); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  const log = openSync(join(paths.root, "service.log"), "a", 0o600);
-  const argv = Bun.main.startsWith("/$bunfs/") ? [] : [Bun.main];
-  try { const process = spawn(globalThis.process.execPath, [...argv, "runtime", "serve", "--config-dir", configDir],
-    { env: env as NodeJS.ProcessEnv, detached: true, stdio: ["ignore", log, log] }); process.unref(); }
-  finally { closeSync(log); }
-  const deadline = Date.now() + 10_000;
-  while (Date.now() < deadline) {
-    try { await runtimeRequest(configDir, "/health"); return; } catch { await Bun.sleep(100); }
+/** Direct user slash commands inherit the active conversation's workspace and selected model. */
+export async function runRuntimeChatCommand(options: { args: string[]; cwd: string; workspace: string; configDir: string;
+  env: Record<string, string | undefined>; provider: string; model: string; sessionId: string }): Promise<string> {
+  const args = options.args.length ? [...options.args] : ["list"]; const action = args[0]!;
+  if (!["submit", "list", "status", "result", "events", "pause", "resume", "cancel", "storage"].includes(action)) throw new Error("/runtime supports submit, list, status, result, events, pause, resume, cancel and storage.");
+  const valueFlags = new Set(["--cwd", "--mode", "--check", "--allow-workspace", "--provider", "--model", "--max-budget-usd", "--max-turns", "--command-id", "--config-dir", "--after", "--task"]);
+  const flags = new Set(["--allow-write", "--allow-shell", "--no-start", "--help", "-h"]);
+  const hasTarget = ["submit", "status", "result", "events", "pause", "resume", "cancel"].includes(action);
+  for (let index = hasTarget ? 2 : 1; index < args.length; index++) {
+    const flag = args[index]!;
+    if (valueFlags.has(flag)) { if (!args[index + 1] || args[index + 1]!.startsWith("--")) throw new Error(`${flag} requires a value`); index++; }
+    else if (!flags.has(flag)) throw new Error(`Unexpected argument ${flag}; quote the objective and use supported runtime options`);
   }
-  throw new Error(`Runtime did not start; inspect ${join(paths.root, "service.log")}`);
+  if (action === "submit") {
+    if (!args[1] || args[1].startsWith("--")) throw new Error('Usage: /runtime submit "objective" [--mode auto] [--allow-write --check "command"]');
+    if (!args.includes("--cwd")) args.push("--cwd", options.workspace);
+    if (!args.includes("--provider")) args.push("--provider", options.provider);
+    if (!args.includes("--model")) args.push("--model", options.model);
+  }
+  let output = ""; let error = "";
+  const code = await runRuntimeCommand({ argv: ["runtime", ...args, "--config-dir", options.configDir], cwd: options.cwd,
+    env: options.env, originSessionId: options.sessionId, stdout: { write: (value) => { output += value; } }, stderr: { write: (value) => { error += value; } } });
+  if (code) throw new Error(error.trim());
+  return action === "submit" ? `Durable task accepted; it continues in the background. Use /runtime status <run-id> or /runtime result <run-id>.\n${output.trim()}` : output.trim();
 }

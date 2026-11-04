@@ -166,3 +166,21 @@
 2026-11-03，Bun 1.3.14：类型检查通过；`TNB_REQUIRE_NATIVE_SANDBOX=1 bun test` 为 **745 pass / 2 skip / 0 fail，747 tests，119 files**。两项跳过分别是 Linux capability 和 Windows best-effort 专属原生测试，不是 macOS 沙箱跳过。构建通过，`dist/tnb --version` 为 0.1.0。
 
 编译产物另行端到端验证：`dist/tnb runtime submit` 自动启动独立服务，本地 OpenAI SSE fixture 发出真实 write 调用，写入 `result.txt`，原生沙箱执行显式检查，Run 验收成功，`runtime result` 返回报告和检查证据，最后服务正常停止；共两次本地模型请求，无付费调用。日志和 fixture 验证记录保存在仓库外 `/Volumes/data/tnb-review-2026-11-03/`。这些验证不等同于长时间真实模型的任务质量测试。
+
+## 4 对话触发补充实现审阅
+
+在 `c3d5f8d` 基础上增加主对话 `durable_task`、Ink/终端 REPL 的 `/runtime submit`、来源 session 与对话摘要、按工作区/session 查询，以及后台占用工作区时的控制对话路径。自然语言由模型选择工具；确定命令不依赖模型解释。新建 Run 走现有工具权限链，直接斜杠命令表示用户显式提交；未把一个普通子 Agent 变成无限额度的后台新 Run。
+
+审阅中修正的边界：
+
+- 前台持有工作区时，后台在 outbox 等待，未预留 attempt/费用，也不消耗错误重试额度；丢掉前台回复不会重复创建同 key 的工作。
+- 后台持有工作区时，控制对话使用独立 session 所有权和正常消息/计量/压缩，只有任务控制工具；不能重新打开普通文件、Shell、Skill、MCP 或项目 lifecycle。
+- 子任务只继承祖先**实际已取得**的工作区 lease，不依据“祖先已加入 running Map”推断。避免恢复期间祖先尚未取锁、后代已越过资源检查的窗口。
+- Plan 状态从历史工具结果恢复，deny/ask 和显式拒绝继续生效；主对话工具不进入子 Agent/fork Skill/Hook agent 的目录。
+- 复用交互 Hook 时 fork 当前配置，替换其旧模型 handler：控制 Hook 仅能使用本轮受计量、无业务工具的模型；请求工作区工具的 Hook 返回阻塞，不复用旧 invocation 的闭包。已有工具前/后置、权限和停止 Hook 保留；不启动第二组文件 watcher。用户信任的 command/http Hook 仍属于宿主代码边界。
+- 对话工具只能查询/控制当前规范工作区的 Run；默认优先匹配当前来源 session。旧 owner 没有 `conversationHandoff` capability 时，在查询和提交前拒绝，避免旧服务忽略筛选条件或对话上下文。
+- 不可用工作区只暂停对应 Run，不把服务整体标成 fatal。斜杠命令继承当前 Provider/model，拒绝无法解释的额外参数；上下文和配置不兼容时仍使用原协议保守拒绝。
+
+回归覆盖自然语言工具交接、前台释放后执行、忙碌时查进度、拒绝授权、Plan、重复 key、跨工作区拒绝、暂停/恢复不重复新建、子 Agent 不暴露工具、旧 owner 拒绝、历史 Plan 恢复、旧 Hook handler 不越权，以及真正的终端 REPL 斜杠路由。对话摘要有 16 KiB 上限，独立 Run 的预算会单独记录；本轮没有增加运行中修改目标或动态扩大授权的消息协议。
+
+补充验证：macOS / Bun 1.3.14 类型检查和构建通过；完整原生沙箱测试 **758 pass / 2 skip / 0 fail，760 tests / 120 files**。两项跳过仍为 Linux/Windows 专属场景。编译后的 `dist/tnb` 使用真实双向 stream-json 对话，经一次 `can_use_tool` 确认提交，自动启动独立 owner；同一 session 下一轮在工作区忙碌时只有控制工具，能查询原 Run；关闭对话后后台继续，最终交付并验收成功。持久记录保留来源 session 和 SQLite 设计上下文，未重复创建工作。全部模型请求来自本地 SSE fixture，无付费调用。验证文件位于仓库外 `/Volumes/data/tnb-review-2026-11-03/conversation-*.log` 和 `compiled-conversation-smoke.json`。

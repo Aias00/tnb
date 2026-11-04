@@ -11,6 +11,7 @@ export type ReplOptions = {
   question(prompt: string): Promise<string>;
   write(text: string): void;
   runTurn(turn: ReplTurn): Promise<number>;
+  handleCommand?(input: string): Promise<boolean>;
   sessionIdFactory(): string;
 };
 
@@ -22,6 +23,7 @@ export async function runRepl(options: ReplOptions): Promise<number> {
     const input = (await options.question("› ")).trim();
     if (!input) continue;
     if (input === "/exit" || input === "/quit") return 0;
+    if (await options.handleCommand?.(input)) continue;
     const exitCode = await options.runTurn({ prompt: input, sessionId, resume: hasRun });
     if (exitCode === 0) hasRun = true;
   }

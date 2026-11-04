@@ -267,6 +267,13 @@ tnb runtime resume RUN_ID
 tnb runtime cancel RUN_ID
 ```
 
+You can also say “run this as a durable background task” in a conversation.
+The main Agent uses `durable_task` through the normal permission checks, with the
+current workspace/model and relevant conversation context. Or enter
+`/runtime submit "objective" --mode auto` directly. While the worker owns the
+workspace, chat retains task controls and text conversation; file tools resume
+after ownership is released.
+
 The default `auto` mode starts with one Agent and can admit bounded, independent
 read-only investigations. `--mode single` forbids delegation; writable child
 Agents and remote federation are not enabled. Results require runtime acceptance;

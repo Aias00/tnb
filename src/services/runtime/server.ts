@@ -18,7 +18,7 @@ export async function runtimePaths(configDir: string): Promise<{ root: string; s
 
 type ServerOptions = { configDir: string; env: Record<string, string | undefined>; signal: AbortSignal; runtime?: DurableRuntime; ready?(socket: string): void };
 export const RUNTIME_CAPABILITIES = Object.freeze({ protocol: 2, defaultMode: "auto", maxDelegationDepth: 2, maxParallelBranches: 4,
-  readOnlyDelegation: true, parallelWrites: false, skills: false, mcp: false, remoteFederation: false, offlineBackup: true });
+  readOnlyDelegation: true, parallelWrites: false, skills: false, mcp: false, remoteFederation: false, offlineBackup: true, conversationHandoff: true });
 export async function serveDurableRuntime(options: ServerOptions): Promise<void> {
   const paths = await runtimePaths(options.configDir);
   const release = await lock(paths.root, { realpath: true, stale: 5000, update: 1000, retries: 0 });
@@ -54,7 +54,14 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
           const url = new URL(request.url);
           if (request.method === "GET") {
             if (url.pathname === "/health") return Response.json({ ready: !runtime.lastError, pid: process.pid, error: runtime.lastError, capabilities: RUNTIME_CAPABILITIES });
-            if (url.pathname === "/runs") return Response.json(store.runs());
+            if (url.pathname === "/runs") {
+              const workspace = url.searchParams.get("workspace"); const sessionId = url.searchParams.get("sessionId");
+              return Response.json(store.runs().filter((run) => {
+                if (!workspace && !sessionId) return true;
+                const config = store.record<RuntimeConfiguration>("configuration", run.runId)?.value;
+                return (!workspace || config?.workspace === workspace) && (!sessionId || config?.originSessionId === sessionId);
+              }));
+            }
             const runId = url.searchParams.get("runId") ?? "";
             if (!store.getRun(runId)) throw new Error("Run not found");
             if (url.pathname === "/events") return Response.json(store.events(runId, Number(url.searchParams.get("after") ?? 0), 100));
