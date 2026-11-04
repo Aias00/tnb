@@ -3,6 +3,8 @@ import { describe, expect, test } from "bun:test";
 import { createAnthropicTransport } from "../../src/providers/anthropic";
 import { createOpenAITransport } from "../../src/providers/openai";
 import type { ModelEvent, ModelRequest } from "../../src/providers/types";
+import { runAgentLoop } from "../../src/core/agent-loop";
+import { defineTool } from "../../src/core/tool";
 
 const request: ModelRequest = {
   model: "test-model",
@@ -24,6 +26,34 @@ async function collect(stream: AsyncGenerator<ModelEvent>) {
 }
 
 describe("provider transports", () => {
+  test("mixed reasoning, text and fragmented tool calls keep distinct blocks through a real Agent loop", async () => {
+    let calls = 0; const executed: string[] = [];
+    const transport = createOpenAITransport({ fetch: async () => {
+      if (calls++) return sseResponse([
+        { choices: [{ delta: { reasoning_content: "Both files checked." }, finish_reason: null }] },
+        { choices: [{ delta: { content: "Finished report" }, finish_reason: "stop" }] },
+      ]);
+      return sseResponse([
+        { choices: [{ delta: { reasoning_content: "I will inspect the files." }, finish_reason: null }] },
+        { choices: [{ delta: { content: "Inspecting two files." }, finish_reason: null }] },
+        { choices: [{ delta: { tool_calls: [{ index: 0, id: "first" }, { index: 1, id: "second", function: { name: "read", arguments: '{"path":"b' } }] }, finish_reason: null }] },
+        { choices: [{ delta: { reasoning_content: " Preserve both calls.", tool_calls: [{ index: 0, function: { name: "read", arguments: '{"path":"a"}' } }, { index: 1, function: { arguments: '"}' } }] }, finish_reason: null }] },
+        { choices: [{ delta: {}, finish_reason: "tool_calls" }] },
+      ]);
+    } });
+    const result = await runAgentLoop({ transport, model: "fixture", prompt: "Inspect files", maxTurns: 3,
+      authorize: async () => ({ behavior: "allow" }), tools: [defineTool<{ path: string }>({ name: "read", description: "Read", access: "read",
+        inputSchema: { type: "object", properties: { path: { type: "string" } } }, isReadOnly: () => true, isConcurrencySafe: () => false,
+        validate: (input) => input as { path: string }, execute: async (input) => { executed.push(input.path); return input.path; } })] });
+    expect(executed).toEqual(["a", "b"]);
+    expect(result.messages[1]!.content).toEqual([
+      { type: "thinking", thinking: "I will inspect the files. Preserve both calls." },
+      { type: "text", text: "Inspecting two files." },
+      { type: "tool-use", id: "first", name: "read", input: { path: "a" } },
+      { type: "tool-use", id: "second", name: "read", input: { path: "b" } },
+    ]);
+    expect(result.messages.at(-1)!.content).toEqual([{ type: "thinking", thinking: "Both files checked." }, { type: "text", text: "Finished report" }]);
+  });
   test("converts Anthropic SSE into canonical events", async () => {
     let body: Record<string, unknown> | undefined;
     const transport = createAnthropicTransport({

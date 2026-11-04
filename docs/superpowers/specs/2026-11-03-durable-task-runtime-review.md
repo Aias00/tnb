@@ -243,3 +243,20 @@ macOS / Bun 1.3.14 最终验证：类型检查、构建通过；要求原生沙�
 编译后的 `dist/tnb` 使用真实 CLI、独立 owner 和本地 SSE 模型走通：极小预算在模型请求前阻止执行并主动提醒；同 command ID 重复续期只生效一次，预算更新后仍暂停；显式恢复、直接回答问题，原 Run 验收成功并自动提醒；在对话内 restart 更换 owner 后不重复完成提示。全程 2 次本地 worker 请求、0 次聊天模型请求、无付费调用。证据在仓库外 `p0-*.log`、`compiled-runtime-p0-smoke.ts/.log/.json`。
 
 后续仍包括系统桌面通知/系统服务托管、持久里程碑与防空转、业务级验收清单、失败分支隔离与公平调度、持久 Skill/MCP 和隔离并行编码。本轮不将这些后续能力标记为已完成。
+
+## 9 Magpie free 分组真实启动验证
+
+本轮经用户明确授权，在 macOS 上使用现有 Magpie 网关的 `group/free-models` 做真实模型调用。保留原分组成员、顺序路由和 turn affinity，不切换付费模型，不修改 Magpie 配置。最终成功流程的 5 次请求均 HTTP 200，响应头实际路由为 `workbuddy-ai/hy3`。没有为该路由虚构零价格；未配置美元预算，费用硬限额不在本次验证范围内。记录的 UTC 时间为 2026-11-04 03:30，当地日期仍为 2026-11-03。
+
+真实调用发现并修复了两处本地模拟没有覆盖的问题：
+
+- OpenAI Chat 流的 reasoning、text 和 `tool_calls[0]` 原来共用 canonical index 0，AgentLoop 因块类型冲突抛出 `Stream block type changed`。现在按内容类别和工具的 wire index 分配独立 canonical index，保留分片身份和参数拼接。回归通过真实 AgentLoop 同时覆盖思考、正文和两个身份分片完成顺序不同的工具调用，没有放宽块类型校验。
+- durable Worker 的系统提示缺少实际工作目录，模型曾尝试写入虚构的 `/workspace/startup-proof.txt`。路径守卫拒绝，未知副作用屏障使任务暂停，没有越界写入。现在每个 Task 的系统提示均包含自身规范工作目录和文件路径规则；回归覆盖从提示中的目录生成绝对路径完成写入，以及跨工作区子任务收到自己的目录。保持原权限、沙箱和未知效果核对规则。
+
+最终使用重新构建的 `dist/tnb`、生产 Worker、独立 owner 和真实终端 REPL 走通：`/task` 以 single 模式提交 → 自动呈现持久问题 → 关闭对话并重启 owner → 新对话自动补提问 → 直接输入选项编号 → 模型写入文件 → 已授权命令在原生沙箱内验收 → 自动完成提醒。重启前后 Task ID 和 wait ID 相同，等待期间重启没有新增模型请求；没有手动查询问题或运行回答命令，也没有调用聊天解释模型。最终 Run 为 succeeded，acceptance 为 verification-commands，真实文件内容逐字节为 `TNB_FREE_LIVE_OK\n`，验收命令 `/usr/bin/grep -Fxq TNB_FREE_LIVE_OK startup-proof.txt` 成功。用时约 24 秒，测试创建的对话、owner 和转发器均已停止。
+
+本次以实际文件和宿主验收作为成功依据：模型先做了只读检查，没有严格遵守“第一步提问”，最终报告仍误写 `/workspace/startup-proof.txt` 并声称第一步已提问。这些属于报告准确性和指令遵循的剩余问题，不能用模型自述作为通过证据。本次覆盖短时单 Agent 的完整执行和等待重启恢复，不能代表数小时稳定性、所有分组成员或真实模型多层委派均已验证。
+
+最终 macOS / Bun 1.3.14 验证：类型检查、构建通过；要求原生沙箱的完整回归 **802 pass / 2 skip / 0 fail，804 tests / 125 files**。两项跳过为其他平台专属测试。两处缺陷均先通过回归复现，再验证修复。前两轮失败证据保留，未将其隐藏或重新归类为成功。
+
+测试程序为仓库外 `/Volumes/data/tnb-review-2026-11-03/magpie-free-live.ts`，本地转发器仅允许所选 free 分组和最多 12 次请求，原样转发真实上游响应；每次请求 120 秒、整体 330 秒边界。成功证据在 `/Volumes/data/tnb-review-2026-11-03/magpie-free-live-2026-11-04T03-30-01-645Z/`，包括 summary.json、requests.json、events.jsonl、result.json、原始响应和终端日志。失败证据分别在同级 `03-20-34-156Z` 和 `03-23-59-728Z` 目录。完整回归日志为 magpie-live-full-tests.log；未向第三方发送消息或通知。

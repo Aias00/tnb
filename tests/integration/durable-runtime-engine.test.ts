@@ -68,10 +68,12 @@ test("real Agent loop delivers and accepts a versioned report through durable sc
 
 test("coding changes are accepted only after a real tool effect and explicit verification", async () => {
   let request = 0; let checks = 0;
-  const transport: ModelTransport = { async *stream() {
+  const transport: ModelTransport = { async *stream(input) {
+    const workspace = /^Working directory: (.+)$/m.exec(input.systemPrompt ?? "")?.[1];
+    expect(workspace).toBe(await import("node:fs/promises").then((fs) => fs.realpath(f.workspace)));
     if (++request === 1) {
       yield { type: "tool-start", index: 0, id: "write-one", name: "write" };
-      yield { type: "tool-input", index: 0, json: JSON.stringify({ path: "result.ts", content: "export const value = 42;\n" }) };
+      yield { type: "tool-input", index: 0, json: JSON.stringify({ path: join(workspace!, "result.ts"), content: "export const value = 42;\n" }) };
       yield { type: "response-end", reason: "tool-use" };
     } else { yield { type: "text", index: 0, text: "Implemented value" }; yield { type: "response-end", reason: "end-turn" }; }
   } };
@@ -316,6 +318,7 @@ test("cross-workspace delegation requires explicit authorization and shares the 
       yield { type: "response-end", reason: "tool-use" };
     } else {
       if (context.task.parentTaskId) expect(context.configuration.workspace).toBe(await import("node:fs/promises").then((fs) => fs.realpath(other)));
+      expect(request.systemPrompt).toContain(`Working directory: ${context.configuration.workspace}\n`);
       yield { type: "text", index: 0, text: "cross-workspace evidence" }; yield { type: "response-end", reason: "end-turn" };
     }
   } } })); await runtime.start();
