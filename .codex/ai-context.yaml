@@ -1,0 +1,5 @@
+project: tnb
+global_knowledge:
+  - canonical-memory-authority
+local_exceptions: []
+task_authority_registry: .codex/task-authority

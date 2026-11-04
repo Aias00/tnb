@@ -32,7 +32,8 @@ describe('custom renderer PTY lifecycle', () => {
       expect(output).toContain('\u001b[?1049h')
       expect(output).toContain('\u001b[?1006h')
       expect(output).toContain('fixture-model')
-      expect(output).toContain('[Pasted text #1 +3 lines]')
+      // Neutral text lets the renderer encode single spaces as cursor advances.
+      expect(output.replaceAll('\u001b[1C', ' ')).toContain('[Pasted text #1 +3 lines]')
       expect(output).not.toContain('[200~')
       expect(output).not.toContain('[201~')
       expect(output).not.toContain('�')

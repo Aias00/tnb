@@ -49,7 +49,8 @@ of implementing a second execution path:
   older match, Enter accepts it into the prompt, and Esc restores the original
   input;
 - `~/.tnb/keybindings.json` can override `historySearch`, `transcriptSearch`,
-  `externalEditor`, `toggleTranscript`, `toggleTasks`, and `pasteImage` under a
+  `externalEditor`, `toggleTranscript`, `toggleTasks`, `pasteImage`, `promptQueue`,
+  `previousTool`, `nextTool`, and `toggleTool` under a
   `bindings` object. Set an action to `null` to disable it. Ctrl+C and Esc remain
   fixed safety controls;
 - the status line shows the latest Provider-reported input as a percentage of
@@ -109,3 +110,30 @@ metadata for compatibility and future permission presentation; it does not
 silently grant or remove tools.
 
 Use `/commands` to inspect the effective command catalog and any load failures.
+
+
+### Queue, tool cards and session browsing
+
+- `Ctrl+Q`: preview queued prompts; Up/Down selects, Enter/E retrieves for editing,
+  D/Delete removes, PgUp/PgDn scrolls the preview, and Esc closes. The current draft
+  is protected from overwrite. Pending prompts wait while this panel is open.
+- `Alt+Up/Down`: select a tool card; `Alt+Enter` or clicking the card toggles its
+  output independently. `Ctrl+O` toggles all output. These bindings are configurable.
+- In `/sessions`, press `/` to search the displayed list by title, prompt or ID.
+  Enter applies the filter; Enter on the selected item resumes it. PgUp/PgDn
+  scrolls the preview. `/sessions <query>` also searches older history.
+- `Ctrl+K/U/W` cuts prompt text; `Ctrl+Y` restores it and `Alt+Y` cycles cuts.
+  Image references remain atomic and can be removed with Backspace.
+
+### File selection and change review
+
+Typing `@` opens a workspace file menu; `@widget` can find `src/widget.ts`.
+Up/Down selects and Tab/Enter accepts, without sending the prompt. Completion
+uses the token at the cursor and retains following text. Paths with spaces are
+quoted. Dotfiles require an explicit dot prefix. `@` references insert paths
+rather than automatically attaching file content.
+
+`/diff` opens a read-only list of working-tree changes, including staged and
+untracked files. Up/Down selects a file, PgUp/PgDn scrolls its patch, Enter toggles
+a full-width preview, Esc returns/closes, and R refreshes. `/diff "file name"`
+opens a single changed file. Reviewing does not alter files or the Git index.

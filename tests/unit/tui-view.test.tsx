@@ -7,6 +7,27 @@ import { createTuiState, reduceTuiState } from "../../src/ui/tui-state";
 import { createTranscriptEntry } from "../../src/ui/transcript/model";
 
 describe("Ink TUI view", () => {
+  test("keeps the conversation visible while editing a long prompt", () => {
+    let state = reduceTuiState(createTuiState("test-model", "default"), { type: "submit", text: "Keep this conversation visible" });
+    state = reduceTuiState(state, { type: "turn-complete" });
+    const input = Array.from({ length: 30 }, (_, i) => `draft row ${i}`).join("\n");
+    const frame = renderToString(<TuiView state={state} input={input} cursor={input.length} columns={100} rows={24} />);
+    expect(frame).toContain("Keep this conversation visible");
+    expect(frame).toContain("draft row 29");
+    expect(frame).not.toContain("draft row 0");
+  });
+
+  test("shows the selected slash command and busy queue controls", () => {
+    const state = reduceTuiState(createTuiState("test-model", "default"), { type: "submit", text: "first" });
+    const frame = renderToString(<TuiView state={state} input="/" cursor={1} columns={120} commandSuggestions={[
+      { name: "help", description: "Show help", usage: "/help" },
+      { name: "model", description: "Choose model", usage: "/model" },
+    ]} commandSuggestionIndex={1} queuedPromptCount={2} />);
+    expect(frame).toContain("❯ /model");
+    expect(frame).toContain("2 queued");
+    expect(frame).toContain("enter queue");
+  });
+
   test("renders transcript, streaming text, tool progress, input, and status", () => {
     let state = reduceTuiState(createTuiState("test-model", "default"), {
       type: "submit",
@@ -369,7 +390,7 @@ describe("Ink TUI view", () => {
   });
 
   test("keeps the selected session and its input preview visible in a long list", () => {
-    const items = Array.from({ length: 12 }, (_, index) => ({
+    const items = Array.from({ length: 40 }, (_, index) => ({
       id: `session-${index}`,
       label: `Session ${index}`,
       command: `/resume session-${index}`,
@@ -383,12 +404,12 @@ describe("Ink TUI view", () => {
         columns={100}
         rows={20}
         management={{ kind: "sessions", title: "Resume session", items }}
-        managementSelection={10}
+        managementSelection={35}
       />,
     );
 
-    expect(frame).toContain("Session 10");
-    expect(frame).toContain("Historical input 10");
+    expect(frame).toContain("Session 35");
+    expect(frame).toContain("Historical input 35");
     expect(frame).not.toContain("Session 0");
   });
 
@@ -421,7 +442,7 @@ describe("Ink TUI view", () => {
     expect(frame).toContain("Conversation preview");
     expect(frame).toContain("Configure Yuanjing");
     expect(frame).toContain("Provider configured");
-    expect(frame).toContain("Read(models.json)");
+    expect(frame).toContain("Read (models.json)");
     expect(frame).toContain("R rename · F fork · D delete");
     expect(frame).toContain("New title: New provider title");
   });
@@ -672,7 +693,7 @@ describe("Ink TUI view", () => {
         input=""
         cursor={0}
         columns={120}
-        rows={40}
+        rows={80}
         verboseTranscript
       />,
       { columns: 120 },

@@ -26,3 +26,33 @@ describe("prompt editor state", () => {
     expect(stash.stash(createPromptEditorState())).toEqual(second);
   });
 });
+
+test("real prompt editor supports cut/yank and restores whole pasted references", () => {
+  const { clearKillRing } = require("../../src/ui/input/cursor");
+  const { expandPromptReferences } = require("../../src/ui/prompt-input/references");
+  clearKillRing();
+  let state = createPromptEditorState("hello world");
+  state = applyPromptEditorAction(state, { type: "kill-word", columns: 80 });
+  expect(state.value).toBe("hello ");
+  state = applyPromptEditorAction(state, { type: "yank", columns: 80 });
+  expect(state.value).toBe("hello world");
+  state = applyPromptEditorAction({ ...state, cursorOffset: 5 }, { type: "kill-line-end", columns: 80 });
+  expect(state.value).toBe("hello");
+  state = applyPromptEditorAction(state, { type: "yank", columns: 80 });
+  expect(state.value).toBe("hello world");
+
+  state = applyPromptEditorAction(createPromptEditorState(), { type: "paste-text", text: "alpha\nbeta\ngamma\ndelta" });
+  clearKillRing();
+  state = applyPromptEditorAction(state, { type: "kill-word", columns: 80 });
+  expect(state.value).toBe("");
+  state = applyPromptEditorAction(state, { type: "yank", columns: 80 });
+  expect(expandPromptReferences(state.value, state.pastedContents).expanded).toBe("alpha\nbeta\ngamma\ndelta");
+});
+
+
+test("text-only cut shortcuts keep image attachments intact", () => {
+  const state = applyPromptEditorAction(createPromptEditorState(), { type: "paste-image", path: "screenshot.png", mediaType: "image/png" });
+  const cut = applyPromptEditorAction(state, { type: "kill-word", columns: 80 });
+  expect(cut.value).toBe(state.value);
+  expect(cut.pastedContents).toEqual(state.pastedContents);
+});

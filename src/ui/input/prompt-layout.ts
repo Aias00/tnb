@@ -15,7 +15,7 @@ export type PromptLayout = {
 };
 
 export function promptContentColumns(terminalColumns: number, mode?: string): number {
-  const borderAndPaddingColumns = 4;
+  const borderAndPaddingColumns = 6;
   const pointerColumns = 2;
   const modeColumns = mode ? stringWidth(`[${mode}] `) : 0;
   return Math.max(2, terminalColumns - borderAndPaddingColumns - pointerColumns - modeColumns);

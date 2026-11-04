@@ -1,6 +1,7 @@
 import React, { memo, useCallback, useEffect, useRef, useState } from "react";
 import figures from "figures";
-import { Box, ScrollBox, Text, type DOMElement, type ScrollBoxHandle } from "./ink/index";
+import stripAnsi from "strip-ansi";
+import { Box, ScrollBox, Text, type DOMElement, type ScrollBoxHandle, useInput } from "./ink/index";
 
 import type { PermissionAskRequest, PermissionMode, PermissionPromptDecision } from "../core/permissions";
 import { Markdown } from "./markdown";
@@ -18,10 +19,15 @@ import type { TranscriptSearchState } from "./transcript/search";
 import type { ShellRuntimeSnapshot } from "../services/shell/manager";
 import type { InputHistorySearch } from "./input-buffer";
 import { buildPromptLayout, promptContentColumns, type PromptLayout } from "./input/prompt-layout";
+import { DEFAULT_KEYBINDINGS, type KeybindingMap } from "./keybindings";
+import { KeybindingProvider, useKeybindingLabel } from "./keybinding-context";
+import type { PromptInputSubmit } from "./prompt-input/types";
 import { Ansi } from "./ink/Ansi";
+import { AccentProvider, UI_COLORS, useAccent } from "./theme";
 
 export type TuiViewProps = {
   state: TuiState;
+  keybindings?: KeybindingMap;
   input: string;
   cursor: number;
   columns: number;
@@ -36,9 +42,21 @@ export type TuiViewProps = {
   inputCompletions?: string[];
   inputCompletionIndex?: number;
   completionNotice?: string;
+  commandSuggestionIndex?: number;
+  queuedPromptCount?: number;
+  queuedPrompts?: readonly PromptInputSubmit[];
+  queuePanel?: boolean;
+  queueSelection?: number;
+  entryExpansion?: Readonly<Record<string, boolean>>;
+  onToggleEntry?(id: string): void;
+  activityLabel?: string;
+  turnStartedAt?: number;
+  sessionFilter?: string;
+  sessionFilterEditing?: boolean;
   tasks?: readonly TaskRecord[];
   management?: ManagementView;
   managementSelection?: number;
+  managementDetailOnly?: boolean;
   sessionAction?: { type: "rename" | "delete"; input: string };
   vimMode?: boolean;
   vimInsert?: boolean;
@@ -53,11 +71,12 @@ export type TuiViewProps = {
   shellPanel?: boolean;
   shellSelection?: number;
   shellInput?: string;
-  onPromptClick?(row: number, column: number): void;
+  onPromptClick?(row: number, column: number, maxVisibleLines?: number): void;
 };
 
 export const TuiView = memo(function TuiView({
   state,
+  keybindings = DEFAULT_KEYBINDINGS,
   input,
   cursor,
   columns,
@@ -72,13 +91,25 @@ export const TuiView = memo(function TuiView({
   inputCompletions = [],
   inputCompletionIndex = 0,
   completionNotice,
+  commandSuggestionIndex = 0,
+  queuedPromptCount = 0,
+  queuedPrompts = [],
+  queuePanel = false,
+  queueSelection = 0,
+  entryExpansion = {},
+  onToggleEntry,
+  activityLabel = "Working…",
+  turnStartedAt,
+  sessionFilter = "",
+  sessionFilterEditing = false,
   tasks = [],
   management,
   managementSelection = 0,
+  managementDetailOnly = false,
   sessionAction,
   vimMode = false,
   vimInsert = true,
-  primaryColor = "magenta",
+  primaryColor = "cyan",
   mcpActivity,
   transcriptViewportRef,
   verboseTranscript = false,
@@ -95,33 +126,44 @@ export const TuiView = memo(function TuiView({
   const updateViewportStatus = useCallback((viewport: { scrollTop: number; contentHeight: number; viewportHeight: number }) => {
     setNewerRows(Math.max(0, viewport.contentHeight - viewport.viewportHeight - viewport.scrollTop));
   }, []);
-  const suggestionRows = commandSuggestions.length || (!commandSuggestions.length ? inputCompletions.length : 0);
+  const menuLimit = Math.max(1, Math.min(8, Math.floor(rows / 4)));
+  const suggestionCount = commandSuggestions.length || inputCompletions.length;
+  const suggestionRows = suggestionCount ? Math.min(menuLimit, suggestionCount) + 1 : completionNotice ? 1 : 0;
+  const queueRows = !queuePanel && queuedPrompts.length ? (rows < 18 ? 1 : Math.min(2, queuedPrompts.length) + 1) : 0;
   const promptMode = vimMode ? (vimInsert ? "INSERT" : "NORMAL") : undefined;
   const contentColumns = promptContentColumns(columns, promptMode);
+  const taskRows = (state.todos.length ? Math.min(3, state.todos.length) + 4 + Number(state.todos.length > 3) : 0)
+    + (tasks.length ? Math.min(3, tasks.length) + 4 + Number(tasks.length > 3) : 0);
+  const activityRows = Number(state.busy) + Number(Boolean(state.busy && mcpActivity && !permission && !question && !activityLabel.startsWith("Cancelling")));
+  const activityBudget = Math.max(0, Math.min(taskRows + activityRows, rows - suggestionRows - queueRows - 7));
+  const auxiliaryRows = 1 + activityBudget + (transcriptSearch ? 3 : 0) + (historySearch ? 3 : 0);
+  const maxPromptLines = Math.max(1, Math.min(6, Math.floor(rows / 3), rows - suggestionRows - queueRows - auxiliaryRows - 5));
   const promptLayout = buildPromptLayout({
     text: input,
     offset: cursor,
     terminalColumns: columns,
+    maxVisibleLines: maxPromptLines,
     prefixColumns: columns - contentColumns,
   });
-  const transcriptHeight = measureTranscriptHeight({ terminalRows: rows, promptLayout, suggestionRows });
+  const transcriptHeight = measureTranscriptHeight({ terminalRows: rows, promptLayout, suggestionRows: suggestionRows + queueRows, auxiliaryRows });
   return (
+    <KeybindingProvider value={keybindings}>
+    <AccentProvider value={primaryColor}>
     <Box width={columns} height={rows} overflow="hidden" flexDirection="column" paddingX={1}>
-      {!management && !shellPanel ? (
+      {!management && !shellPanel && !queuePanel ? (
         <Box flexGrow={1} flexBasis={0} overflow="hidden" flexDirection="column" marginTop={1}>
           {transcriptViewportRef
-            ? <TranscriptViewport ref={transcriptViewportRef} entries={state.transcript} width={Math.max(1, columns - 2)} height={transcriptHeight} theme={primaryColor} verbose={verboseTranscript} {...(selectedTranscriptEntryId ? { selectedEntryId: selectedTranscriptEntryId } : {})} onStateChange={updateViewportStatus} />
+            ? <TranscriptViewport ref={transcriptViewportRef} entries={state.transcript} width={Math.max(1, columns - 2)} height={transcriptHeight} theme={primaryColor} verbose={verboseTranscript} entryExpansion={entryExpansion} onToggleEntry={onToggleEntry} {...(selectedTranscriptEntryId ? { selectedEntryId: selectedTranscriptEntryId } : {})} onStateChange={updateViewportStatus} />
             : <Box height={transcriptHeight} overflow="hidden" flexDirection="column">
-                {state.transcript.slice(-Math.max(1, Math.floor(transcriptHeight / 3))).map((entry) => <TranscriptEntryView key={entry.id} entry={entry} verbose={verboseTranscript} selected={entry.id === selectedTranscriptEntryId} />)}
+                {state.transcript.slice(-Math.max(1, Math.floor(transcriptHeight / 3))).map((entry) => <TranscriptEntryView key={entry.id} entry={entry} verbose={entryExpansion[entry.id] ?? verboseTranscript} selected={entry.id === selectedTranscriptEntryId} />)}
               </Box>}
-          <Box flexDirection="column" flexShrink={0}>
+          <Box flexDirection="column" flexShrink={0} height={activityBudget} overflow="hidden">
+            {state.busy ? <>
+              <WorkingStatus label={activityLabel} startedAt={turnStartedAt} color={primaryColor} />
+              {mcpActivity && !permission && !question && !activityLabel.startsWith("Cancelling") ? <McpActivityRow activity={mcpActivity} color={primaryColor} /> : null}
+            </> : null}
             {state.todos.length ? <TodoList todos={state.todos} /> : null}
             {tasks.length ? <TaskList tasks={tasks} /> : null}
-            {state.busy && mcpActivity
-              ? <McpActivityRow activity={mcpActivity} color={primaryColor} />
-              : state.busy
-                ? <Text color={primaryColor}>{figures.star} Working…</Text>
-                : null}
           </Box>
         </Box>
       ) : null}
@@ -141,23 +183,31 @@ export const TuiView = memo(function TuiView({
           {...(sessionAction ? { sessionAction } : {})}
           maxItems={Math.max(3, Math.min(7, rows - 16))}
           columns={columns}
-          height={Math.max(6, rows - 7)}
+          height={Math.max(6, rows - 2)}
+          filter={sessionFilter}
+          filterEditing={sessionFilterEditing}
+          detailOnly={managementDetailOnly}
         />
+      ) : queuePanel ? (
+        <QueuePanel prompts={queuedPrompts} selection={queueSelection} columns={columns} rows={rows} notice={completionNotice} />
       ) : shellPanel ? (
         <ShellRuntimePanel runtimes={shellRuntimes} selection={shellSelection} {...(shellInput !== undefined ? { input: shellInput } : {})} />
       ) : (
         <>
+          {queuedPrompts.length ? <Box flexDirection="column" paddingX={1}>
+            {(rows < 18 ? [] : queuedPrompts.slice(0, 2)).map((prompt, index) => <Text key={index} dimColor wrap="truncate-end">{index + 1}. {prompt.display.replace(/\s+/g, " ").slice(0, Math.max(10, columns - 12))}</Text>)}
+            <Text dimColor wrap="truncate-end">{queuedPrompts.length} queued · {keybindings.promptQueue ?? "disabled"} preview/edit/remove</Text>
+          </Box> : null}
           {transcriptSearch ? <TranscriptSearchBar search={transcriptSearch} color={primaryColor} /> : null}
           {historySearch ? <HistorySearchBar search={historySearch} color={primaryColor} /> : null}
-          {commandSuggestions.length ? <CommandSuggestions commands={commandSuggestions} color={primaryColor} /> : null}
-          {!commandSuggestions.length && inputCompletions.length ? <InputCompletions values={inputCompletions} selection={inputCompletionIndex} color={primaryColor} /> : null}
+          {commandSuggestions.length ? <CommandSuggestions commands={commandSuggestions} maxItems={menuLimit} selection={commandSuggestionIndex} color={primaryColor} /> : null}
+          {!commandSuggestions.length && inputCompletions.length ? <InputCompletions values={inputCompletions} maxItems={menuLimit} selection={inputCompletionIndex} color={primaryColor} /> : null}
           {!commandSuggestions.length && !inputCompletions.length && completionNotice ? <CompletionNotice message={completionNotice} /> : null}
           {!transcriptSearch && !historySearch ? <PromptInputView
             layout={promptLayout}
-            disabled={state.busy}
             color={primaryColor}
             {...(promptMode ? { mode: promptMode } : {})}
-            {...(onPromptClick ? { onClick: onPromptClick } : {})}
+            {...(onPromptClick ? { onClick: (row, column) => onPromptClick(row, column, maxPromptLines) } : {})}
           /> : null}
         </>
       )}
@@ -168,27 +218,61 @@ export const TuiView = memo(function TuiView({
         usage={state.usage}
         lastInputTokens={state.lastInputTokens}
         contextWindowTokens={state.contextWindowTokens}
-        modal={Boolean(permission || question || management || transcriptSearch || historySearch || shellPanel)}
+        modal={Boolean(permission || question || management || transcriptSearch || historySearch || shellPanel || queuePanel)}
         transcriptOffset={newerRows}
         verboseTranscript={verboseTranscript}
+        queuedPromptCount={queuedPromptCount}
       />
     </Box>
+    </AccentProvider>
+    </KeybindingProvider>
   );
 });
+
+function WorkingStatus({ label, startedAt, color }: { label: string; startedAt?: number; color: "cyan" | "magenta" | "blue" | "green" }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => { const timer = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(timer); }, []);
+  return <Text color={color} wrap="truncate-end">{figures.star} {label}{startedAt ? ` · ${Math.max(0, Math.floor((now - startedAt) / 1000))}s` : ""}</Text>;
+}
+
+function QueuePanel({ prompts, selection, columns, rows, notice }: { prompts: readonly PromptInputSubmit[]; selection: number; columns: number; rows: number; notice?: string }) {
+  const accent = useAccent();
+  const queueKey = useKeybindingLabel("promptQueue");
+  const listRef = useRef<ScrollBoxHandle | null>(null);
+  const previewRef = useRef<ScrollBoxHandle | null>(null);
+  useInput((_input, key) => {
+    if (key.pageDown) previewRef.current?.scrollBy(Math.max(1, Math.floor(rows / 3)));
+    if (key.pageUp) previewRef.current?.scrollBy(-Math.max(1, Math.floor(rows / 3)));
+  });
+  const itemRefs = useRef(new Map<number, DOMElement>());
+  useEffect(() => { const element = itemRefs.current.get(selection); if (element) listRef.current?.scrollToElement(element); previewRef.current?.scrollTo(0); }, [selection, prompts]);
+  return <Box height={Math.max(6, rows - 2)} borderStyle="round" borderColor={UI_COLORS.border} paddingX={1} flexDirection="column">
+    <Text bold color={accent}>Queued prompts · {prompts.length} pending</Text>
+    <Text dimColor wrap="truncate-end">Execution pauses here after the current turn finishes.</Text>
+    <ScrollBox ref={listRef} height={Math.max(1, Math.floor((rows - 7 - Number(Boolean(notice))) / 2))} flexDirection="column">
+      {prompts.map((prompt, index) => <Box key={index} ref={element => { if (element) itemRefs.current.set(index, element); else itemRefs.current.delete(index); }}><Text wrap="truncate-end" color={selection === index ? accent : undefined}>{selection === index ? figures.pointer : " "} {index + 1}. {prompt.display.replace(/\s+/g, " ").slice(0, Math.max(10, columns - 12))}</Text></Box>)}
+      {!prompts.length ? <Text dimColor>No pending prompts.</Text> : null}
+    </ScrollBox>
+    {prompts[selection] ? <ScrollBox ref={previewRef} height={Math.max(1, Math.ceil((rows - 7 - Number(Boolean(notice))) / 2))}><Text>{prompts[selection]!.expanded}</Text></ScrollBox> : null}
+    {notice ? <Text color="yellow" wrap="truncate-end">{notice}</Text> : null}
+    <Text dimColor wrap="truncate-end">↑/↓ select · Enter/E edit · D/Delete remove · PgUp/PgDn preview · {queueKey}/Esc close</Text>
+  </Box>;
+}
 
 function ShellRuntimePanel({ runtimes, selection, input }: { runtimes: readonly ShellRuntimeSnapshot[]; selection: number; input?: string }) {
   const selected = runtimes[selection];
   const output = selected?.kind === "pty" ? selected.screen : selected?.output;
+  const accent = useAccent();
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1}>
-      <Text bold color="cyan">Background tasks & PTY sessions</Text>
+    <Box flexDirection="column" borderStyle="round" borderColor={UI_COLORS.border} paddingX={1}>
+      <Text bold color={accent}>Background tasks & PTY sessions</Text>
       {runtimes.length ? runtimes.map((runtime, index) => (
-        <Text key={runtime.kind === "pty" ? `pty-${runtime.pid}` : runtime.taskId} {...(index === selection ? { color: "cyan" as const } : {})} bold={index === selection}>
+        <Text key={runtime.kind === "pty" ? `pty-${runtime.pid}` : runtime.taskId} {...(index === selection ? { color: accent } : {})} bold={index === selection}>
           {index === selection ? figures.pointer : " "} {runtime.kind === "pty" ? `PTY ${runtime.pid} · ${runtime.alive ? "running" : "exited"} · ${runtime.command}` : `${runtime.taskId} · ${runtime.status} · ${runtime.command}`}
         </Text>
       )) : <Text dimColor>No background tasks or PTY sessions.</Text>}
       {output ? <Box flexDirection="column" marginTop={1}><Text bold>Output</Text><Text dimColor>{output.split("\n").slice(-8).join("\n")}</Text></Box> : null}
-      {input !== undefined ? <Text color="cyan">Input: {input}<Text inverse> </Text></Text> : null}
+      {input !== undefined ? <Text color={accent}>Input: {input}<Text inverse> </Text></Text> : null}
       <Text dimColor>↑/↓ select · I send PTY input · K stop · Ctrl+T/Esc close</Text>
     </Box>
   );
@@ -232,7 +316,7 @@ function McpActivityRow({
     ? `${activity.progress}`
     : `${activity.progress}/${activity.total}`;
   return (
-    <Text color={color}>
+    <Text color={color} wrap="truncate-end">
       {figures.star} MCP {activity.serverName} {amount}
       {activity.message ? ` · ${activity.message}` : ""}
     </Text>
@@ -246,6 +330,9 @@ function ManagementDialog({
   columns,
   height,
   sessionAction,
+  filter = "",
+  filterEditing = false,
+  detailOnly = false,
 }: {
   view: ManagementView;
   selection: number;
@@ -253,50 +340,59 @@ function ManagementDialog({
   columns: number;
   height: number;
   sessionAction?: { type: "rename" | "delete"; input: string };
+  filter?: string;
+  filterEditing?: boolean;
+  detailOnly?: boolean;
 }) {
   const selected = view.items[selection];
   const itemScrollRef = useRef<ScrollBoxHandle | null>(null);
   const previewScrollRef = useRef<ScrollBoxHandle | null>(null);
   const itemRefs = useRef(new Map<string, DOMElement>());
+  useInput((_input, key) => {
+    if (key.pageDown) previewScrollRef.current?.scrollBy(Math.max(1, height - 6));
+    if (key.pageUp) previewScrollRef.current?.scrollBy(-Math.max(1, height - 6));
+  });
   useEffect(() => {
     const item = view.items[selection];
     const element = item ? itemRefs.current.get(item.id) : undefined;
     if (element) itemScrollRef.current?.scrollToElement(element, -1);
     previewScrollRef.current?.scrollTo(0);
   }, [selection, view.items]);
-  const listWidth = view.kind === "sessions" && columns >= 80
+  const listWidth = (view.kind === "sessions" || view.kind === "diff") && columns >= 80
     ? Math.max(28, Math.floor(columns * 0.38))
     : columns - 4;
-  const showSidePreview = columns >= 80;
+  const showSidePreview = columns >= 80 && !detailOnly;
   const detail = selected ? <ManagementDetail view={view} item={selected} /> : <Text dimColor>No item selected.</Text>;
+  const accent = useAccent();
   return (
-    <Box height={height} flexDirection="column" borderStyle="round" borderColor="magenta" paddingX={1}>
-      <Text bold color="magenta">{view.title}</Text>
-      {view.description ? <Text dimColor>{view.description}</Text> : null}
+    <Box height={height} flexDirection="column" borderStyle="round" borderColor={UI_COLORS.border} paddingX={1}>
+      <Text bold color={accent} wrap="truncate-end">{view.title}</Text>
+      {view.description ? <Text dimColor wrap="truncate-end">{view.description}</Text> : null}
+      {view.kind === "sessions" ? <Text color={accent}>Search: {filter || (filterEditing ? "" : "/ to filter by title, prompt or ID")}{filterEditing ? <Text inverse> </Text> : null}</Text> : null}
       <Box flexDirection={showSidePreview ? "row" : "column"} flexGrow={1} minHeight={3} marginTop={1} gap={1}>
-        <ScrollBox ref={itemScrollRef} width={listWidth} flexGrow={showSidePreview ? 0 : 1} flexDirection="column">
+        {!detailOnly ? <ScrollBox ref={itemScrollRef} width={listWidth} flexGrow={showSidePreview ? 0 : 1} flexDirection="column">
           {view.items.length ? view.items.map((item, index) => (
             <Box key={item.id} ref={element => {
               if (element) itemRefs.current.set(item.id, element);
               else itemRefs.current.delete(item.id);
             }} flexDirection="column" flexShrink={0}>
-              <Text {...(selection === index ? { color: "cyan" as const } : {})} bold={selection === index}>
+              <Text {...(selection === index ? { color: accent } : {})} bold={selection === index}>
                 {selection === index ? figures.pointer : " "} {item.active ? figures.tick : " "} {item.label}
               </Text>
               {selection === index && item.description ? <Text dimColor>    {item.description}</Text> : null}
             </Box>
           )) : <Text dimColor>No items available.</Text>}
-        </ScrollBox>
-        {showSidePreview ? (
+        </ScrollBox> : null}
+        {showSidePreview || detailOnly ? (
           <ScrollBox ref={previewScrollRef} flexGrow={1} flexDirection="column">
             {detail}
           </ScrollBox>
         ) : null}
       </Box>
-      {!showSidePreview ? <Box flexDirection="column" marginTop={1}>{detail}</Box> : null}
-      {sessionAction?.type === "rename" ? <Text color="cyan">New title: {sessionAction.input}<Text inverse> </Text></Text> : null}
+      {!showSidePreview && !detailOnly ? <ScrollBox ref={previewScrollRef} flexGrow={1} flexDirection="column" marginTop={1}>{detail}</ScrollBox> : null}
+      {sessionAction?.type === "rename" ? <Text color={accent}>New title: {sessionAction.input}<Text inverse> </Text></Text> : null}
       {sessionAction?.type === "delete" ? <Text color="red">Delete this session? y/Enter confirm · n/Esc cancel</Text> : null}
-      <Text dimColor>
+      <Text dimColor wrap="truncate-end">
         {view.items.length
           ? `${managementActions(view.kind, selected)}↑/↓ select · Enter ${managementEnterLabel(view.kind)} · Esc close${view.items.length > maxItems ? ` · ${selection + 1}/${view.items.length}` : ""}`
           : "Esc close"}
@@ -306,7 +402,8 @@ function ManagementDialog({
 }
 
 function managementActions(kind: ManagementView["kind"], item?: ManagementView["items"][number]): string {
-  if (kind === "sessions") return "R rename · F fork · D delete · ";
+  if (kind === "diff") return "R refresh · Enter full preview/back · PgUp/PgDn preview · ";
+  if (kind === "sessions") return "/ search · PgUp/PgDn preview · R rename · F fork · D delete · ";
   const parts: string[] = [];
   if (kind === "mcp") {
     parts.push("R reload");
@@ -321,6 +418,7 @@ function managementActions(kind: ManagementView["kind"], item?: ManagementView["
 }
 
 function managementEnterLabel(kind: ManagementView["kind"]): string {
+  if (kind === "diff") return "expand";
   if (kind === "mcp" || kind === "plugins") return "toggle";
   if (kind === "marketplace") return "install";
   if (kind === "doctor") return "rerun";
@@ -335,6 +433,12 @@ function ManagementDetail({
   view: ManagementView;
   item: ManagementView["items"][number];
 }) {
+  const accent = useAccent();
+  if (view.kind === "diff") return <Box flexDirection="column">
+    <Text bold>{item.label}</Text>
+    {item.description ? <Text dimColor>{item.description}</Text> : null}
+    <GitPatchPreview patch={item.diffPreview ?? "No patch available."} accent={accent} />
+  </Box>;
   const previewLabel = item.transcriptPreview?.length
     ? "Conversation preview"
     : item.preview?.length
@@ -372,46 +476,64 @@ function ManagementDetail({
   );
 }
 
+function GitPatchPreview({ patch, accent }: { patch: string; accent: "cyan" | "blue" | "green" | "magenta" }) {
+  let inHunk = false;
+  return <Box flexDirection="column">{stripAnsi(patch).split("\n").map((line, index) => {
+    if (line.startsWith("diff --git")) inHunk = false;
+    const header = line.startsWith("@@");
+    if (header) inHunk = true;
+    const color = header ? accent : inHunk && line.startsWith("+") ? "green" : inHunk && line.startsWith("-") ? "red" : undefined;
+    return <Text key={index} color={color} dimColor={line.startsWith("diff ") || line.startsWith("index ")}>{line || " "}</Text>;
+  })}</Box>;
+}
+
 function TaskList({ tasks }: { tasks: readonly TaskRecord[] }) {
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1} marginBottom={1}>
+    <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1} marginBottom={1} flexShrink={0}>
       <Text bold>Task runtime</Text>
-      {tasks.map((task) => {
+      {tasks.slice(0, 3).map((task) => {
         const running = task.status === "running" || task.status === "in_progress";
         const successful = task.status === "completed";
         const icon = successful ? figures.tick : running ? figures.pointer : task.status === "pending" ? figures.circle : figures.cross;
         const color = successful ? "green" : running ? "cyan" : task.status === "pending" ? "gray" : "red";
         return (
-          <Text key={task.id} color={color}>
+          <Text key={task.id} color={color} wrap="truncate-end">
             {icon} #{task.id} [{task.status}] {running && task.activeForm ? task.activeForm : task.subject}
             {task.owner ? ` · ${task.owner}` : ""}
             {typeof task.metadata?.teamName === "string" ? ` · team ${task.metadata.teamName}` : ""}
           </Text>
         );
       })}
+      {tasks.length > 3 ? <Text dimColor>+{tasks.length - 3} tasks · /tasks</Text> : null}
     </Box>
   );
 }
 
 function CommandSuggestions({
   commands,
+  selection,
+  maxItems,
   color,
 }: {
   commands: Array<(typeof SLASH_COMMANDS)[number] | ExternalSlashCommand>;
+  maxItems: number;
+  selection: number;
   color: "magenta" | "cyan" | "blue" | "green";
 }) {
+  const start = Math.max(0, Math.min(selection - Math.floor(maxItems / 2), commands.length - maxItems));
   return (
     <Box flexDirection="column" paddingX={1}>
-      {commands.map(({ name, description }, index) => (
+      {commands.slice(start, start + maxItems).map(({ name, description }, offset) => { const index = start + offset; return (
         <Text
           key={name}
-          dimColor={index !== 0}
-          {...(index === 0 ? { color } : {})}
+          wrap="truncate-end"
+          dimColor={index !== selection}
+          {...(index === selection ? { color } : {})}
         >
-          {index === 0 ? figures.pointer : " "} /{name} — {description}
+          {index === selection ? figures.pointer : " "} /{name} — {description}
         </Text>
-      ))}
-      <Text dimColor>Tab complete</Text>
+      ); })}
+      <Text dimColor wrap="truncate-end">↑/↓ select · Tab/Enter complete · {selection + 1}/{commands.length}</Text>
     </Box>
   );
 }
@@ -419,20 +541,23 @@ function CommandSuggestions({
 function InputCompletions({
   values,
   selection,
+  maxItems,
   color,
 }: {
   values: string[];
+  maxItems: number;
   selection: number;
   color: "magenta" | "cyan" | "blue" | "green";
 }) {
+  const start = Math.max(0, Math.min(selection - Math.floor(maxItems / 2), values.length - maxItems));
   return (
     <Box flexDirection="column" paddingX={1}>
-      {values.slice(0, 8).map((value, index) => (
-        <Text key={value} dimColor={index !== selection} {...(index === selection ? { color } : {})}>
+      {values.slice(start, start + maxItems).map((value, offset) => { const index = start + offset; return (
+        <Text key={value} wrap="truncate-end" dimColor={index !== selection} {...(index === selection ? { color } : {})}>
           {index === selection ? figures.pointer : " "} {value}
         </Text>
-      ))}
-      <Text dimColor>↑/↓ select · Tab accept/cycle · Esc dismiss</Text>
+      ); })}
+      <Text dimColor wrap="truncate-end">↑/↓ select · Tab/Enter accept · Esc dismiss · {selection + 1}/{values.length}</Text>
     </Box>
   );
 }
@@ -440,20 +565,21 @@ function InputCompletions({
 function CompletionNotice({ message }: { message: string }) {
   return (
     <Box paddingX={1}>
-      <Text dimColor>{message}</Text>
+      <Text dimColor wrap="truncate-end">{message}</Text>
     </Box>
   );
 }
 
 function TodoList({ todos }: { todos: TuiState["todos"] }) {
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1} marginBottom={1}>
+    <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1} marginBottom={1} flexShrink={0}>
       <Text bold>Tasks</Text>
-      {todos.map((todo, index) => {
+      {todos.slice(0, 3).map((todo, index) => {
         const icon = todo.status === "completed" ? figures.tick : todo.status === "in_progress" ? figures.pointer : figures.circle;
         const color = todo.status === "completed" ? "green" : todo.status === "in_progress" ? "cyan" : "gray";
-        return <Text key={`${index}-${todo.content}`} color={color}>{icon} {todo.status === "in_progress" ? todo.activeForm : todo.content}</Text>;
+        return <Text key={`${index}-${todo.content}`} color={color} wrap="truncate-end">{icon} {todo.status === "in_progress" ? todo.activeForm : todo.content}</Text>;
       })}
+      {todos.length > 3 ? <Text dimColor>+{todos.length - 3} tasks</Text> : null}
     </Box>
   );
 }
@@ -470,18 +596,19 @@ function QuestionDialog({
   otherInput?: string;
 }) {
   const options = [...question.options, { label: "Other", description: "Enter a custom answer." }];
+  const accent = useAccent();
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor="cyan" paddingX={1}>
-      <Text bold color="cyan">{question.header}</Text>
+    <Box flexDirection="column" borderStyle="round" borderColor={UI_COLORS.border} paddingX={1}>
+      <Text bold color={accent}>{question.header}</Text>
       <Text>{question.question}</Text>
       {otherInput !== undefined ? (
-        <Box borderStyle="single" borderColor="cyan" paddingX={1} marginTop={1}>
+        <Box borderStyle="single" borderColor={UI_COLORS.border} paddingX={1} marginTop={1}>
           <Text>Other: {otherInput}<Text inverse> </Text></Text>
         </Box>
       ) : (
       <Box flexDirection="column" marginTop={1}>
         {options.map((option, index) => (
-          <Text key={option.label} {...(selection === index ? { color: "cyan" as const } : {})} bold={selection === index}>
+          <Text key={option.label} {...(selection === index ? { color: accent } : {})} bold={selection === index}>
             {selection === index ? figures.pointer : " "} {question.multiSelect ? (selected.has(index) ? "[x]" : "[ ]") : `${index + 1}.`} {option.label} — {option.description}
           </Text>
         ))}
@@ -492,15 +619,15 @@ function QuestionDialog({
   );
 }
 
-function PromptInputView({ layout, disabled, mode, color, onClick }: { layout: PromptLayout; disabled: boolean; mode?: string; color: "magenta" | "cyan" | "blue" | "green"; onClick?(row: number, column: number): void }) {
+function PromptInputView({ layout, mode, color, onClick }: { layout: PromptLayout; mode?: string; color: "magenta" | "cyan" | "blue" | "green"; onClick?(row: number, column: number): void }) {
   return (
-    <Box flexShrink={0} borderStyle="round" borderColor={disabled ? "gray" : color} paddingX={1} {...(onClick ? { onClick: (event) => {
+    <Box flexShrink={0} borderStyle="round" borderColor={UI_COLORS.border} paddingX={1} {...(onClick ? { onClick: (event) => {
       const modeColumns = mode ? `[${mode}] `.length : 0;
       onClick(Math.max(0, event.localRow - 1), Math.max(0, event.localCol - 4 - modeColumns));
     } } : {})}>
       {mode ? <Text color={mode === "NORMAL" ? "yellow" : "green"}>[{mode}] </Text> : null}
       <Text color={color}>{figures.pointer} </Text>
-      <Text color={color}><Ansi dimColor={disabled}>{layout.visibleText}</Ansi></Text>
+      <Text><Ansi>{layout.visibleText}</Ansi></Text>
     </Box>
   );
 }
@@ -550,6 +677,7 @@ function StatusLine({
   modal,
   transcriptOffset,
   verboseTranscript,
+  queuedPromptCount,
 }: {
   model: string;
   permissionMode: PermissionMode;
@@ -560,22 +688,26 @@ function StatusLine({
   modal: boolean;
   transcriptOffset: number;
   verboseTranscript: boolean;
+  queuedPromptCount: number;
 }) {
+  const queueKey = useKeybindingLabel("promptQueue");
+  const toggleKey = useKeybindingLabel("toggleTool");
+  const allKey = useKeybindingLabel("toggleTranscript");
   const inputTokens = usage.inputTokens + usage.cacheReadInputTokens + usage.cacheCreationInputTokens;
   const cost = usage.costUsd ? ` · $${usage.costUsd.toFixed(4)}` : "";
   const context = contextLabel(lastInputTokens, contextWindowTokens);
   return (
-    <Box flexShrink={0} justifyContent="space-between">
-      <Text dimColor>
+    <Box flexShrink={0} height={2} flexDirection="column">
+      <Text dimColor wrap="truncate-end">
         {modal
           ? "follow dialog controls"
           : transcriptOffset > 0
             ? `PgUp/PgDn · Shift+↑/↓ · Ctrl+End latest · ${transcriptOffset} newer`
             : busy
-              ? `esc interrupt · ctrl+o ${verboseTranscript ? "compact" : "expand"} · PgUp scroll`
-              : `enter send · ctrl+o ${verboseTranscript ? "compact" : "expand"} · PgUp scroll · ctrl+c ×2 exit`}
+              ? `enter queue · esc interrupt · ${queuedPromptCount} queued · ${queueKey} manage`
+              : `enter send · ${toggleKey} tool · ${allKey} all · ${queueKey} queue`}
       </Text>
-      <Text dimColor>{model} · {permissionMode} · {context} · ↑{inputTokens.toLocaleString()} ↓{usage.outputTokens.toLocaleString()}{cost}</Text>
+      <Text wrap="truncate-end"><Text bold>{model}</Text><Text dimColor> · {permissionMode} · {context} · ↑{inputTokens.toLocaleString()} ↓{usage.outputTokens.toLocaleString()}{cost}</Text></Text>
     </Box>
   );
 }

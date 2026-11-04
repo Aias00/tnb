@@ -13,6 +13,9 @@ import type { PermissionMode, PermissionPromptDecision } from "../core/permissio
 import type { ModelEvent } from "../providers/types";
 import { applyInputKey, createInputBuffer, searchInputHistory, type InputBuffer, type InputHistorySearch } from "./input-buffer";
 import { promptContentColumns } from "./input/prompt-layout";
+import { workspaceCompletionToken, completionLabel, completionCursor } from "./file-completion";
+import { filterSessionView } from "./session-filter";
+import { createPromptEditorState } from "./prompt-input/editor-state";
 import { PromptInputController } from "./prompt-input/PromptInput";
 import type { PromptEditorState, PromptHistoryEntry, PromptInputSubmit } from "./prompt-input/types";
 import { PermissionController } from "./permission-controller";
@@ -67,7 +70,7 @@ export type TuiAppOptions = {
   runTurn(turn: TuiTurn): Promise<void>;
   runCommand?(request: SlashCommandRequest): Promise<SlashCommandResult>;
   externalCommands?: readonly ExternalSlashCommand[] | (() => readonly ExternalSlashCommand[]);
-  completeInput?(input: string, signal: AbortSignal): Promise<string[]>;
+  completeInput?(input: string, signal: AbortSignal, cursor?: number): Promise<string[]>;
   pasteImage?(): Promise<string | undefined>;
   displayImage?(path: string): Promise<void>;
   editInput?(value: string): Promise<ExternalEditorResult>;
@@ -154,6 +157,7 @@ export function TuiApp(options: TuiAppOptions) {
   const [questionOther, setQuestionOther] = useState<InputBuffer | undefined>();
   const [management, setManagement] = useState<ManagementView | undefined>(options.initialManagement);
   const [managementSelection, setManagementSelection] = useState(0);
+  const [managementDetailOnly, setManagementDetailOnly] = useState(false);
   const [sessionAction, setSessionAction] = useState<{ type: "rename" | "delete"; input: InputBuffer } | undefined>();
   const [scheduledPrompts, setScheduledPrompts] = useState<string[]>([]);
   const [shellPanel, setShellPanel] = useState(false);
@@ -175,16 +179,29 @@ export function TuiApp(options: TuiAppOptions) {
   const transcriptViewportRef = useRef<TranscriptViewportController | null>(null);
   const [buffer, setBuffer] = useState<InputBuffer>(initialInput.buffer);
   const [historySearch, setHistorySearch] = useState<InputHistorySearch | undefined>();
-  const [inputCompletions, setInputCompletions] = useState<{ values: string[]; index: number } | undefined>();
+  const [inputCompletions, setInputCompletions] = useState<{ values: string[]; index: number; original: string; cursor: number } | undefined>();
+  const [queuePanel, setQueuePanel] = useState(false);
+  const [queueSelection, setQueueSelection] = useState(0);
+  const [restoredEditor, setRestoredEditor] = useState<PromptEditorState>();
+  const [sessionFilter, setSessionFilter] = useState("");
+  const [sessionFilterEditing, setSessionFilterEditing] = useState(false);
+  const [entryExpansion, setEntryExpansion] = useState<Record<string, boolean>>({});
+  const [cancelling, setCancelling] = useState(false);
+  const [turnStartedAt, setTurnStartedAt] = useState<number>();
+  const [phase, setPhase] = useState("Requesting model");
+  const visibleManagement = management ? filterSessionView(management, sessionFilter) : undefined;
+  const [queuedPrompts, setQueuedPrompts] = useState<PromptInputSubmit[]>([]);
+  const [commandSuggestionIndex, setCommandSuggestionIndex] = useState(0);
   const [completionNotice, setCompletionNotice] = useState<string | undefined>();
   const completionController = useRef<AbortController | undefined>(undefined);
+  const dismissedCompletion = useRef<string | undefined>(undefined);
   const [vimMode, setVimMode] = useState(options.vimMode === true);
-  const [theme, setTheme] = useState(options.theme ?? "magenta");
+  const [theme, setTheme] = useState(options.theme ?? "cyan");
   const [verboseTranscript, setVerboseTranscript] = useState(false);
   const [transcriptSearch, setTranscriptSearch] = useState<TranscriptSearchState | undefined>();
   const [selectedTranscriptEntryId, setSelectedTranscriptEntryId] = useState<string | undefined>();
   const [vimInsert, setVimInsert] = useState(!options.vimMode);
-  const [promptMouse, setPromptMouse] = useState<{ row: number; column: number; nonce: number } | undefined>();
+  const [promptMouse, setPromptMouse] = useState<{ row: number; column: number; nonce: number; maxVisibleLines?: number } | undefined>();
   const bufferRef = useRef(buffer);
   const [terminalSize, setTerminalSize] = useState(() => ({
     columns: stdout.columns || 80,
@@ -194,8 +211,10 @@ export function TuiApp(options: TuiAppOptions) {
   const lastCtrlCPress = useRef(0);
   const ctrlCExitTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const hasRun = useRef(options.initialResume === true);
-  const editorActive = useRef(false);
   const imageToolPaths = useRef(new Map<string, string>());
+
+  useEffect(() => { setSessionFilter(""); setSessionFilterEditing(false); setManagementSelection(0); setManagementDetailOnly(false); }, [management]);
+  useEffect(() => { if (!state.busy) { setCancelling(false); setTurnStartedAt(undefined); } }, [state.busy]);
 
   useEffect(() => {
     const updateSize = () => setTerminalSize({
@@ -247,11 +266,18 @@ export function TuiApp(options: TuiAppOptions) {
     if (selectedId) transcriptViewportRef.current?.reveal(selectedId);
   }, [transcriptSearch?.index, transcriptSearch?.matches]);
 
-  const submit = useCallback((submitted: string | PromptInputSubmit) => {
-    if (state.busy) return;
+  const submit = useCallback((submitted: string | PromptInputSubmit, fromQueue = false) => {
     const structured: PromptInputSubmit = typeof submitted === "string"
       ? { display: submitted, expanded: submitted, mode: "prompt", pastedContents: {} }
       : submitted;
+    if (state.busy) {
+      setQueuedPrompts((current) => [...current, structuredClone(structured)]);
+      const empty = createInputBuffer("", history);
+      bufferRef.current = empty;
+      setBuffer(empty);
+      setCompletionNotice(undefined);
+      return;
+    }
     const prompt = structured.expanded;
     transcriptViewportRef.current?.scroll("bottom");
     completionController.current?.abort();
@@ -273,9 +299,11 @@ export function TuiApp(options: TuiAppOptions) {
       mode: structured.mode,
       pastedContents: structuredClone(structured.pastedContents),
     }]);
-    const emptyBuffer = createInputBuffer("", nextHistory);
-    bufferRef.current = emptyBuffer;
-    setBuffer(emptyBuffer);
+    if (!fromQueue) {
+      const emptyBuffer = createInputBuffer("", nextHistory);
+      bufferRef.current = emptyBuffer;
+      setBuffer(emptyBuffer);
+    }
     if (parsedCommand.kind === "unknown" && !isExternal) {
       dispatch({ type: "command-start", text: prompt });
       dispatch({
@@ -311,6 +339,7 @@ export function TuiApp(options: TuiAppOptions) {
         if (result.theme !== undefined) setTheme(result.theme);
         setManagement(result.management);
         if (result.resetSession) {
+          setQueuedPrompts([]); setQueuePanel(false); setEntryExpansion({}); setSelectedTranscriptEntryId(undefined);
           sessionId.current = result.sessionId ?? nextSessionId;
           hasRun.current = result.resumeSession === true;
           const restored = restoreInputHistory(result.restoredInputHistory ?? []);
@@ -328,6 +357,9 @@ export function TuiApp(options: TuiAppOptions) {
       });
       return;
     }
+    setCancelling(false);
+    setTurnStartedAt(Date.now());
+    setPhase("Requesting model");
     dispatch({ type: "submit", text: structured.display });
     const controller = new AbortController();
     abortController.current = controller;
@@ -337,10 +369,14 @@ export function TuiApp(options: TuiAppOptions) {
       resume: hasRun.current,
       signal: controller.signal,
       onModelEvent(event) {
+        if (event.type === "text") setPhase("Writing response");
+        if (event.type === "thinking") setPhase("Thinking");
+        if (event.type === "response-end") setPhase(event.reason === "tool-use" ? "Preparing tools" : "Finishing response");
         dispatch({ type: "model-event", event });
       },
       onToolEvent(event) {
         if (event.type === "tool-execution-start") {
+          setPhase(`Running ${event.name}`);
           if (event.name === "image_generate") {
             const input = typeof event.input === "object" && event.input !== null ? event.input as Record<string, unknown> : {};
             const path = typeof input.outputPath === "string"
@@ -377,7 +413,7 @@ export function TuiApp(options: TuiAppOptions) {
       },
     }).then(() => {
       hasRun.current = true;
-      dispatch({ type: "turn-complete" });
+      dispatch(controller.signal.aborted ? { type: "turn-error", message: "Interrupted" } : { type: "turn-complete" });
     }).catch((error: unknown) => {
       dispatch({
         type: "turn-error",
@@ -392,6 +428,31 @@ export function TuiApp(options: TuiAppOptions) {
     });
   }, [exit, history, options, permissionController.request, questionController, state.busy]);
 
+  const requestCompletions = useCallback((automatic = false) => {
+    if (!options.completeInput) return;
+    completionController.current?.abort();
+    const controller = new AbortController();
+    completionController.current = controller;
+    const original = bufferRef.current.value;
+    const cursor = bufferRef.current.cursor;
+    void options.completeInput(original, controller.signal, cursor).then(values => {
+      if (controller.signal.aborted || bufferRef.current.value !== original || bufferRef.current.cursor !== cursor) return;
+      setInputCompletions(values.length ? { values, index: 0, original, cursor } : undefined);
+      setCompletionNotice(values.length || automatic ? undefined : "No completions for the current input.");
+    }).catch((error: unknown) => {
+      if (!controller.signal.aborted) setCompletionNotice(error instanceof Error ? error.message : String(error));
+    });
+  }, [options.completeInput]);
+
+  useEffect(() => {
+    completionController.current?.abort();
+    setInputCompletions(undefined);
+    const token = workspaceCompletionToken(buffer.value, buffer.cursor);
+    if (!token?.at || permission || question || management || queuePanel || historySearch || transcriptSearch || shellPanel || dismissedCompletion.current === `${buffer.cursor}:${buffer.value}`) return;
+    const timer = setTimeout(() => requestCompletions(true), 120);
+    return () => { clearTimeout(timer); completionController.current?.abort(); };
+  }, [buffer.value, buffer.cursor, permission, question, management, queuePanel, historySearch, transcriptSearch, shellPanel, requestCompletions]);
+
   useEffect(() => options.scheduleManager?.subscribe((prompt, source) => {
     setScheduledPrompts((current) => [...current, `[Scheduled wakeup ${source}]\n${prompt}`]);
   }), [options.scheduleManager]);
@@ -405,12 +466,21 @@ export function TuiApp(options: TuiAppOptions) {
     return () => clearInterval(timer);
   }, [options.shellManager, shellPanel]);
 
+  useEffect(() => { setCommandSuggestionIndex(0); }, [buffer.value]);
+
   useEffect(() => {
-    if (state.busy || permission || question || management || scheduledPrompts.length === 0) return;
+    if (state.busy || permission || question || management || queuePanel || !queuedPrompts.length) return;
+    const [prompt, ...remaining] = queuedPrompts;
+    setQueuedPrompts(remaining);
+    if (prompt) submit(prompt, true);
+  }, [management, permission, question, queuePanel, queuedPrompts, state.busy, submit]);
+
+  useEffect(() => {
+    if (state.busy || permission || question || management || queuePanel || queuedPrompts.length || scheduledPrompts.length === 0) return;
     const [prompt, ...remaining] = scheduledPrompts;
     setScheduledPrompts(remaining);
-    if (prompt) submit(prompt);
-  }, [management, permission, question, scheduledPrompts, state.busy, submit]);
+    if (prompt) submit(prompt, true);
+  }, [management, permission, question, queuePanel, queuedPrompts.length, scheduledPrompts, state.busy, submit]);
 
   useInput((input, key, event) => {
     const promptMode = vimMode ? (vimInsert ? "INSERT" : "NORMAL") : undefined;
@@ -480,8 +550,41 @@ export function TuiApp(options: TuiAppOptions) {
       }
       return;
     }
-    if (management) {
-      const selected = management.items[managementSelection];
+    if (queuePanel) {
+      if (key.escape || key.ctrl && input === "c" || matchesKeybinding(keybindings, "promptQueue", input, key)) setQueuePanel(false);
+      else if (key.upArrow) setQueueSelection(index => Math.max(0, index - 1));
+      else if (key.downArrow) setQueueSelection(index => Math.min(Math.max(0, queuedPrompts.length - 1), index + 1));
+      else if ((key.backspace || key.delete || input.toLowerCase() === "d") && queuedPrompts[queueSelection]) {
+        setQueuedPrompts(current => current.filter((_, index) => index !== queueSelection));
+        setQueueSelection(index => Math.max(0, index - 1));
+      } else if ((key.return || input.toLowerCase() === "e") && queuedPrompts[queueSelection]) {
+        if (bufferRef.current.value) { setCompletionNotice("Keep or clear the current draft before editing a queued prompt."); return; }
+        const prompt = queuedPrompts[queueSelection]!;
+        const pastedContents = structuredClone(prompt.pastedContents);
+        const editor = { ...createPromptEditorState(prompt.display), mode: prompt.mode, pastedContents, nextPasteId: Math.max(0, ...Object.keys(pastedContents).map(Number)) + 1 };
+        setRestoredEditor(editor);
+        const next = createInputBuffer(prompt.display, history);
+        bufferRef.current = next; setBuffer(next);
+        setQueuedPrompts(current => current.filter((_, index) => index !== queueSelection));
+        setQueueSelection(0); setQueuePanel(false);
+      }
+      return;
+    }
+    if (management && visibleManagement) {
+      if (management.kind === "diff") {
+        if (key.escape && managementDetailOnly) { setManagementDetailOnly(false); return; }
+        if (key.return) { setManagementDetailOnly(value => !value); return; }
+        if (input.toLowerCase() === "r") { setManagement(undefined); submit(management.refreshCommand ?? "/diff"); return; }
+      }
+      if (management.kind === "sessions" && (sessionFilterEditing || input === "/")) {
+        if (!sessionFilterEditing) setSessionFilterEditing(true);
+        else if (key.escape) { setSessionFilter(""); setSessionFilterEditing(false); setManagementSelection(0); }
+        else if (key.return) setSessionFilterEditing(false);
+        else if (key.backspace || key.delete) { setSessionFilter(value => Array.from(value).slice(0, -1).join("")); setManagementSelection(0); }
+        else if (input && !key.ctrl && !key.meta) { setSessionFilter(value => value + input); setManagementSelection(0); }
+        return;
+      }
+      const selected = visibleManagement.items[managementSelection];
       if (sessionAction && selected) {
         if (key.escape) {
           setSessionAction(undefined);
@@ -504,14 +607,14 @@ export function TuiApp(options: TuiAppOptions) {
         }
         return;
       }
-      if (management.items.length === 0) {
-        if (key.escape || (key.ctrl && input === "c")) setManagement(undefined);
+      if (visibleManagement.items.length === 0) {
+        if (key.escape || (key.ctrl && input === "c")) { setManagement(undefined); }
         return;
       }
       if (key.upArrow || key.leftArrow) {
-        setManagementSelection((value) => (value + management.items.length - 1) % management.items.length);
+        setManagementSelection((value) => (value + visibleManagement.items.length - 1) % visibleManagement.items.length);
       } else if (key.downArrow || key.rightArrow) {
-        setManagementSelection((value) => (value + 1) % management.items.length);
+        setManagementSelection((value) => (value + 1) % visibleManagement.items.length);
       } else if (key.escape || (key.ctrl && input === "c")) {
         setManagement(undefined);
       } else if (management.kind === "sessions" && input.toLowerCase() === "r" && selected) {
@@ -609,6 +712,7 @@ export function TuiApp(options: TuiAppOptions) {
       return;
     }
     if (inputCompletions?.values.length && key.escape) {
+      dismissedCompletion.current = `${bufferRef.current.cursor}:${bufferRef.current.value}`;
       completionController.current?.abort();
       setInputCompletions(undefined);
       setCompletionNotice(undefined);
@@ -663,29 +767,63 @@ export function TuiApp(options: TuiAppOptions) {
       setCompletionNotice(undefined);
       return;
     }
-    const promptControllerActive = !state.busy && !permission && !question && !management && !historySearch && !transcriptSearch && !shellPanel;
-    if (promptControllerActive && promptControllerOwnsInput(input, key, event.keypress.isPasted, Boolean(inputCompletions?.values.length), bufferRef.current.value.length > 0)) {
+    if (matchesKeybinding(keybindings, "promptQueue", input, key)) {
+      setQueueSelection(0); setQueuePanel(true); return;
+    }
+    if (matchesKeybinding(keybindings, "previousTool", input, key) || matchesKeybinding(keybindings, "nextTool", input, key)) {
+      const tools = state.transcript.filter(entry => entry.kind === "tool");
+      if (!tools.length) return;
+      const current = tools.findIndex(entry => entry.id === selectedTranscriptEntryId);
+      const previous = matchesKeybinding(keybindings, "previousTool", input, key);
+      const index = current < 0 ? tools.length - 1 : (current + (previous ? -1 : 1) + tools.length) % tools.length;
+      const id = tools[index]!.id;
+      setSelectedTranscriptEntryId(id); transcriptViewportRef.current?.reveal(id); return;
+    }
+    if (matchesKeybinding(keybindings, "toggleTool", input, key)) {
+      const selected = state.transcript.find(entry => entry.id === selectedTranscriptEntryId && entry.kind === "tool") ?? [...state.transcript].reverse().find(entry => entry.kind === "tool");
+      if (selected) { setSelectedTranscriptEntryId(selected.id); setEntryExpansion(current => ({ ...current, [selected.id]: !(current[selected.id] ?? verboseTranscript) })); }
       return;
     }
-    if (matchesKeybinding(keybindings, "externalEditor", input, key) && options.editInput && !state.busy && !editorActive.current) {
-      editorActive.current = true;
-      setCompletionNotice("Opening external editor…");
-      void options.editInput(bufferRef.current.value).then((result) => {
-        if (result.error) {
-          setCompletionNotice(result.error);
-          return;
-        }
-        if (result.content !== undefined) {
-          const next = createInputBuffer(result.content, history);
+    if (matchesKeybinding(keybindings, "toggleTranscript", input, key)) {
+      setVerboseTranscript(value => !value); setEntryExpansion({}); return;
+    }
+    const promptControllerActive = !permission && !question && !management && !queuePanel && !historySearch && !transcriptSearch && !shellPanel;
+    if (promptControllerActive && inputCompletions?.values.length && !event.keypress.isPasted && (key.upArrow || key.downArrow || key.tab || key.return && !key.shift)) {
+      if (key.upArrow || key.downArrow) {
+        const direction = key.upArrow ? -1 : 1;
+        setInputCompletions(current => current ? { ...current, index: (current.index + direction + current.values.length) % current.values.length } : current);
+      } else {
+        const value = inputCompletions.values[inputCompletions.index]!;
+        const next = { ...createInputBuffer(value, history), cursor: completionCursor(inputCompletions.original, value, inputCompletions.cursor) };
+        bufferRef.current = next; setBuffer(next);
+        dismissedCompletion.current = value.slice(0, next.cursor).endsWith("/") ? undefined : `${next.cursor}:${value}`;
+        setInputCompletions(undefined); setCompletionNotice(undefined);
+      }
+      return;
+    }
+    const commands = suggestSlashCommands(bufferRef.current.value, resolveExternalCommands(options.externalCommands));
+    if (promptControllerActive && commands.length && !event.keypress.isPasted && (key.upArrow || key.downArrow || key.tab || key.return && !key.shift)) {
+      if (key.upArrow || key.downArrow) {
+        setCommandSuggestionIndex((current) => (current + (key.upArrow ? -1 : 1) + commands.length) % commands.length);
+      } else {
+        const command = commands[commandSuggestionIndex] ?? commands[0]!;
+        // Exact commands still submit on Enter; prefixes complete before execution.
+        if (key.return && bufferRef.current.value.trim() === `/${command.name}`) submit(bufferRef.current.value);
+        else {
+          const next = createInputBuffer(`${command.usage.split(" ")[0]} `, history);
           bufferRef.current = next;
           setBuffer(next);
         }
-        setCompletionNotice(undefined);
-      }).catch((error: unknown) => {
-        setCompletionNotice(error instanceof Error ? error.message : String(error));
-      }).finally(() => {
-        editorActive.current = false;
-      });
+      }
+      return;
+    }
+    if (key.escape && state.busy) {
+      setCancelling(true);
+      abortController.current?.abort();
+      return;
+    }
+    if (promptControllerActive && (matchesKeybinding(keybindings, "externalEditor", input, key) || matchesKeybinding(keybindings, "pasteImage", input, key))) return;
+    if (promptControllerActive && promptControllerOwnsInput(input, key, event.keypress.isPasted, Boolean(inputCompletions?.values.length), bufferRef.current.value.length > 0)) {
       return;
     }
     if (key.ctrl && key.shift && input.toLowerCase() === "c" && selection.hasSelection()) {
@@ -699,6 +837,7 @@ export function TuiApp(options: TuiAppOptions) {
     }
     if (key.ctrl && input === "c") {
       if (state.busy) {
+        setCancelling(true);
         abortController.current?.abort();
         return;
       }
@@ -724,10 +863,6 @@ export function TuiApp(options: TuiAppOptions) {
       }, 800);
       return;
     }
-    if (matchesKeybinding(keybindings, "toggleTranscript", input, key)) {
-      setVerboseTranscript((value) => !value);
-      return;
-    }
     if (bufferRef.current.value && key.ctrl && (input === "u" || input === "d")) {
       const next = applyInkInput(bufferRef.current, input, key, { columns: promptColumns, scope: "main-prompt" });
       bufferRef.current = next;
@@ -741,32 +876,6 @@ export function TuiApp(options: TuiAppOptions) {
     );
     if (transcriptInput.handled && transcriptInput.command) {
       transcriptViewportRef.current?.scroll(transcriptInput.command);
-      return;
-    }
-    if (matchesKeybinding(keybindings, "pasteImage", input, key) && options.pasteImage && !state.busy) {
-      void options.pasteImage().then((path) => {
-        if (!path) {
-          dispatch({ type: "turn-error", message: "The clipboard does not contain a PNG image." });
-          return;
-        }
-        const next = applyInputKey(bufferRef.current, {
-          name: "text",
-          text: `${bufferRef.current.value ? " " : ""}[Image: ${path}]`,
-          columns: promptColumns,
-        });
-        bufferRef.current = next;
-        setBuffer(next);
-        void options.displayImage?.(path);
-      }).catch((error: unknown) => {
-        dispatch({
-          type: "turn-error",
-          message: error instanceof Error ? error.message : String(error),
-        });
-      });
-      return;
-    }
-    if (key.escape && state.busy) {
-      abortController.current?.abort();
       return;
     }
     if (vimMode && key.escape) {
@@ -817,46 +926,7 @@ export function TuiApp(options: TuiAppOptions) {
         setCompletionNotice(undefined);
         return;
       }
-      if (inputCompletions?.values.length) {
-        const index = (inputCompletions.index + 1) % inputCompletions.values.length;
-        const next = createInputBuffer(inputCompletions.values[index]!, history);
-        bufferRef.current = next;
-        setBuffer(next);
-        setInputCompletions({ ...inputCompletions, index });
-        setCompletionNotice(undefined);
-        return;
-      }
-      if (options.completeInput) {
-        completionController.current?.abort();
-        const controller = new AbortController();
-        completionController.current = controller;
-        void options.completeInput(bufferRef.current.value, controller.signal).then((values) => {
-          if (controller.signal.aborted) return;
-          if (!values.length) {
-            setInputCompletions(undefined);
-            setCompletionNotice("No completions for the current input.");
-            return;
-          }
-          const next = createInputBuffer(values[0]!, history);
-          bufferRef.current = next;
-          setBuffer(next);
-          setInputCompletions({ values, index: 0 });
-          setCompletionNotice(undefined);
-        }).catch((error: unknown) => {
-          if (!controller.signal.aborted) dispatch({ type: "turn-error", message: error instanceof Error ? error.message : String(error) });
-        });
-      }
-      return;
-    }
-
-    if (inputCompletions?.values.length && (key.upArrow || key.downArrow)) {
-      const direction = key.upArrow ? -1 : 1;
-      const index = (inputCompletions.index + direction + inputCompletions.values.length) % inputCompletions.values.length;
-      const next = createInputBuffer(inputCompletions.values[index]!, history);
-      bufferRef.current = next;
-      setBuffer(next);
-      setInputCompletions({ ...inputCompletions, index });
-      setCompletionNotice(undefined);
+      requestCompletions();
       return;
     }
 
@@ -879,13 +949,16 @@ export function TuiApp(options: TuiAppOptions) {
   return (
     <>
       <PromptInputController
-        active={!state.busy && !permission && !question && !management && !historySearch && !transcriptSearch && !shellPanel}
+        keybindings={keybindings}
+        restoreState={restoredEditor}
+        active={!permission && !question && !management && !queuePanel && !historySearch && !transcriptSearch && !shellPanel}
+        maxVisibleLines={Math.max(1, Math.min(6, Math.floor(terminalSize.rows / 3)))}
         columns={promptContentColumns(terminalSize.columns, vimMode ? (vimInsert ? "INSERT" : "NORMAL") : undefined)}
         value={buffer.value}
         cursorOffset={buffer.cursor}
         history={promptHistory}
         vimEnabled={vimMode}
-        completionActive={Boolean(inputCompletions?.values.length)}
+        completionActive={Boolean(inputCompletions?.values.length) || suggestSlashCommands(buffer.value, resolveExternalCommands(options.externalCommands)).length > 0}
         {...(options.pasteImage ? { pasteImage: options.pasteImage } : {})}
         {...(options.editInput ? { editInput: options.editInput } : {})}
         onChange={updatePromptEditor}
@@ -894,6 +967,7 @@ export function TuiApp(options: TuiAppOptions) {
         {...(promptMouse ? { mousePosition: promptMouse } : {})}
       />
     <TuiView
+      keybindings={keybindings}
       state={state}
       input={buffer.value}
       cursor={buffer.cursor}
@@ -908,8 +982,20 @@ export function TuiApp(options: TuiAppOptions) {
         buffer.value,
         resolveExternalCommands(options.externalCommands),
       )}
-      {...(inputCompletions ? { inputCompletions: inputCompletions.values } : {})}
+      {...(inputCompletions ? { inputCompletions: inputCompletions.values.map(value => completionLabel(inputCompletions.original, value, inputCompletions.cursor)) } : {})}
       inputCompletionIndex={inputCompletions?.index ?? 0}
+      commandSuggestionIndex={commandSuggestionIndex}
+      queuedPromptCount={queuedPrompts.length}
+      queuedPrompts={queuedPrompts}
+      queuePanel={queuePanel}
+      queueSelection={queueSelection}
+      entryExpansion={entryExpansion}
+      onToggleEntry={(id) => { setSelectedTranscriptEntryId(id); setEntryExpansion(current => ({ ...current, [id]: !(current[id] ?? verboseTranscript) })); }}
+      activityLabel={cancelling ? "Cancelling…" : permission ? "Waiting for permission" : question ? "Waiting for your answer" : state.tools.some(tool => tool.status === "running") ? phase : phase.startsWith("Running ") ? "Requesting model" : phase}
+      turnStartedAt={turnStartedAt}
+      sessionFilter={sessionFilter}
+      sessionFilterEditing={sessionFilterEditing}
+      managementDetailOnly={managementDetailOnly}
       {...(completionNotice ? { completionNotice } : {})}
       tasks={tasks}
       shellRuntimes={shellRuntimes}
@@ -920,8 +1006,8 @@ export function TuiApp(options: TuiAppOptions) {
       vimMode={vimMode}
       vimInsert={vimInsert}
       primaryColor={theme}
-      onPromptClick={(row, column) => setPromptMouse((current) => ({ row, column, nonce: (current?.nonce ?? 0) + 1 }))}
-      {...(management ? { management, managementSelection } : {})}
+      onPromptClick={(row, column, maxVisibleLines) => setPromptMouse((current) => ({ row, column, maxVisibleLines, nonce: (current?.nonce ?? 0) + 1 }))}
+      {...(visibleManagement ? { management: visibleManagement, managementSelection } : {})}
       {...(sessionAction ? { sessionAction: { type: sessionAction.type, input: sessionAction.input.value } } : {})}
       {...(permission ? { permission, permissionSelection } : {})}
       {...(question

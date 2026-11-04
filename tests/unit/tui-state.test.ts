@@ -6,6 +6,26 @@ import {
 } from "../../src/ui/tui-state";
 
 describe("TUI state", () => {
+  test("keeps text before and after tools in chronological response segments", () => {
+    let state = reduceTuiState(createTuiState("test", "default"), { type: "submit", text: "inspect" });
+    const text = (value: string) => { state = reduceTuiState(state, { type: "model-event", event: { type: "text", index: 0, text: value } }); };
+    text("Let me check.");
+    state = reduceTuiState(state, { type: "model-event", event: { type: "response-end", reason: "tool-use" } });
+    state = reduceTuiState(state, { type: "tool-start", id: "git", name: "bash", input: { command: "git status" } });
+    state = reduceTuiState(state, { type: "tool-finish", id: "git", output: "clean", isError: false });
+    text("Workspace "); text("is clean.");
+    state = reduceTuiState(state, { type: "turn-complete" });
+    expect(state.transcript.map(entry => entry.kind === "tool" ? entry.name : entry.text)).toEqual(["inspect", "Let me check.", "bash", "Workspace is clean."]);
+    expect(state.messages.filter(message => message.role === "assistant").map(message => message.text)).toEqual(["Let me check.", "Workspace is clean."]);
+  });
+
+  test("tool execution closes the text segment even without response-end", () => {
+    let state = reduceTuiState(createTuiState("test", "default"), { type: "model-event", event: { type: "text", index: 0, text: "before" } });
+    state = reduceTuiState(state, { type: "tool-start", id: "todo", name: "todo_write", input: { todos: [] } });
+    state = reduceTuiState(state, { type: "model-event", event: { type: "text", index: 0, text: "after" } });
+    expect(state.transcript.map(entry => entry.kind === "assistant" ? entry.text : entry.kind)).toEqual(["before", "after"]);
+  });
+
   test("builds one streaming assistant response from model deltas", () => {
     let state = createTuiState("claude-sonnet-4-6", "default");
     state = reduceTuiState(state, { type: "submit", text: "Inspect the project" });
@@ -206,4 +226,14 @@ describe("TUI state", () => {
     });
     expect(state).toMatchObject({ model: "larger-model", contextWindowTokens: 300_000, lastInputTokens: 90_000 });
   });
+});
+
+test("interruption finalizes running tool cards rather than leaving spinners behind", () => {
+  let state = reduceTuiState(createTuiState("test", "default"), { type: "tool-start", id: "waiting", name: "bash", input: {} });
+  state = reduceTuiState(state, { type: "turn-error", message: "Interrupted" });
+  expect(state.busy).toBe(false);
+  expect(state.tools[0]?.status).toBe("failed");
+  const card = state.transcript.find(entry => entry.kind === "tool");
+  expect(card?.kind === "tool" && card.status).toBe("failed");
+  expect(card?.kind === "tool" && card.output).toBe("Interrupted");
 });

@@ -178,7 +178,7 @@ export const SLASH_COMMANDS = [
   {
     name: "diff",
     aliases: [] as const,
-    usage: "/diff",
+    usage: "/diff [file]",
     description: "Show current Git working-tree changes.",
   },
   {
@@ -420,9 +420,10 @@ export type SlashCommandResult = {
 };
 
 export type ManagementView = {
-  kind: "sessions" | "models" | "permissions" | "mcp" | "checkpoints" | "tasks" | "crontab" | "workflows" | "skills" | "plugins" | "marketplace" | "security" | "doctor" | "ide" | "hooks" | "agents" | "team";
+  kind: "diff" | "sessions" | "models" | "permissions" | "mcp" | "checkpoints" | "tasks" | "crontab" | "workflows" | "skills" | "plugins" | "marketplace" | "security" | "doctor" | "ide" | "hooks" | "agents" | "team";
   title: string;
   description?: string;
+  refreshCommand?: string;
   items: ManagementItem[];
 };
 
@@ -432,6 +433,7 @@ export type ManagementItem = {
   description?: string;
   preview?: string[];
   transcriptPreview?: TranscriptEntry[];
+  diffPreview?: string;
   command: string;
   active?: boolean;
   badges?: string[];

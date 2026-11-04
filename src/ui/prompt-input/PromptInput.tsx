@@ -1,6 +1,7 @@
 import React, { useEffect, useRef } from "react";
 
 import type { ExternalEditorResult } from "../external-editor";
+import { DEFAULT_KEYBINDINGS, matchesKeybinding, type KeybindingMap } from "../keybindings";
 import { useInput } from "../ink/index";
 import { applyPromptEditorAction, createPromptEditorState } from "./editor-state";
 import { PromptHistoryNavigator } from "./history";
@@ -9,12 +10,16 @@ import type { PromptEditorState, PromptHistoryEntry, PromptInputSubmit } from ".
 import { PromptStash, PromptUndoBuffer } from "./undo";
 import { promptActionFromKey } from "./use-text-input";
 import { VimInputController } from "./use-vim-input";
+import { resetKillAccumulation, resetYankState } from "../input/cursor";
 import { buildPromptLayout } from "../input/prompt-layout";
 import { promptOffsetFromMouse } from "./mouse";
 
 export type PromptInputControllerProps = {
   active: boolean;
+  keybindings?: KeybindingMap;
+  restoreState?: PromptEditorState;
   columns: number;
+  maxVisibleLines?: number;
   value: string;
   cursorOffset: number;
   history: PromptHistoryEntry[];
@@ -25,7 +30,7 @@ export type PromptInputControllerProps = {
   onChange(state: PromptEditorState): void;
   onSubmit(input: PromptInputSubmit): void;
   onNotice?(message: string): void;
-  mousePosition?: { row: number; column: number; nonce: number };
+  mousePosition?: { row: number; column: number; nonce: number; maxVisibleLines?: number };
 };
 
 export function PromptInputController(props: PromptInputControllerProps): null {
@@ -34,8 +39,16 @@ export function PromptInputController(props: PromptInputControllerProps): null {
   const stash = useRef(new PromptStash());
   const history = useRef(new PromptHistoryNavigator(props.history));
   const vim = useRef(new VimInputController());
+  const editorActive = useRef(false);
 
   useEffect(() => { history.current.replace(props.history); }, [props.history]);
+  useEffect(() => {
+    if (!props.restoreState) return;
+    state.current = structuredClone(props.restoreState);
+    history.current.reset();
+    undo.current.push(state.current, true);
+    props.onChange(structuredClone(state.current));
+  }, [props.restoreState]);
   useEffect(() => {
     if (state.current.value === props.value && state.current.cursorOffset === props.cursorOffset) return;
     state.current = props.value === "" && state.current.value !== ""
@@ -45,7 +58,7 @@ export function PromptInputController(props: PromptInputControllerProps): null {
   useEffect(() => { undo.current.push(state.current, true); }, []);
   useEffect(() => {
     if (!props.mousePosition) return;
-    const layout = buildPromptLayout({ text: state.current.value, offset: state.current.cursorOffset, terminalColumns: props.columns, prefixColumns: 0 });
+    const layout = buildPromptLayout({ text: state.current.value, offset: state.current.cursorOffset, terminalColumns: props.columns, prefixColumns: 0, maxVisibleLines: props.mousePosition.maxVisibleLines ?? props.maxVisibleLines });
     const cursorOffset = promptOffsetFromMouse({ text: state.current.value, layout, row: props.mousePosition.row, column: props.mousePosition.column });
     state.current = { ...state.current, cursorOffset };
     props.onChange(structuredClone(state.current));
@@ -60,7 +73,9 @@ export function PromptInputController(props: PromptInputControllerProps): null {
   useInput((input, key, event) => {
     if (!props.active) return;
     if (key.ctrl && input === "c") return;
-    if (props.completionActive && (key.upArrow || key.downArrow || key.tab || key.return || key.escape)) return;
+    const bindings = props.keybindings ?? DEFAULT_KEYBINDINGS;
+    if ((["historySearch", "transcriptSearch", "toggleTranscript", "toggleTasks", "promptQueue", "previousTool", "nextTool", "toggleTool"] as const).some(action => matchesKeybinding(bindings, action, input, key))) return;
+    if (props.completionActive && (key.upArrow || key.downArrow || key.tab || key.return && !key.shift || key.escape)) return;
 
     if (key.ctrl && (input === "_" || input === "-" && key.shift)) {
       event.stopImmediatePropagation();
@@ -74,7 +89,7 @@ export function PromptInputController(props: PromptInputControllerProps): null {
       update(restored ?? createPromptEditorState(), true);
       return;
     }
-    if (key.ctrl && input === "v" && props.pasteImage) {
+    if (matchesKeybinding(props.keybindings ?? DEFAULT_KEYBINDINGS, "pasteImage", input, key) && props.pasteImage) {
       event.stopImmediatePropagation();
       void props.pasteImage().then((path) => {
         if (!path) return props.onNotice?.("The clipboard does not contain an image.");
@@ -82,14 +97,16 @@ export function PromptInputController(props: PromptInputControllerProps): null {
       }).catch((error: unknown) => props.onNotice?.(error instanceof Error ? error.message : String(error)));
       return;
     }
-    if (key.ctrl && input === "g" && props.editInput) {
+    if (matchesKeybinding(props.keybindings ?? DEFAULT_KEYBINDINGS, "externalEditor", input, key) && props.editInput) {
       event.stopImmediatePropagation();
+      if (editorActive.current) return;
+      editorActive.current = true;
       const snapshot = structuredClone(state.current);
       const expanded = expandPromptReferences(snapshot.value, snapshot.pastedContents).expanded;
       void props.editInput(expanded).then((result) => {
         if (result.error) { state.current = snapshot; props.onChange(snapshot); props.onNotice?.(result.error); return; }
         if (result.content !== undefined) update({ ...createPromptEditorState(result.content), mode: snapshot.mode, vimMode: snapshot.vimMode }, true);
-      }).catch((error: unknown) => { state.current = snapshot; props.onChange(snapshot); props.onNotice?.(error instanceof Error ? error.message : String(error)); });
+      }).catch((error: unknown) => { state.current = snapshot; props.onChange(snapshot); props.onNotice?.(error instanceof Error ? error.message : String(error)); }).finally(() => { editorActive.current = false; });
       return;
     }
     if (key.return && !key.shift) {
@@ -128,6 +145,7 @@ export function PromptInputController(props: PromptInputControllerProps): null {
     const normalizedAction = action.type === "insert" && (event.keypress.isPasted || input.length > 1 || /[\r\n]/.test(input))
       ? { type: "paste-text" as const, text: input, columns: props.columns }
       : action;
+    if (normalizedAction.type === "paste-text") { resetKillAccumulation(); resetYankState(); }
     update(applyPromptEditorAction(state.current, normalizedAction), normalizedAction.type === "paste-text");
   }, { isActive: props.active });
 

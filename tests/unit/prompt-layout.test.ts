@@ -28,8 +28,8 @@ describe("prompt layout", () => {
   });
 
   test("derives the exact content width from prompt chrome and mode", () => {
-    expect(promptContentColumns(80)).toBe(74);
-    expect(promptContentColumns(80, "NORMAL")).toBe(65);
+    expect(promptContentColumns(80)).toBe(72);
+    expect(promptContentColumns(80, "NORMAL")).toBe(63);
     expect(promptContentColumns(1, "INSERT")).toBe(2);
   });
 

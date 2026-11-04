@@ -3,6 +3,9 @@ import figures from "figures";
 import { Box, Text } from "../ink/index";
 import { Markdown } from "../markdown";
 import type { TranscriptEntry } from "./model";
+import { useKeybindingLabel } from "../keybinding-context";
+import { buildLineDiff, compactDiff } from "./diff";
+import { UI_COLORS, useAccent } from "../theme";
 
 type ToolEntry = Extract<TranscriptEntry, { kind: "tool" }>;
 
@@ -15,19 +18,20 @@ export function TranscriptEntryView({
   verbose?: boolean;
   selected?: boolean;
 }) {
+  const accent = useAccent();
   if (entry.kind === "tool") return <ToolEntryView entry={entry} verbose={verbose} selected={selected} />;
   if (entry.kind === "user") {
     return (
-      <Box marginBottom={1}>
-        <Text bold color="cyan" inverse={selected}>{figures.pointer} </Text>
-        <Text>{entry.text}</Text>
+      <Box marginBottom={1} flexShrink={0}>
+        <Text bold color={accent} inverse={selected}>{figures.pointer} </Text>
+        <Text bold>{entry.text}</Text>
       </Box>
     );
   }
   if (entry.kind === "assistant") {
     return (
-      <Box marginBottom={1} paddingLeft={1} flexDirection="row">
-        <Text color="cyan" inverse={selected}>{selected ? `${figures.pointer} ` : "  "}</Text>
+      <Box marginBottom={1} flexShrink={0} paddingLeft={1} flexDirection="row">
+        <Text color={accent} inverse={selected}>{selected ? `${figures.pointer} ` : "  "}</Text>
         <Box flexDirection="column" flexGrow={1}><Markdown streaming={entry.streaming}>{entry.text}</Markdown></Box>
       </Box>
     );
@@ -44,13 +48,14 @@ function ToolEntryView({
   verbose: boolean;
   selected: boolean;
 }) {
+  const accent = useAccent();
   const icon = entry.status === "running" ? figures.ellipsis : entry.status === "completed" ? figures.tick : figures.cross;
-  const color = entry.status === "running" ? "yellow" : entry.status === "completed" ? "green" : "red";
+  const color = entry.status === "running" ? accent : entry.status === "completed" ? UI_COLORS.success : UI_COLORS.error;
   const detail = renderToolUse(entry.name, entry.input, verbose);
   return (
-    <Box flexDirection="column" marginBottom={1} paddingLeft={2}>
-      <Text color={color} inverse={selected}>
-        {icon} {toolTitle(entry.name)}{detail ? <Text dimColor>({detail})</Text> : null}
+    <Box flexDirection="column" marginBottom={1} paddingLeft={2} flexShrink={0}>
+      <Text inverse={selected}>
+        <Text color={color}>{icon} </Text><Text bold>{toolTitle(entry.name)}</Text>{detail ? <Text dimColor> ({detail})</Text> : null}
       </Text>
       <ToolResponse entry={entry} verbose={verbose} />
     </Box>
@@ -81,7 +86,7 @@ function renderToolResponse(
   if (entry.name === "bash") return renderBashResponse(entry, verbose);
   if (entry.name === "write") return renderWriteResponse(entry, verbose);
   if (entry.name === "edit") return renderEditResponse(entry, verbose);
-  if (entry.name === "read") return renderReadResponse(entry);
+  if (entry.name === "read") return renderReadResponse(entry, verbose);
   if (entry.name === "grep" || entry.name === "glob") return renderSearchResponse(entry, verbose);
   if (entry.name === "agent") return renderAgentResponse(entry, verbose);
   if (entry.name === "skill") return renderSkillResponse(entry, verbose);
@@ -174,7 +179,7 @@ function renderWebResponse(entry: ToolEntry, verbose: boolean): React.ReactNode 
   return (
     <Box flexDirection="column">
       <Text>Web query · {truncateText(query, 72)} · {summary}</Text>
-      <Text>{summary}{!verbose && entry.output ? " (ctrl+o to expand)" : ""}</Text>
+      <Text>{summary}{!verbose && entry.output ? <ExpansionHint /> : null}</Text>
       {verbose && entry.output ? <Text dimColor>{output}</Text> : null}
     </Box>
   );
@@ -207,7 +212,7 @@ function renderImageResponse(entry: ToolEntry, verbose: boolean): React.ReactNod
     return (
       <Box flexDirection="column">
         <Text>Image output · search · {count} {count === 1 ? "image" : "images"}</Text>
-        <Text>Found {count} {count === 1 ? "image" : "images"}{!verbose && entry.output ? " (ctrl+o to expand)" : ""}</Text>
+        <Text>Found {count} {count === 1 ? "image" : "images"}{!verbose && entry.output ? <ExpansionHint /> : null}</Text>
         {verbose && entry.output ? <Text dimColor>{output}</Text> : null}
       </Box>
     );
@@ -323,7 +328,7 @@ function summaryWithExpandableOutput(summary: string, entry: ToolEntry, verbose:
   const duration = formatDuration(undefined, entry.durationMs);
   return (
     <Box flexDirection="column">
-      <Text>{summary}{duration ? ` ${duration}` : ""}{!verbose && entry.output ? " (ctrl+o to expand)" : ""}</Text>
+      <Text>{summary}{duration ? ` ${duration}` : ""}{!verbose && entry.output ? <ExpansionHint /> : null}</Text>
       {verbose && entry.output ? <Text dimColor>{cleanOutput(entry.output)}</Text> : null}
     </Box>
   );
@@ -370,7 +375,7 @@ function renderWriteResponse(
     <Box flexDirection="column">
       <Text>Wrote <Text bold>{lines}</Text> {lines === 1 ? "line" : "lines"}</Text>
       {shown ? <Text dimColor>{shown}</Text> : <Text dimColor>(No content)</Text>}
-      {!verbose && hidden > 0 ? <Text dimColor>… +{hidden} lines (ctrl+o to expand)</Text> : null}
+      {!verbose && hidden > 0 ? <Text dimColor>… +{hidden} lines<ExpansionHint /></Text> : null}
     </Box>
   );
 }
@@ -384,32 +389,26 @@ function renderEditResponse(
   const input = record(entry.input);
   const oldText = stringField(input, "oldText", "old_string") ?? "";
   const newText = stringField(input, "newText", "new_string") ?? "";
-  const oldLines = oldText.split("\n");
-  const newLines = newText.split("\n");
-  const maxLines = verbose ? Number.POSITIVE_INFINITY : 8;
-  const maxPairCount = Math.max(oldLines.length, newLines.length);
-  const rows = Array.from({ length: Math.min(maxPairCount, maxLines) }, (_, index) => ({
-    before: oldLines[index],
-    after: newLines[index],
-  }));
-  const hidden = Math.max(0, maxPairCount - rows.length);
+  const rows = buildLineDiff(oldText, newText);
+  const shown = verbose ? rows : compactDiff(rows);
+  const hidden = rows.length - shown.length;
+  const added = rows.filter(row => row.kind === "added").length;
+  const removed = rows.filter(row => row.kind === "removed").length;
   return (
     <Box flexDirection="column">
-      <Text>Patch preview · {oldLines.length} old · {newLines.length} new</Text>
-      {rows.map(({ before, after }, index) => (
-        <Box key={`edit-${index}`} flexDirection="column">
-          {before !== undefined ? <Text color="red">- {before}</Text> : null}
-          {after !== undefined ? <Text color="green">+ {after}</Text> : null}
-        </Box>
-      ))}
-      {!verbose && hidden > 0 ? <Text dimColor>… +{hidden} lines (ctrl+o to expand)</Text> : null}
+      <Text>Patch preview · <Text color="green">+{added}</Text> · <Text color="red">−{removed}</Text> · fragment line numbers</Text>
+      {shown.map((row, index) => <Text key={index} color={row.kind === "added" ? "green" : row.kind === "removed" ? "red" : undefined} dimColor={row.kind === "context"}>
+        {String(row.oldLine ?? "").padStart(3)} {String(row.newLine ?? "").padStart(3)} {row.kind === "added" ? "+" : row.kind === "removed" ? "-" : " "} {row.text}
+      </Text>)}
+      {!verbose && hidden > 0 ? <Text dimColor>… {hidden} diff lines hidden<ExpansionHint /></Text> : null}
     </Box>
   );
 }
 
-function renderReadResponse(entry: Extract<TranscriptEntry, { kind: "tool" }>): React.ReactNode {
+function renderReadResponse(entry: Extract<TranscriptEntry, { kind: "tool" }>, verbose: boolean): React.ReactNode {
   if (entry.status === "running") return <Text dimColor>{runningLabel(entry)}</Text>;
-  if (entry.status === "failed") return <Text color="red">{entry.output ?? "Read failed"}</Text>;
+  if (entry.status === "failed") return <OutputText content={entry.output ?? "Read failed"} verbose={verbose} error />;
+  if (verbose && entry.output) return <OutputText content={entry.output} verbose />;
   const output = entry.output ?? "";
   const lines = visibleLineCount(output);
   return <Text>Read <Text bold>{lines}</Text> {lines === 1 ? "line" : "lines"}</Text>;
@@ -427,7 +426,7 @@ function renderSearchResponse(
   const label = entry.name === "glob" ? "files" : "matches";
   return (
     <Box flexDirection="column">
-      <Text>Found <Text bold>{lines.length}</Text> {lines.length === 1 ? label.slice(0, -1) : label}{!verbose && lines.length ? " (ctrl+o to expand)" : ""}</Text>
+      <Text>Found <Text bold>{lines.length}</Text> {lines.length === 1 ? label.slice(0, -1) : label}{!verbose && lines.length ? <ExpansionHint /> : null}</Text>
       {verbose && lines.length ? <Text dimColor>{lines.join("\n")}</Text> : null}
     </Box>
   );
@@ -513,15 +512,23 @@ function runningLabel(entry: Extract<TranscriptEntry, { kind: "tool" }>): string
   return `Running…${seconds === undefined ? "" : ` (${seconds}s)`}`;
 }
 
+function ExpansionHint() {
+  const toolKey = useKeybindingLabel("toggleTool");
+  const allKey = useKeybindingLabel("toggleTranscript");
+  return <Text dimColor> ({toolKey} this tool · {allKey} all)</Text>;
+}
+
 function OutputText({ content, verbose, error = false }: { content: string; verbose: boolean; error?: boolean }) {
   const clean = cleanOutput(content);
   const lines = clean.split("\n");
-  const shown = verbose || lines.length <= 4 ? lines : lines.slice(0, 3);
-  const hidden = Math.max(0, lines.length - shown.length);
+  const shown = verbose || lines.length <= 4 ? lines : error ? [...lines.slice(0, 1), "…", ...lines.slice(-2)] : lines.slice(0, 3);
+  const hidden = Math.max(0, lines.length - (error && !verbose && lines.length > 4 ? 3 : shown.length));
+  const truncated = !verbose && shown.some(line => line.length > 320);
+  const visible = verbose ? shown : shown.map(line => line.length > 320 ? `${Array.from(line).slice(0, 320).join("")}…` : line);
   return (
     <Box flexDirection="column">
-      <Text {...(error ? { color: "red" as const } : {})} dimColor={!error}>{shown.join("\n") || (error ? "Failed" : "(No output)")}</Text>
-      {!verbose && hidden > 0 ? <Text dimColor>… +{hidden} lines (ctrl+o to expand)</Text> : null}
+      <Text {...(error ? { color: "red" as const } : {})} dimColor={!error}>{visible.join("\n") || (error ? "Failed" : "(No output)")}</Text>
+      {!verbose && (hidden > 0 || truncated) ? <Text dimColor>… {hidden > 0 ? `+${hidden} lines` : "long lines folded"}<ExpansionHint /></Text> : null}
     </Box>
   );
 }

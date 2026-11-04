@@ -8,6 +8,10 @@ export const KEYBINDING_ACTIONS = [
   "toggleTranscript",
   "toggleTasks",
   "pasteImage",
+  "promptQueue",
+  "previousTool",
+  "nextTool",
+  "toggleTool",
 ] as const;
 
 export type KeybindingAction = (typeof KEYBINDING_ACTIONS)[number];
@@ -20,6 +24,10 @@ export const DEFAULT_KEYBINDINGS: KeybindingMap = {
   toggleTranscript: "ctrl+o",
   toggleTasks: "ctrl+t",
   pasteImage: "ctrl+v",
+  promptQueue: "ctrl+q",
+  previousTool: "meta+up",
+  nextTool: "meta+down",
+  toggleTool: "meta+enter",
 };
 
 type KeyLike = {
