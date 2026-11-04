@@ -1,0 +1,94 @@
+import type { WorkerResources } from "../services/runtime/engine";
+import type { DurableRun, DurableTask } from "../services/runtime/types";
+import type { JournalOutcome } from "../core/call-journal";
+import type { ToolUseBlock } from "../core/message";
+import type { AgentTool } from "../core/tool";
+import { digestJson, encodeJson, text } from "../services/runtime/json";
+
+export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+export type ResourceClaim = { id: string; mode: "read" | "write" };
+export type CapabilityGrant = { name: string; resources: string[]; mode: "read" | "write" };
+/** Persisted data only. Credentials and executable adapter code remain on the host. */
+export type DomainDescriptor = { id: string; version: string; config: JsonValue; resources: ResourceClaim[]; grants: CapabilityGrant[] };
+export type DomainContext = { descriptor: DomainDescriptor; namespace: string; run: DurableRun; task: DurableTask; signal: AbortSignal };
+export type DomainAcceptance = { checks: Array<{ command: string; output: string }>; evidence?: JsonValue };
+export type DomainOperation = { operationId: string; call: ToolUseBlock; input: unknown };
+export type DomainReceipt = { operationId: string; name: string; input: unknown; result: string; truncated: boolean };
+
+export interface AgentDomainAdapter {
+  readonly id: string;
+  readonly version: string;
+  validate(config: JsonValue): void;
+  createWorker(context: DomainContext): Promise<WorkerResources>;
+  /** Host facts, not a model summary; must change when relevant inputs change. */
+  snapshot(context: DomainContext): Promise<JsonValue>;
+  /** Must be read-only/replay-safe. Throw to reject a candidate. */
+  accept(context: DomainContext, candidate: { report: string; inputDigest: string; receipts: DomainReceipt[] }): Promise<DomainAcceptance>;
+  /** Query an external idempotency key/status; never redispatch the original effect. */
+  reconcile?(context: DomainContext, operation: DomainOperation): Promise<JournalOutcome | undefined>;
+}
+
+export function validateDomainDescriptor(descriptor: DomainDescriptor): DomainDescriptor {
+  // Reject non-JSON values rather than silently dropping functions/undefined during restart.
+  const visit = (value: unknown, depth = 0): void => {
+    if (depth > 32) throw new Error("Adapter configuration nesting exceeds limit");
+    if (value === null || typeof value === "string" || typeof value === "boolean" || typeof value === "number" && Number.isFinite(value)) return;
+    if (Array.isArray(value)) { for (const item of value) visit(item, depth + 1); return; }
+    if (value && typeof value === "object" && Object.getPrototypeOf(value) === Object.prototype) { Object.values(value).forEach(item => visit(item, depth + 1)); return; }
+    throw new Error("Adapter descriptor must contain JSON data only");
+  };
+  visit(descriptor);
+  if (!descriptor || Object.keys(descriptor).some(key => !["id", "version", "config", "resources", "grants"].includes(key))) throw new Error("Invalid adapter descriptor");
+  text(descriptor.id, "adapter ID", 128); text(descriptor.version, "adapter version", 128);
+  if (descriptor.id === "coding") throw new Error("coding is a reserved adapter ID");
+  if (!Array.isArray(descriptor.resources) || !descriptor.resources.length || descriptor.resources.length > 32) throw new Error("Adapter needs one to 32 resource claims");
+  if (!Array.isArray(descriptor.grants) || descriptor.grants.length > 64) throw new Error("Invalid capability grants");
+  const ids = new Set<string>();
+  for (const claim of descriptor.resources) {
+    text(claim.id, "resource ID", 512);
+    if (!["read", "write"].includes(claim.mode) || ids.has(claim.id)) throw new Error("Invalid or duplicate resource claim");
+    ids.add(claim.id);
+  }
+  for (const grant of descriptor.grants) {
+    text(grant.name, "capability name", 128);
+    if (!["read", "write"].includes(grant.mode) || !Array.isArray(grant.resources) || !grant.resources.length || grant.resources.length > 32) throw new Error("Invalid capability grant");
+    for (const resource of grant.resources) if (!descriptor.resources.some(claim => claim.id === resource && (grant.mode === "read" || claim.mode === "write"))) throw new Error("Capability exceeds resource claims");
+  }
+  if (Buffer.byteLength(encodeJson(descriptor)) > 65536) throw new Error("Adapter descriptor exceeds 64 KiB");
+  return structuredClone(descriptor);
+}
+
+export class DomainRegistry {
+  readonly #adapters = new Map<string, AgentDomainAdapter>();
+  constructor(adapters: readonly AgentDomainAdapter[] = []) {
+    for (const adapter of adapters) {
+      text(adapter.id, "adapter ID", 128); text(adapter.version, "adapter version", 128);
+      const key = digestJson({ id: adapter.id, version: adapter.version });
+      if (adapter.id === "coding" || this.#adapters.has(key)) throw new Error("Duplicate or reserved adapter identity");
+      this.#adapters.set(key, Object.freeze({ id: adapter.id, version: adapter.version, validate: adapter.validate.bind(adapter), createWorker: adapter.createWorker.bind(adapter),
+        snapshot: adapter.snapshot.bind(adapter), accept: adapter.accept.bind(adapter), ...(adapter.reconcile ? { reconcile: adapter.reconcile.bind(adapter) } : {}) }));
+    }
+  }
+  resolve(descriptor: DomainDescriptor): AgentDomainAdapter {
+    const adapter = this.#adapters.get(digestJson({ id: descriptor.id, version: descriptor.version }));
+    if (!adapter) throw new Error(`Adapter unavailable: ${descriptor.id}@${descriptor.version}; register the pinned version or migrate explicitly`);
+    const validation: unknown = adapter.validate(structuredClone(descriptor.config));
+    if (validation && typeof (validation as { then?: unknown }).then === "function") {
+      void Promise.resolve(validation).catch(() => undefined);
+      throw new Error("Adapter config validation must be synchronous");
+    }
+    return adapter;
+  }
+}
+
+export const RUNTIME_TOOL_NAMES = new Set(["agent", "durable_wait", "durable_recall", "assess_delegation", "review_child_result", "complete_investigation"]);
+export function selectDomainTools(tools: AgentTool[], descriptor: DomainDescriptor): AgentTool[] {
+  if (new Set(tools.map(tool => tool.name)).size !== tools.length || tools.some(tool => RUNTIME_TOOL_NAMES.has(tool.name))) throw new Error("Duplicate or reserved adapter tool name");
+  return tools.filter(tool => {
+    const capability = tool.capability;
+    if (!capability) return false; // Includes unclassified MCP tools; classification belongs to the trusted host.
+    if (!["read", "write"].includes(capability.mode) || !Array.isArray(capability.resources) || !capability.resources.length) throw new Error("Invalid tool capability");
+    return capability.resources.every(id => descriptor.grants.some(grant => grant.name === capability.name && grant.resources.includes(id)
+      && (capability.mode === "read" || grant.mode === "write")));
+  });
+}

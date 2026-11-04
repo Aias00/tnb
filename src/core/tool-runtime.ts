@@ -66,7 +66,7 @@ export async function executeTool(
         name: use.name,
         data: structuredClone(data),
       });
-    });
+    }, { toolUseId: use.id, operationId: invocationId, scope });
     const content = typeof output === "string" ? output : output.content;
     const attachments = typeof output === "string" ? [] : output.attachments;
     if (invocationId && options.callJournal) {

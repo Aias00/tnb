@@ -1,0 +1,48 @@
+import { afterEach, expect, test } from "bun:test";
+import { randomUUID } from "node:crypto";
+import { spawn } from "node:child_process";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { DomainRegistry, validateDomainDescriptor, type DomainDescriptor } from "../../src/agent/domain";
+import { tryAcquireResources } from "../../src/services/runtime/resources";
+const roots: string[] = [];
+afterEach(async () => { for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true }); });
+async function directory() { const path = await mkdtemp(join(tmpdir(), "tnb-domain-resources-")); roots.push(path); return path; }
+const descriptor = (): DomainDescriptor => ({ id: "fixture", version: "1", config: {}, resources: [{ id: "account/document", mode: "read" }], grants: [{ name: "read.document", resources: ["account/document"], mode: "read" }] });
+test("persisted adapter descriptors reject executable config and permission escalation", () => {
+  const value = descriptor();
+  expect(validateDomainDescriptor(value)).toEqual(value);
+  value.grants[0]!.mode = "write"; expect(() => validateDomainDescriptor(value)).toThrow("exceeds resource");
+  value.grants = []; (value as unknown as { config: unknown }).config = { callback() {} };
+  expect(() => validateDomainDescriptor(value)).toThrow("JSON");
+  expect(() => new DomainRegistry().resolve(descriptor())).toThrow("pinned version");
+  const sparse = descriptor(); sparse.config = Array(2);
+  expect(() => validateDomainDescriptor(sparse)).toThrow("JSON");
+});
+test("resource admission atomically allows readers, excludes writers and rolls back partial admission", async () => {
+  const directoryPath = await directory(), id = randomUUID();
+  const first = tryAcquireResources([{ id, mode: "read" }], directoryPath)!;
+  const second = tryAcquireResources([{ id, mode: "read" }], directoryPath)!;
+  try {
+    expect(second).toBeDefined(); expect(tryAcquireResources([{ id, mode: "write" }], directoryPath)).toBeUndefined();
+    expect(tryAcquireResources([{ id: "free", mode: "write" }, { id, mode: "write" }], directoryPath)).toBeUndefined();
+    const free = tryAcquireResources([{ id: "free", mode: "write" }], directoryPath); expect(free).toBeDefined(); free!();
+  } finally { second(); first(); }
+  const writer = tryAcquireResources([{ id, mode: "write" }], directoryPath)!;
+  try { expect(tryAcquireResources([{ id, mode: "read" }], directoryPath)).toBeUndefined(); } finally { writer(); }
+});
+test.skipIf(process.platform === "win32")("resource leases from a killed process are reclaimed without replaying work", async () => {
+  const directoryPath = await directory(), id = randomUUID();
+  const module = new URL("../../src/services/runtime/resources.ts", import.meta.url).href;
+  const script = `import { tryAcquireResources } from ${JSON.stringify(module)}; const release=tryAcquireResources([{id:process.env.RESOURCE_ID,mode:'write'}],process.env.RESOURCE_DIRECTORY);if(!release)throw new Error('busy');process.stdout.write('held\\n');setInterval(()=>{},1000);`;
+  const child = spawn(process.execPath, ["-e", script], { env: { ...process.env, RESOURCE_ID: id, RESOURCE_DIRECTORY: directoryPath }, stdio: ["ignore", "pipe", "pipe"] });
+  const exited = new Promise<void>(resolve => child.once("close", () => resolve()));
+  try {
+    await new Promise<void>((resolve, reject) => { const timer = setTimeout(() => reject(new Error("Resource child did not acquire lease")), 3000);
+      child.stdout.once("data", () => { clearTimeout(timer); resolve(); }); child.once("error", reject); child.once("exit", () => { clearTimeout(timer); reject(new Error("Resource child exited early")); }); });
+    expect(tryAcquireResources([{ id, mode: "read" }], directoryPath)).toBeUndefined();
+    child.kill("SIGKILL"); await exited;
+    const next = tryAcquireResources([{ id, mode: "write" }], directoryPath); expect(next).toBeDefined(); next!();
+  } finally { if (child.exitCode === null) child.kill("SIGKILL"); await exited; }
+});

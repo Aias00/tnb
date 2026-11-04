@@ -29,7 +29,7 @@ export function workbenchItems(tab: WorkbenchTab, data: { runs: readonly RunPres
   ];
 }
 export function runDetailLines(detail: RunDetail): string[] {
-  return [`交付：${detail.acceptance === "verification-commands" ? "配置的验收命令已通过" : detail.acceptance === "report-delivered" ? "报告已交付；没有执行验收命令" : "尚未接纳结果"}`,
+  return [`交付：${detail.acceptance === "domain-verified" ? "场景验收已通过" : detail.acceptance === "verification-commands" ? "配置的验收命令已通过" : detail.acceptance === "report-delivered" ? "报告已交付；没有执行验收命令" : "尚未接纳结果"}`,
     "", "报告", detail.report, "", `检查（${detail.checks.length}）`, ...detail.checks.flatMap((check) => [`✓ ${check.command}`, check.output]),
     "", `已确认的文件修改（最近 ${detail.changes.length} 项）`, ...detail.changes.flatMap((change) => [`${change.tool} · ${change.path}`, change.preview]),
     ...(detail.unresolved.length ? ["", "待核对的操作（不会自动重做）", ...detail.unresolved.flatMap((operation) => [`${operation.name} · operation ${operation.id} · task ${operation.taskId}`, operation.input]),

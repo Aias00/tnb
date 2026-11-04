@@ -49,7 +49,7 @@ export function createDurableContext(options: {
         if (block.type === "tool-use") toolNames.set(block.id, block.name);
         if (block.type === "tool-result" && ["durable_recall", "durable_wait", "agent", "assess_delegation", "review_child_result", "complete_investigation"].includes(toolNames.get(block.toolUseId) ?? "")) continue;
         if (block.type !== "tool-result" || Buffer.byteLength(block.content) <= resultBytes) continue;
-        const marker = "\n[Tool output shortened in active context. Use durable_recall for the original result; re-check files before relying on omitted details.]";
+        const marker = "\n[Tool output shortened in active context. Use durable_recall for the original result; re-check resources before relying on omitted details.]";
         const head = prefixWithin(block.content, (text) => Buffer.byteLength(text + marker) <= resultBytes);
         block.content = head + marker;
         cappedToolResults++;
@@ -92,7 +92,7 @@ export function createDurableContext(options: {
 
   function collapse(messages: ConversationMessage[]): ConversationMessage[] {
     const notice: ConversationMessage[] = [
-      { role: "user", content: [{ type: "text", text: `[Context recovery: earlier evidence was omitted because a bounded summary was unavailable or insufficient. Archive: ${options.transcriptPath}; use durable_recall to page original task evidence. Use the pinned task contract and checkpoint; inspect current files and verification evidence before continuing. Do not assume omitted operations failed or repeat side effects blindly.]` }] },
+      { role: "user", content: [{ type: "text", text: `[Context recovery: earlier evidence was omitted because a bounded summary was unavailable or insufficient. Archive: ${options.transcriptPath}; use durable_recall to page original task evidence. Use the pinned task contract and checkpoint; inspect current resources and verification evidence before continuing. Do not assume omitted operations failed or repeat side effects blindly.]` }] },
       { role: "assistant", content: [{ type: "text", text: "I will reconcile current facts before continuing." }] },
     ];
     for (let index = 1; index <= messages.length; index++) {

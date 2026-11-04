@@ -21,7 +21,7 @@ export const pauseDescription: Record<string, string> = {
   "unknown-effects": "操作结果未知，需要核对影响", "execution-error": "执行阻塞，需要查看错误",
 };
 const phaseLabels: Record<TaskActivity["phase"], string> = { preparing: "准备模型请求 / 等待模型名额", model: "请求模型", compacting: "整理上下文",
-  workspace: "等待工作区释放", capacity: "等待执行名额", verification: "正在验收" };
+  workspace: "等待工作区释放", resources: "等待业务资源释放", capacity: "等待执行名额", verification: "正在验收" };
 function taskPhase(runtime: DurableRuntime, task: DurableTask): string {
   if (task.status === "succeeded") return "已接纳结果";
   if (task.status === "failed") return "失败";
@@ -36,7 +36,7 @@ function taskPhase(runtime: DurableRuntime, task: DurableTask): string {
   if (task.status === "validating" && activity?.phase !== "verification") return "准备验收";
   const pending = runtime.store.record<TaskProgress>("task-progress", task.taskId)?.value.pending;
   if (task.status === "running" && pending?.length && activity?.phase !== "compacting") return `执行工具：${pending.slice(0, 3).map((call) => call.name).join("、")}`;
-  if (activity && (task.status === "running" || task.status === "validating" || ["workspace", "capacity"].includes(activity.phase))) {
+  if (activity && (task.status === "running" || task.status === "validating" || ["workspace", "resources", "capacity"].includes(activity.phase))) {
     return activity.phase === "verification" ? `验收 ${activity.completed ?? 0}/${activity.total ?? 0}` : phaseLabels[activity.phase];
   }
   return task.status === "validating" ? "待验收" : "待执行";
@@ -47,7 +47,7 @@ export function presentRun(runtime: DurableRuntime, runId: string): RunPresentat
   const charges = runtime.store.records<{ priced?: boolean }>("model-request", runId); const requests = charges.length;
   const inputs = root ? runtime.store.records<TaskInput>("task-input", runId, root.taskId).sort((a, b) => b.value.inputRevision - a.value.inputRevision).slice(0, 3) : [];
   const phase = run.status === "paused" ? pauseDescription[run.pauseReason ?? "user"] ?? "已暂停" : run.status === "pausing" ? "暂停中，正在排空执行" : run.status === "cancelling" ? "取消中，正在核对执行结果"
-    : run.status === "succeeded" ? (config.checks?.length ? "验收通过" : "报告已交付，未执行验收命令") : run.status === "failed" ? "任务失败" : run.status === "cancelled" ? "已取消" : root ? taskPhase(runtime, root) : "待执行";
+    : run.status === "succeeded" ? (config.domain ? "场景验收通过" : config.checks?.length ? "验收通过" : "报告已交付，未执行验收命令") : run.status === "failed" ? "任务失败" : run.status === "cancelled" ? "已取消" : root ? taskPhase(runtime, root) : "待执行";
   return { runId, revision: run.revision, title: run.objective.slice(0, 160), workspace: config.workspace, mode: run.policy.mode, status: run.status, phase,
     reason: run.pauseReason, updatedAt: Math.max(run.updatedAt, ...tasks.map((task) => Math.max(task.updatedAt, runtime.store.record<TaskActivity>("task-activity", task.taskId)?.value.at ?? 0))), model: config.model?.slice(0, 256), provider: config.provider?.slice(0, 256), checks: config.checks?.length ?? 0,
     budget: { ...runtime.budget.totals(runId), requests, limit: config.maxModelRequests, maxCostUsd: config.maxCostUsd, priced: requests > 0 && charges.every((charge) => charge.value.priced === true) },
