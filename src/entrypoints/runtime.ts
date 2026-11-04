@@ -11,6 +11,9 @@ import { withOfflineRuntime, backupRuntime, restoreRuntime, pruneRuntime, runtim
 
 const HELP = `Usage: tnb runtime <submit|status|result|list|events|questions|answer|limits|pause|resume|cancel|reconcile|start|restart|serve|stop|backup|restore|prune|storage> [options]
 
+followup [run-id] --text "requirements" [--task ID] [--input-id ID]
+  Select an unresolved input with --resolve-input ID --revision N and a run-id.
+routing [--cwd PATH]  Show input routing decisions and pending clarification.
 submit <objective> [--cwd PATH] [--mode single|auto|multi] [--allow-write] [--allow-shell]
   [--check COMMAND]... [--allow-workspace PATH]... [--provider ID] [--model ID]
   [--max-budget-usd N] [--max-turns N] [--deadline ISO-DATE] [--command-id ID] [--no-start]
@@ -36,7 +39,7 @@ Reconciliation asserts an already observed external result and never reruns the 
 `;
 
 export async function runRuntimeCommand(options: { argv: string[]; cwd: string; env: Record<string, string | undefined>;
-  originSessionId?: string; stdout: { write(value: string): unknown }; stderr: { write(value: string): unknown } }): Promise<number> {
+  originSessionId?: string; sourceText?: string; stdout: { write(value: string): unknown }; stderr: { write(value: string): unknown } }): Promise<number> {
   const args = options.argv.slice(1); const action = args[0];
   const value = (name: string) => { const index = args.indexOf(name); return index < 0 ? undefined : args[index + 1]; };
   const values = (name: string) => args.flatMap((item, index) => item === name && args[index + 1] ? [args[index + 1]!] : []);
@@ -73,6 +76,16 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
     if (action === "submit" && !args.includes("--no-start")) await ensureRuntime(configDir, options.env);
     let result: unknown;
     if (action === "list") result = await runtimeRequest(configDir, "/runs");
+    else if (action === "routing") result = await runtimeRequest(configDir, `/routing?workspace=${encodeURIComponent(await realpath(resolve(value("--cwd") ?? options.cwd)))}`);
+    else if (action === "followup") {
+      const commandId = value("--command-id") ?? randomUUID();
+      const workspace = await realpath(resolve(value("--cwd") ?? options.cwd));
+      const original = value("--text") ?? (value("--resolve-input") ? "Resolve original input" : undefined);
+      if (!original) throw new Error("Followup requires --text or --resolve-input");
+      result = await runtimeRequest(configDir, "/command", { action, commandId, workspace, runId: args[1] && !args[1].startsWith("--") ? args[1] : undefined,
+        taskId: value("--task"), resolveInputId: value("--resolve-input"), expectedRevision: value("--revision") ? Number(value("--revision")) : undefined,
+        source: { inputId: value("--input-id") ?? commandId, workspace, rawText: original, source: options.originSessionId ? "conversation" : "cli", sessionId: options.originSessionId } });
+    }
     else if (action === "stop") result = await runtimeRequest(configDir, "/command", { action: "stop", commandId: randomUUID() });
     else if (["status", "events", "result", "questions"].includes(action)) result = await runtimeRequest(configDir, `/${action}?runId=${encodeURIComponent(args[1] ?? "")}&after=${value("--after") ?? "0"}&taskId=${encodeURIComponent(value("--task") ?? "")}`);
     else if (action === "submit") {
@@ -85,6 +98,8 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
           allowWrite: args.includes("--allow-write"), allowShell: args.includes("--allow-shell"), checks: values("--check"),
           provider: value("--provider"), model: value("--model"), maxCostUsd, maxTurns: Number(value("--max-turns") ?? 200), maxRetries: 3, compactThreshold: 24000 } };
       if (options.originSessionId) Object.assign(body.configuration, { originSessionId: options.originSessionId });
+      Object.assign(body, { successorOf: value("--successor"), source: { inputId: body.commandId, workspace: await realpath(workspace),
+        rawText: options.sourceText ?? args[1], source: options.originSessionId ? "conversation" : "cli", sessionId: options.originSessionId } });
       try { result = await runtimeRequest(configDir, "/command", body); }
       catch (error) { throw new Error(`${error instanceof Error ? error.message : String(error)}. Retry identical input with --command-id ${body.commandId}`); }
     } else if (action === "limits") {
@@ -118,18 +133,20 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
 
 /** Direct user slash commands inherit the active conversation's workspace and selected model. */
 export type RuntimeChatOptions = { args: string[]; cwd: string; workspace: string; configDir: string;
-  env: Record<string, string | undefined>; provider: string; model: string; sessionId: string };
+  env: Record<string, string | undefined>; provider: string; model: string; sessionId: string; sourceText?: string };
 export async function runRuntimeChatCommand(options: RuntimeChatOptions): Promise<string> {
   const args = options.args.length ? [...options.args] : ["list"]; const action = args[0]!;
-  if (!["submit", "list", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel", "storage", "start", "restart", "stop"].includes(action)) throw new Error("/runtime supports submit, list, status, result, events, questions, answer, limits, pause, resume, cancel, storage, start, restart and stop.");
-  const valueFlags = new Set(["--cwd", "--mode", "--check", "--allow-workspace", "--provider", "--model", "--max-budget-usd", "--max-turns", "--command-id", "--config-dir", "--after", "--task", "--question", "--answer", "--version", "--deadline", "--extend-hours", "--revision"]);
+  if (!["followup", "routing", "submit", "list", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel", "storage", "start", "restart", "stop"].includes(action)) throw new Error("/runtime supports submit, list, status, result, events, questions, answer, limits, pause, resume, cancel, storage, start, restart and stop.");
+  const valueFlags = new Set(["--text", "--input-id", "--resolve-input", "--successor", "--cwd", "--mode", "--check", "--allow-workspace", "--provider", "--model", "--max-budget-usd", "--max-turns", "--command-id", "--config-dir", "--after", "--task", "--question", "--answer", "--version", "--deadline", "--extend-hours", "--revision"]);
   const flags = new Set(["--allow-write", "--allow-shell", "--no-start", "--help", "-h"]);
-  const hasTarget = ["submit", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel"].includes(action);
+  if (action === "followup" && (!args[1] || args[1].startsWith("--"))) args.splice(1, 0, "");
+  const hasTarget = ["followup", "submit", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel"].includes(action);
   for (let index = hasTarget ? 2 : 1; index < args.length; index++) {
     const flag = args[index]!;
     if (valueFlags.has(flag)) { if (!args[index + 1] || args[index + 1]!.startsWith("--")) throw new Error(`${flag} requires a value`); index++; }
     else if (!flags.has(flag)) throw new Error(`Unexpected argument ${flag}; quote the objective and use supported runtime options`);
   }
+  if (["followup", "routing"].includes(action) && !args.includes("--cwd")) args.push("--cwd", options.workspace);
   if (action === "submit") {
     if (!args[1] || args[1].startsWith("--")) throw new Error('Usage: /runtime submit "objective" [--mode auto] [--allow-write --check "command"]');
     if (!args.includes("--cwd")) args.push("--cwd", options.workspace);
@@ -138,7 +155,7 @@ export async function runRuntimeChatCommand(options: RuntimeChatOptions): Promis
   }
   let output = ""; let error = "";
   const code = await runRuntimeCommand({ argv: ["runtime", ...args, "--config-dir", options.configDir], cwd: options.cwd,
-    env: options.env, originSessionId: options.sessionId, stdout: { write: (value) => { output += value; } }, stderr: { write: (value) => { error += value; } } });
+    env: options.env, originSessionId: options.sessionId, sourceText: options.sourceText, stdout: { write: (value) => { output += value; } }, stderr: { write: (value) => { error += value; } } });
   if (code) throw new Error(error.trim());
   return action === "submit" ? `Durable task accepted; it continues in the background. Use /runtime status <run-id> or /runtime result <run-id>.\n${output.trim()}` : output.trim();
 }
@@ -147,6 +164,8 @@ const LONG_TASK_HELP = `Long tasks · /longtask (aliases: /task, /long, /长任�
 
 /longtask "objective" [--mode single|auto|multi] [--allow-write] [--allow-shell]
   [--check "command"]... [--max-budget-usd N] [--max-turns N]
+/longtask followup [run-id] --text "additional requirements"
+/longtask routing
 /longtask list
 /longtask status|result|events|pause|resume|cancel [run-id]
 /longtask questions [run-id]
@@ -165,7 +184,7 @@ run-id to select another task. Closing the conversation does not cancel work.
 export async function runLongTaskChatCommand(options: RuntimeChatOptions): Promise<string> {
   let args = [...options.args];
   if (!args.length || args[0] === "help" || args.includes("--help") || args.includes("-h")) return LONG_TASK_HELP;
-  const actions = new Set(["submit", "list", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel"]);
+  const actions = new Set(["followup", "routing", "submit", "list", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel"]);
   if (!actions.has(args[0]!)) args.unshift("submit");
   if (args[0] === "submit") {
     const flagAt = args.findIndex((value, index) => index > 0 && value.startsWith("--"));
@@ -174,6 +193,7 @@ export async function runLongTaskChatCommand(options: RuntimeChatOptions): Promi
     const result = await runRuntimeChatCommand({ ...options, args });
     return result.replaceAll("/runtime status <run-id>", "/longtask status").replaceAll("/runtime result <run-id>", "/longtask result");
   }
+  if (["followup", "routing"].includes(args[0]!)) return runRuntimeChatCommand({ ...options, args });
   if (args[0] === "list" || !args[1] || args[1]!.startsWith("--")) {
     if (args[0] === "list") for (let index = 1; index < args.length; index += 2) {
       if (!["--cwd", "--config-dir"].includes(args[index]!) || !args[index + 1] || args[index + 1]!.startsWith("--")) throw new Error("Usage: /longtask list [--cwd PATH] [--config-dir PATH]");

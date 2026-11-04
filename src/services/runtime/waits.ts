@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { digestJson, integer, text } from "./json";
 import { RuntimeStore, type RuntimeTransaction } from "./store";
 import type { DurableRun, DurableTask, WorkerIdentity } from "./types";
+import { recordRouting, type RoutingInput } from "./routing";
 
 export type WaitProposal =
   | { kind: "question"; key: string; question: string; options?: string[]; about: string }
@@ -61,7 +62,7 @@ export class DurableWaits {
       return value;
     });
   }
-  answer(input: { commandId: string; runId: string; waitId: string; expectedVersion: number; answer: string }): WaitView {
+  answer(input: { commandId: string; runId: string; waitId: string; expectedVersion: number; answer: string; source?: RoutingInput }): WaitView {
     text(input.answer, "question answer", 8000); integer(input.expectedVersion, "question version", 1);
     return this.store.command(input.commandId, { kind: "wait.answer", input }, this.clock(), (tx) => {
       const record = tx.record<DurableWait>("wait", input.waitId);
@@ -79,6 +80,7 @@ export class DurableWaits {
       const saved = tx.saveRecord({ ...record, value: answered }, record.revision);
       tx.signal(input.runId, "message", input.waitId, { waitId: input.waitId });
       tx.event(input.runId, "wait.answered", { waitId: input.waitId, version: saved.revision }, value.taskId);
+      if (input.source) recordRouting(tx, input.source, "answer", input.runId, value.taskId);
       // Waking is performed by the owner's next scan, including answers that precede parking.
       return { ...answered, version: saved.revision };
     });
@@ -105,7 +107,8 @@ export function refreshWaits(tx: RuntimeTransaction, run: DurableRun): void {
     if (["cancelling", "cancelled", "failed", "succeeded"].includes(run.status)) state = "cancelled";
     else if (run.status === "active") {
       if (wait.proposal.kind === "timer" && wait.dueAt! <= tx.now) state = "elapsed";
-      if (wait.proposal.kind === "children" && wait.proposal.children.every((id) => tx.getTask(id)?.status === "succeeded")) state = "resolved";
+      if (wait.proposal.kind === "children" && wait.proposal.children.every((id) => tx.getTask(id)?.status === "succeeded"
+        || (tx.getTask(id)?.status === "failed" && tx.record<{ required: boolean }>("delegation-contract", id)?.value.required === false))) state = "resolved";
     }
     if (!state) continue;
     tx.saveRecord({ ...record, value: { ...wait, state, completedAt: tx.now } }, record.revision);

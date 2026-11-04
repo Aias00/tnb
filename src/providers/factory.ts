@@ -5,6 +5,7 @@ import { createOpenAIResponsesTransport } from "./openai-responses";
 import { resolveProviderSelection, type ProviderSelection } from "./config";
 import type { ModelTransport } from "./types";
 import type { BillingRoute } from "../services/usage/budget";
+import { createHash } from "node:crypto";
 
 export type ReasoningEffort = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
 
@@ -14,7 +15,9 @@ export function resolveBillingRoute(selection: ProviderSelection, modelId: strin
     : provider.models.find((item) => item.id === modelId)
       ?? ((provider.id === "anthropic" || provider.id === "openai")
         ? resolveProviderSelection({ providers: { [provider.id]: provider } }, provider.id, modelId).model : undefined);
-  return { provider: provider.id, model: modelId, ...(model?.pricing ? { pricing: model.pricing } : {}) };
+  return { provider: provider.id, model: modelId, ...(model?.pricing ? { pricing: model.pricing } : {}),
+    resourceDomain: createHash("sha256").update(JSON.stringify({ api: provider.api, endpoint: provider.baseUrl?.replace(/\/+$/, ""), credential: provider.apiKey,
+      headers: Object.fromEntries(Object.entries(provider.headers ?? {}).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) })).digest("hex") };
 }
 
 export function createConfiguredTransport(

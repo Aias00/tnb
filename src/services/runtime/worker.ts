@@ -78,7 +78,7 @@ export function createRuntimeWorkerFactory(options: { configDir: string; runtime
       projectInstructions: await loadProjectInstructions(workspace, { stopAt: workspace }),
       authorize: async (tool, input, context) => {
         signal.throwIfAborted();
-        if (tool.name === "agent" || tool.name === "durable_wait" || tool.name === "durable_recall") return { behavior: "allow" };
+        if (["agent", "durable_wait", "durable_recall", "assess_delegation", "review_child_result", "complete_investigation"].includes(tool.name)) return { behavior: "allow" };
         return checker({ ...tool, risk: tool.access }, input, signal, context);
       },
       check: shell ? async (command, checkSignal) => {

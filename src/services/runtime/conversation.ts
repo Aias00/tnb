@@ -51,7 +51,7 @@ export async function runRuntimeControlTurn(options: CliOptions, parsed: ParsedA
     });
     budget = new UsageBudget({ maxCostUsd: parsed.maxBudgetUsd, onUsage: (record) => session.appendUsage(record) });
     const signal = options.signal ? AbortSignal.any([options.signal, budget.signal]) : budget.signal;
-    const transport = budget.wrap(options.transport ?? createConfiguredTransport(selection, parsed.thinking, parsed.fastMode), (request) => resolveBillingRoute(selection, request.model));
+    const transport = budget.wrap(options.transport ?? createConfiguredTransport(selection, parsed.thinking, parsed.fastMode), (request) => resolveBillingRoute(selection, request.model), { workspace: context.workspace });
     options.onInvocationTransport?.(transport);
     const evaluateHook: HookModelHandler = async (hook, input, hookSignal) => {
       if (hook.type === "agent" && (hook.tools ?? ["read", "grep", "glob"]).length) return { ok: false, reason: "Hook workspace tools are unavailable while a durable worker owns the workspace" };
@@ -64,7 +64,7 @@ export async function runRuntimeControlTurn(options: CliOptions, parsed: ParsedA
       return evaluation.messages.at(-1)?.content.filter((block) => block.type === "text").map((block) => (block as { text: string }).text).join("\n") ?? "";
     };
     hooks?.setModelHandlers({ prompt: evaluateHook, agent: evaluateHook });
-    const tool = createDurableTaskTool({ configDir, env: options.env, sessionId: session.sessionId,
+    const tool = createDurableTaskTool({ configDir, env: options.env, sessionId: session.sessionId, sourceText: typeof options.promptContent === "string" ? options.promptContent : parsed.prompt,
       workspace: () => context.workspace, roots: () => context.roots, provider: selection.provider.id, model: selection.model.id });
     const eligible = parsed.tools === undefined || parsed.tools.some((name) => name.toLowerCase() === "durable_task");
     const allowed = !parsed.allowedTools.length || parsed.allowedTools.some((name) => name.toLowerCase() === "durable_task");

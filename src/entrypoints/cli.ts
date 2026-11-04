@@ -986,10 +986,11 @@ export async function runCli(options: CliOptions): Promise<number> {
   let releaseSession: (() => Promise<void>) | undefined;
   const workspaceReleases: Array<() => Promise<void>> = [];
   const lockedWorkspaces = new Set<string>();
+  const workspaceOwner = randomUUID();
   const lockWorkspace = async (path: string) => {
     const canonical = await realpath(path); if (lockedWorkspaces.has(canonical)) return;
     const { acquireWorkspace } = await import("../services/runtime/workspace");
-    workspaceReleases.push(await acquireWorkspace(canonical)); lockedWorkspaces.add(canonical);
+    workspaceReleases.push(await acquireWorkspace(canonical, workspaceOwner)); lockedWorkspaces.add(canonical);
   };
   let usageBudget: UsageBudget | undefined;
   let releasePermissionObserver: (() => void) | undefined;
@@ -1147,7 +1148,7 @@ export async function runCli(options: CliOptions): Promise<number> {
     options = { ...options, signal: options.signal
       ? AbortSignal.any([options.signal, budget.signal]) : budget.signal };
     const meter = (raw: ModelTransport, route: ProviderSelection) => budget.wrap(raw,
-      (request) => resolveBillingRoute(route, request.model));
+      (request) => resolveBillingRoute(route, request.model), { workspace: options.cwd });
     const transport = meter(options.transport ?? lazyModelTransport(() => createConfiguredTransportWithFallback(
       selection, fallbackSelection, parsed.thinking, undefined, effectiveFastMode,
     )), selection);
@@ -1846,7 +1847,7 @@ export async function runCli(options: CliOptions): Promise<number> {
       : undefined;
     const workflowTool = createWorkflowTool(agentTool);
     const planModeTools = createPlanModeTools(permissionModeState);
-    const durableTool = createDurableTaskTool({ configDir, env: options.env, sessionId: session.sessionId,
+    const durableTool = createDurableTaskTool({ configDir, env: options.env, sessionId: session.sessionId, sourceText: typeof options.promptContent === "string" ? options.promptContent : parsed.prompt,
       workspace: workspace.current, roots: workspace.roots, provider: selection.provider.id, model: selectedModel });
     const availableTools = skillTool
       ? [...baseTools, agentTool, workflowTool, ...planModeTools, skillTool, durableTool]

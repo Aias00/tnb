@@ -1,5 +1,5 @@
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { chmod, mkdir, readFile, writeFile, unlink, lstat } from "node:fs/promises";
+import { chmod, mkdir, readFile, writeFile, unlink, lstat, realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { digestJson } from "./json";
 import { DurableRuntime, type RuntimeConfiguration } from "./engine";
@@ -7,6 +7,7 @@ import { RuntimeStore } from "./store";
 import { createRuntimeWorkerFactory } from "./worker";
 import { lock } from "../../utils/lockfile";
 import { questionAttentionResponse } from "./attention-stream";
+import type { RoutingInput, RoutingDecision } from "./routing";
 
 export async function runtimePaths(configDir: string): Promise<{ root: string; socket: string; token: string }> {
   const root = resolve(configDir, "runtime"); await mkdir(root, { recursive: true, mode: 0o700 });
@@ -20,7 +21,9 @@ export async function runtimePaths(configDir: string): Promise<{ root: string; s
 type ServerOptions = { configDir: string; env: Record<string, string | undefined>; signal: AbortSignal; runtime?: DurableRuntime; ready?(socket: string): void };
 export const RUNTIME_CAPABILITIES = Object.freeze({ protocol: 2, defaultMode: "auto", maxDelegationDepth: 2, maxParallelBranches: 4,
   readOnlyDelegation: true, parallelWrites: false, skills: false, mcp: false, remoteFederation: false, offlineBackup: true, conversationHandoff: true,
-  durableWaits: true, durableDelegation: true, deadlineScheduling: true, questionNotifications: true, lifecycleNotifications: true, adjustableLimits: true });
+  durableWaits: true, durableDelegation: true, deadlineScheduling: true, questionNotifications: true, lifecycleNotifications: true, adjustableLimits: true,
+  taskRouting: true, safeFollowups: true, delegationStrategyVersion: 2, defaultDelegationDepth: 1, autoParallelBranches: 2,
+  structuredChildReports: true, machineModelCoordination: true, overlappingWorkspaceLocks: true });
 export async function serveDurableRuntime(options: ServerOptions): Promise<void> {
   const paths = await runtimePaths(options.configDir);
   const release = await lock(paths.root, { realpath: true, stale: 5000, update: 1000, retries: 0 });
@@ -56,6 +59,10 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
           const url = new URL(request.url);
           if (request.method === "GET") {
             if (url.pathname === "/health") return Response.json({ ready: !runtime.lastError, pid: process.pid, error: runtime.lastError, capabilities: RUNTIME_CAPABILITIES });
+            if (url.pathname === "/routing") {
+              const workspace = await realpath(url.searchParams.get("workspace") ?? "");
+              return Response.json(store.routes(workspace));
+            }
             if (url.pathname === "/attention") {
               const workspace = url.searchParams.get("workspace"); if (!workspace) throw new Error("Notification workspace is required");
               return questionAttentionResponse(runtime, workspace, request.signal);
@@ -88,14 +95,42 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
           const input = await request.json() as { action: string; commandId: string; runId?: string; objective?: string;
             configuration?: RuntimeConfiguration; mode?: "single" | "auto" | "multi"; taskId?: string; operationId?: string; result?: string;
             waitId?: string; expectedVersion?: number; answer?: string; noticeId?: string; expectedRevision?: number;
-            deadline?: number; extendMs?: number; maxCostUsd?: number };
+            deadline?: number; extendMs?: number; maxCostUsd?: number; source?: RoutingInput; workspace?: string; text?: string; inputId?: string; resolveInputId?: string; successorOf?: string; routeAction?: string };
           return await serialCommand(async () => {
             if (typeof input.commandId !== "string" || !input.commandId) throw new Error("commandId is required");
             if (input.expectedRevision !== undefined && (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1)) throw new Error("Invalid expected Run revision");
             if (input.action === "stop") { setTimeout(() => stopped.resolve(), 20); return Response.json({ stopping: true }); }
-            if (input.action === "submit") return Response.json(await runtime.submit({ commandId: input.commandId, objective: input.objective!, configuration: input.configuration!, mode: input.mode, deadline: input.deadline }));
+            if (input.action === "route-control") {
+              if (!input.source || await realpath(input.source.workspace) !== input.source.workspace) throw new Error("Canonical input source is required");
+              return Response.json(runtime.router.clarifyControl({ commandId: input.commandId, source: input.source, action: input.routeAction! }));
+            }
+            if (input.action === "resolve-route") {
+              const decision = store.route<RoutingDecision>(input.resolveInputId!);
+              if (!decision || !input.source || decision.workspace !== input.source.workspace || decision.sessionId !== input.source.sessionId
+                || !decision.candidates.some((candidate) => candidate.runId === input.runId)) throw new Error("Routing target is not in the original question scope");
+              if (decision.status === "accepted" && decision.runId === input.runId && decision.revision === (input.expectedRevision ?? 0) + 1) return Response.json(decision);
+              if (decision.status !== "clarify" || decision.revision !== input.expectedRevision || !["run.pause", "run.cancel", "run.resume"].includes(decision.action)) throw new Error("Routing decision changed; refresh before selecting");
+              const run = store.getRun(input.runId!);
+              if (!run || runtime.configuration(run.runId).workspace !== decision.workspace) throw new Error("Control target workspace changed");
+              const source: RoutingInput = { inputId: decision.inputId, workspace: decision.workspace, rawText: decision.rawText, source: decision.source,
+                sessionId: decision.sessionId, resolutionRevision: decision.revision };
+              if (decision.action === "run.pause") runtime.commands.pauseRun({ commandId: input.commandId, runId: run.runId, expectedRevision: run.revision, source });
+              else if (decision.action === "run.cancel") runtime.commands.cancelRun({ commandId: input.commandId, runId: run.runId, expectedRevision: run.revision, source });
+              else await runtime.resume(run.runId, input.commandId, run.revision, source);
+              return Response.json(store.route(decision.inputId));
+            }
+            if (input.action === "submit") return Response.json(await runtime.submit({ commandId: input.commandId, objective: input.objective!, configuration: { ...input.configuration!, strategyVersion: 2 }, mode: input.mode, deadline: input.deadline, source: input.source, successorOf: input.successorOf }));
+            if (input.action === "followup") {
+              const workspace = await realpath(input.workspace ?? input.source?.workspace ?? "");
+              return Response.json(runtime.router.followup({ commandId: input.commandId, runId: input.runId, taskId: input.taskId,
+                resolveInputId: input.resolveInputId, expectedRevision: input.expectedRevision,
+                source: input.source ?? { inputId: input.inputId ?? input.commandId, workspace, rawText: input.text ?? "Resolve original input", source: "api" } }));
+            }
             const run = input.runId && store.getRun(input.runId);
             if (!run) throw new Error("Run not found");
+            const workspace = runtime.configuration(run.runId).workspace;
+            const source: RoutingInput = input.source ?? { inputId: input.commandId, workspace, rawText: input.answer ?? `${input.action} ${run.runId}`, source: "api" };
+            if (source.workspace !== workspace) throw new Error("Control input workspace mismatch");
             type Receipt = { digest: string; expectedRevision: number; result?: unknown };
             const digest = digestJson(input);
             const receipt = store.command(randomUUID(), { kind: "http.prepare", id: input.commandId, digest }, Date.now(), (tx) => {
@@ -107,12 +142,12 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
             if (receipt.result) return Response.json(receipt.result);
             if (input.action === "ack") runtime.commands.acknowledgeNotice({ commandId: input.commandId, runId: run.runId, noticeId: input.noticeId! });
             else if (input.action === "limits") runtime.commands.updateLimits({ commandId: input.commandId, runId: run.runId,
-              expectedRevision: receipt.expectedRevision, deadline: input.deadline, extendMs: input.extendMs, maxCostUsd: input.maxCostUsd });
+              expectedRevision: receipt.expectedRevision, deadline: input.deadline, extendMs: input.extendMs, maxCostUsd: input.maxCostUsd, source });
             else if (input.action === "answer") runtime.waits.answer({ commandId: input.commandId, runId: run.runId,
-              waitId: input.waitId!, expectedVersion: input.expectedVersion!, answer: input.answer! });
-            else if (input.action === "pause") runtime.commands.pauseRun({ commandId: input.commandId, runId: run.runId, expectedRevision: receipt.expectedRevision });
-            else if (input.action === "cancel") runtime.commands.cancelRun({ commandId: input.commandId, runId: run.runId, expectedRevision: receipt.expectedRevision });
-            else if (input.action === "resume") await runtime.resume(run.runId, input.commandId, receipt.expectedRevision);
+              waitId: input.waitId!, expectedVersion: input.expectedVersion!, answer: input.answer!, source });
+            else if (input.action === "pause") runtime.commands.pauseRun({ commandId: input.commandId, runId: run.runId, expectedRevision: receipt.expectedRevision, source });
+            else if (input.action === "cancel") runtime.commands.cancelRun({ commandId: input.commandId, runId: run.runId, expectedRevision: receipt.expectedRevision, source });
+            else if (input.action === "resume") await runtime.resume(run.runId, input.commandId, receipt.expectedRevision, source);
             else if (input.action === "reconcile") {
               if (store.getTask(input.taskId!)?.runId !== run.runId) throw new Error("Reconciliation task mismatch");
               await runtime.reconcile(input.taskId!, input.operationId!, input.result!);

@@ -1,5 +1,6 @@
 import type { DurableRuntime, RuntimeConfiguration } from "./engine";
-import type { QuestionNotice } from "./attention";
+import type { InboxQuestion } from "./attention";
+import type { RoutingDecision } from "./routing";
 import { pendingRunNotices } from "./notices";
 
 /** A reconnect always starts with authoritative open questions, so no event cursor can lose a decision. */
@@ -11,13 +12,16 @@ export function questionAttentionResponse(runtime: DurableRuntime, workspace: st
     start(controller) {
       let closed = false, previous: string | undefined;
       const snapshot = () => {
-        const questions: QuestionNotice[] = [];
+        const questions: InboxQuestion[] = [];
         page: for (const run of runtime.store.runs()) {
           if (runtime.store.record<RuntimeConfiguration>("configuration", run.runId)?.value.workspace !== workspace) continue;
           for (const question of runtime.waits.questions(run.runId)) {
             questions.push({ ...question, runObjective: run.objective, runStatus: run.status });
             if (questions.length === 64) break page; // Answering advances the bounded snapshot to the next decisions.
           }
+        }
+        for (const decision of runtime.store.routes<RoutingDecision>(workspace).filter((decision) => decision.status === "clarify" && decision.candidates.length >= 2).slice(0, 32)) {
+          questions.push({ ...decision, routing: true, version: decision.revision });
         }
         return JSON.stringify({ workspace, questions, notifications: pendingRunNotices(runtime, workspace), lifecycleNotifications: true, ready: !runtime.lastError });
       };

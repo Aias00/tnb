@@ -1,6 +1,6 @@
 # 持久长任务运行时
 
-`tnb runtime` 是独立本机服务：接纳任务后，关闭提交终端不会取消工作。它复用 tnb 的 AgentLoop、Provider、工具、权限检查和原生沙箱，并增加持久调度、工具日志、分层恢复、产物验收和 Run 预算。当前交付范围是单 Agent 编码，以及按需、最多三级的只读 Agent 协作。验证平台为 macOS / Bun；本文描述实际代码能力，完整演进目标见[设计](superpowers/specs/2026-11-03-durable-task-runtime-design.md)。
+`tnb runtime` 是独立本机服务：接纳任务后，关闭提交终端不会取消工作。它复用 tnb 的 AgentLoop、Provider、工具、权限检查和原生沙箱，并增加持久输入路由、调度、工具日志、分层恢复、产物验收和 Run 预算。当前交付范围是单 Agent 编码，以及按需的一层只读子 Agent 协作；旧 Run 保留原委派策略。验证平台为 macOS 和 Linux ARM64 / Bun；本文描述实际代码能力，完整演进目标见[设计](superpowers/specs/2026-11-03-durable-task-runtime-design.md)。
 
 ## 使用
 
@@ -16,7 +16,7 @@ tnb runtime submit '修复重试逻辑，补回归测试并通过类型检查' \
   --cwd /path/to/project --allow-write --allow-shell \
   --check 'bun run typecheck' --check 'bun test' --max-budget-usd 5
 
-# 不允许委派时使用 single；当前 multi 与 auto 的准入规则基本相同。
+# 不允许委派时使用 single；multi 要求有界评估，仍可选择不拆分。
 tnb runtime submit '修复一个边界条件' --cwd /path/to/project --mode single \
   --allow-write --check 'bun test tests/retry.test.ts'
 
@@ -176,13 +176,37 @@ Run 接纳、任务、事件、命令回执和调度 outbox 同事务提交。SQ
 
 这套机制允许多次压缩续跑，不承诺无限任务、摘要无损或连续数小时稳定性。Provider 的实际窗口必须正确配置；遇到网关实际路由容量小于配置仍可能有限恢复后暂停。每 Task transcript 的 64 MiB 上限、服务存储限制、Run 截止时间、轮次及费用预算仍生效。丢失于摘要中的语义约束应通过原始记录和当前事实复核，最终结果仍由独立验收接纳。
 
+## 对话续接与任务归属
+
+```text
+/task followup RUN_ID --text "补充：还要核对错误恢复的边界"
+/task routing
+/task followup RUN_ID --resolve-input INPUT_ID --revision 1
+```
+
+也可使用 `tnb runtime followup/routing` 或 `/runtime`。只有唯一合适任务时可省略 RUN_ID；同工作区多候选不会按主题或最近时间猜测，而是保存 clarify 决定并通过已有自动问答界面提示选择。自然语言控制同样需明确目标。选择绑定原 inputId/revision、会话与候选范围，交付原始补充文字，不把选项文字当成新增要求。`routing` 可检查已接纳、待澄清和拒绝原因；CLI 的 `--input-id` 可用于重投同一来源事件。
+
+输入原文、来源、归属决定、Task 输入修订和唤醒 outbox 在事务内保存。Worker 在完整工具轮次后消费持久 inbox，用稳定 delivery ID 追加 transcript，再确认交付；崩溃后修复回执不重复追加。不更改已经发送的模型请求或工具 history scope。新增要求使旧 candidate/验收失效，并在原任务增量执行，不为此消耗失败修复次数。最新要求固定注入系统上下文，原始输入和更早证据仍留在 transcript，可有界取回。
+
+暂停任务接纳补充但不自动恢复；等待用户回答的任务也不跳过等待。取消或完成的任务拒绝续接，需要 `tnb runtime submit '后续任务' --successor RUN_ID --cwd /path/to/project` 显式新建。补充和路由选择不能增加写入、Shell 或费用授权。无候选的 clarify 输入不能直接选择以后新建的任务；请明确提交或重新发出补充。
+
 ## 单 Agent 与多 Agent
 
-当前 `single` 已有委派限制；`auto` 与 `multi` 的容量和准入基本相同，尚无 `multi` 优先评估分工的实现步骤。输入续接识别、通用 followup inbox、独立路由决策记录和执行策略差异属于[后续修订设计](superpowers/specs/2026-11-04-task-routing-and-delegation-design.md)，不表示当前已有统一 Router。现有 submit、answer、控制和委派功能仍按下文运行。
+新 Run 使用执行策略 v2，输入路由与执行策略分别记录。Router 判断原始输入属于哪个任务、是补充还是控制；Worker 判断已接纳的任务是否值得拆分。自然语言复用主对话已有模型回合，不为每条输入额外调用 Router 模型。普通讨论不会自动成为后台任务。
 
-默认 `auto` 不预建角色。模型可提出一个调查或一批最多四个独立调查，并说明理由；运行时检查 single 约束、祖先身份、深度、授权工作区、任务数和并发额度。每个接纳事件记录只读权限、模式、理由和计划修订号。判定不依赖未经评测的固定收益分数；尚未进行真实付费模型的质量/费用对比，不宣称多 Agent 一定更快或更好。
+| 模式 | 新 Run 的实际行为 |
+| --- | --- |
+| single | 一个业务 Agent，统一准入拒绝委派 |
+| auto（默认） | 从直接执行开始，按需提出独立调查；每批最多两个，Run 最多两个活跃业务 Agent |
+| multi | 初步调查后四个模型回合内必须形成评估，可用 `assess_delegation` 选择 direct，也可用完整委派提案记录分工选择；每批最多四个，Run 最多四个活跃业务 Agent |
 
-委派以 `(parent_task_id, key)` 固定业务身份，并核对 prompt/workspace 的输入摘要。相同 key、相同输入沿用已有任务；同 key 改输入会拒绝。父任务等待期间结束 Attempt、保留 Task 身份和持久恢复条件，释放执行资源；子任务验收后向原父任务交付结果，父恢复时重新申请并发名额。中间 Agent 使用相同机制，最多到根—中间—叶三级。孙级 Agent 不再获得 `agent` 工具。
+v2 默认一层委派。提案必须声明稳定 key、问题、独立性理由、scope、evidenceRefs、交付物、验收标准、required/辅助性质、子任务轮次与请求数。运行时检查实际成功的工具引用、授权工作区、深度、重复工作和额度；scope 是调查合同，不等同于新增一层文件沙箱。子任务仍只能访问原授权工作区并保持只读。决策、合同、拒绝原因、计划修订和子任务接纳持久保存，不依赖模型自填收益分数。
+
+委派以 `(parent_task_id, key)` 固定业务身份，并核对完整提案摘要。相同 key、相同输入沿用已有任务；同 key 改输入会拒绝。父任务等待期间结束 Attempt、保留 Task 身份和持久恢复条件，释放执行资源；子任务验收后向原父任务交付结果，父恢复时重新申请并发名额。没有 strategyVersion 的旧 Run 保持原工具 schema、能力指纹及最多两层委派，不在升级时静默改策略。
+
+子 Agent 用 `complete_investigation` 提交 summary、evidenceRefs、uncertainties，工具回执落盘后直接结束本次调查，不再多发一次模型请求；合法的最终 JSON 报告也可接纳。格式错误最多提示修复两次，仍消耗原额度。提交后崩溃保留原报告与输入摘要，不用新工作区摘要冒充旧证据。`input` 表示需求来源，`tool:<call-id>` 必须是本 Task 的实际成功工具操作；这只证明引用来源，不证明结论语义正确。父 Agent 必须用 `review_child_result` 明确核实当前结果及输入版本，报告全文可通过 `durable_recall` 分页取回。
+
+必需分支失败不能在事后改为辅助；辅助分支失败需父任务明确接管，最终产物保留运行时附加的限制说明。新 Run 默认最多 256 次物理模型请求，子合同最多 32 次，维护性摘要同样计入。保留最后两次 Run 请求及按父请求估算的费用用于父整合；未知费用预留不清零。容量暂缺排队、合同或额度不成立拒绝，并保存原因。尚无同任务同预算的质量/成本基准，不能据此断言多 Agent 更快或更好。
 
 子结果通过工具 operation 和 transcript delivery 去重；重启不会重新创建已经接纳的子任务。并行只读批次同事务接纳，失败不会留下半个批次。对子项目的调查只允许显式 `--allow-workspace /path` 注册的工作区，仍使用同一 owner、Run ID、预算和结果关联，不是远端服务间的消息协议。各工作区的报告是其已记录输入版本的证据，不保证多个项目在同一个物理时刻形成联合快照。
 
@@ -226,8 +250,10 @@ tnb runtime resume RUN_ID
 
 | 资源 | 当前上限 |
 | --- | --- |
-| 活跃业务 worker / 模型流 | 进程各 8；auto/multi 每 Run 各 4；single 业务 worker 1 |
-| 委派 | 深度 2、批次 4、每 Run 64 个动态任务 |
+| 活跃业务 worker / 模型流 | 进程各 8；新 Run auto 2、multi 4、single 1；同用户跨进程模型请求每资源域 4、总计 8 |
+| 委派 | 新 Run 深度 1，auto 批次 2 / multi 批次 4，每 Run 64 个动态任务；旧 Run 保留原策略 |
+| 模型请求 | 新 Run 默认 256 次物理请求；子合同 1–32 次，含摘要请求；机器协调等待队列 256 |
+| 路由与补充输入 | 路由历史共 10,000 条，每 Task 最多 256 条 inbox，达到上限显式拒绝 |
 | 模型响应 / 单请求时间 | 2 MiB / 10 分钟 |
 | 单条 record / artifact | 1 MiB |
 | 单任务 transcript / 单 operation journal | 64 MiB / 8 MiB |
@@ -236,6 +262,10 @@ tnb runtime resume RUN_ID
 | 元数据集合读取 | 每种集合最多 10,000 条，超过后显式停止，不截断恢复证据 |
 
 状态水位每 30 秒检查，不是严格文件系统配额。真实 I/O 失败会停止派发并报告故障，不伪造已持久化成功。费用估计、归一化 usage、摘要调用和所有子任务使用同一 Run 账本；请求发送前预留，完整 usage 后结算，不确定预留跨重启保留。Provider 内部重试在持久 worker 中关闭，每次物理请求由持久调度重新计量；不配置 fallback。该额度是本地准入控制，不等同于外部账单的硬封顶。
+
+跨进程协调位于同用户私有 `/tmp/tnb-coordinator-UID/leases.sqlite`，独立于 `TNB_HOME`，只保存租约与资源域哈希，不保存凭据。相同 Provider endpoint/凭据/请求头的别名共享资源域，规范化请求头顺序和 endpoint 尾斜杠；同域按项目轮转。请求先获得机器名额再预留持久费用，取消删除等待票据，进程死亡或 PID 出生身份变化后回收租约；无法验证的活跃持有者保守保留。该协议需参与进程合作，不是操作系统安全边界，也不能限制旧版本或其他客户端。
+
+工作区租约按真实规范路径检查相同目录、父子目录及符号链接别名，防止多终端分别启动时绕过互斥；不同独立目录可并行。同一次调用显式声明的多个根复用调用身份，仍保留旧的精确目录锁以兼容旧进程。
 
 ## 备份、恢复与清理
 
@@ -254,6 +284,8 @@ tnb runtime restore /path/to/backup --config-dir /path/to/restored-config
 
 清理保留 command ID 回执作为去重墓碑，删除所选 Run 的状态/事件/任务日志，并回收不再被任何保留任务、事件或执行记录引用的产物。已清理的回执可能包含失效 artifact 引用，这是显式删除的结果，不会把 ID 再用成一项新业务。磁盘空间充足时整理 SQLite 以释放页。旧 Goal/Task/Workflow 不自动导入，也不改写旧 session；只有新 runtime 接纳的任务拥有这里的恢复协议。
 
+schema v3 从 v1/v2 自动迁移，增加路由记录表。路由身份和决定随备份保存；当前 `prune` 不清理该表，历史路由可继续引用已清理 Run，重投仍不能产生另一项工作。尚无独立路由历史清理/未决问题撤销命令；10,000 条上限不是无限运行承诺，不应手工删行绕过去重。
+
 ## 源码与验证
 
 | 模块 | 职责 |
@@ -261,6 +293,8 @@ tnb runtime restore /path/to/backup --config-dir /path/to/restored-config
 | `schema.ts` / `store.ts` / `commands.ts` | schema、事务、revision、租约、命令去重、等待和队列 |
 | `journal.ts` / `transcript.ts` | 外部效果与会话证据、稳定调用和送达身份、压缩边界 |
 | `engine.ts` | owner、调度、各级执行、控制传播、恢复与验收 |
+| `routing.ts` / `delegation.ts` | 原文归属、澄清、持久 inbox、提案和证据报告协议 |
+| `../usage/coordinator.ts` | 跨进程请求容量、公平排队与工作区冲突注册 |
 | `worker.ts` / `workspace.ts` | 原工具/Provider 组合、权限与原生沙箱、前后台工作区互斥 |
 | `budget.ts` / `artifacts.ts` | 共享费用、请求并发、候选和验证产物、输入版本 |
 | `server.ts` / `entrypoints/runtime.ts` | 鉴权服务、命令串行化、CLI 与后台启动 |

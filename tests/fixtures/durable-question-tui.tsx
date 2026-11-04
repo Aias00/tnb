@@ -18,7 +18,7 @@ const inbox: QuestionInbox = {
   },
   subscribe: (listener) => { listeners.add(listener); return () => { listeners.delete(listener); }; },
   next: () => questions.find((question) => !dismissed.has(question.waitId)),
-  dismiss: (question) => { dismissed.add(question.waitId); questions = [...questions]; listeners.forEach((listener) => listener()); },
+  dismiss: (question) => { if (question.waitId) dismissed.add(question.waitId); questions = [...questions]; listeners.forEach((listener) => listener()); },
   answer: async (question, answer) => {
     await appendFile(trigger + ".answers", answer + "\n");
     questions = questions.filter((current) => current.waitId !== question.waitId); listeners.forEach((listener) => listener());

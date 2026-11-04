@@ -80,3 +80,23 @@ test("waiting for a model slot consumes no physical request or uncertain reserva
   } finally { unblock(); await Promise.all(running); }
   expect(f.budget.totals(f.run.runId).uncertain).toBe(0);
 });
+
+test("child request caps retain Run usage and preserve parent integration requests before physical admission", async () => {
+  const f = fixture(); let physical = 0;
+  const raw: ModelTransport = { async *stream() { physical++;
+    yield { type: "usage", usage: { inputTokens: 1, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 } };
+    yield { type: "response-end", reason: "end-turn" };
+  } };
+  const parent = f.budget.wrap(raw, { ...f.context, runMaxRequests: 4 });
+  await drain(parent);
+  const child = f.budget.wrap(raw, { ...f.context, taskId: f.tasks[1]!.taskId, parentTaskId: f.tasks[0]!.taskId, maxRequests: 1, runMaxRequests: 4 });
+  await drain(child);
+  await expect(drain(child)).rejects.toThrow("Child model request limit");
+  expect(physical).toBe(2); expect(f.store.records("model-request", f.run.runId)).toHaveLength(2);
+  const otherChild = f.budget.wrap(raw, { ...f.context, taskId: "another", parentTaskId: f.tasks[0]!.taskId, maxRequests: 3, runMaxRequests: 4 });
+  await expect(drain(otherChild)).rejects.toThrow("reserved for parent");
+  await drain(parent); await drain(parent);
+  expect(physical).toBe(4);
+  await expect(drain(parent)).rejects.toThrow("Run model request limit");
+  expect(f.store.records("model-request", f.run.runId)).toHaveLength(4);
+});

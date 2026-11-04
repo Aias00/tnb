@@ -1,3 +1,4 @@
+// Legacy v1 policy fixtures verify compatibility; v2 routing and delegation have separate contract tests.
 import { afterEach, expect, test } from "bun:test";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -31,7 +32,7 @@ async function fixture(transport: ModelTransport, check?: (command: string) => P
   };
   const runtime = new DurableRuntime(store, state, factory); runtimes.push(runtime); await runtime.start();
   const config: RuntimeConfiguration = { workspace, allowedWorkspaces: [workspace], allowWrite: false, allowShell: false, checks: [],
-    maxTurns: 10, maxRetries: 1, compactThreshold: 10000, maxCostUsd: 1 };
+    maxTurns: 10, maxRetries: 1, strategyVersion: 1, compactThreshold: 10000, maxCostUsd: 1 };
   return { runtime, store, config, workspace, state, factory, releaseValidation: () => validation.resolve() };
 }
 async function settled(runtime: DurableRuntime, runId: string) {
@@ -214,7 +215,7 @@ test("actual SIGKILL at a leaf recovers all three levels without duplicating chi
   const root = await mkdtemp(join(tmpdir(), "tnb-runtime-tree-kill-")); roots.push(root);
   const workspace = join(root, "work"); await mkdir(workspace);
   const state = join(root, "control", "runtime");
-  const config: RuntimeConfiguration = { workspace, allowedWorkspaces: [workspace], allowWrite: false, allowShell: false, checks: [], maxTurns: 10, maxRetries: 1, compactThreshold: 10000 };
+  const config: RuntimeConfiguration = { workspace, allowedWorkspaces: [workspace], allowWrite: false, allowShell: false, checks: [], maxTurns: 10, maxRetries: 1, strategyVersion: 1, compactThreshold: 10000 };
   const source = `import { DurableRuntime } from ${JSON.stringify(join(import.meta.dir, "../../src/services/runtime/engine.ts"))};
 import { RuntimeStore } from ${JSON.stringify(join(import.meta.dir, "../../src/services/runtime/store.ts"))};
 const store = new RuntimeStore(${JSON.stringify(join(state, "state.sqlite"))});

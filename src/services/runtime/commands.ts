@@ -3,11 +3,12 @@ import { digestJson, integer, text } from "./json";
 import { RuntimeStore, type RuntimeTransaction } from "./store";
 import { refreshWaits, type DurableWait } from "./waits";
 import { NOTICE_EVENTS } from "./notices";
+import { recordRouting, type RoutingInput } from "./routing";
 import { assertTaskTransition, type DurableAttempt, type DurableRun, type DurableTask,
   type ExecutionPolicy, type RuntimeSignal, type TaskStatus, type WaitCondition, type WorkerIdentity, type PauseReason, type RunLimits } from "./types";
 
 export type TaskDefinition = { key: string; objective: string; inputDigest: string; dependsOn?: string[] };
-type Command = { commandId: string };
+type Command = { commandId: string; source?: RoutingInput };
 type TaskCommand = Command & { taskId: string; expectedRevision: number };
 type RunCommand = Command & { runId: string; expectedRevision: number };
 
@@ -15,7 +16,7 @@ type RunCommand = Command & { runId: string; expectedRevision: number };
 export class RuntimeCommands {
   constructor(readonly store: RuntimeStore, private readonly clock: () => number = Date.now) {}
 
-  createRun(input: Command & { objective: string; tasks?: TaskDefinition[]; policy?: Partial<ExecutionPolicy>; deadline?: number; configuration?: unknown }): { run: DurableRun; tasks: DurableTask[] } {
+  createRun(input: Command & { objective: string; tasks?: TaskDefinition[]; policy?: Partial<ExecutionPolicy>; deadline?: number; configuration?: unknown; source?: RoutingInput; successorOf?: string }): { run: DurableRun; tasks: DurableTask[] } {
     return this.#command(input, "run.create", (tx) => {
       text(input.objective, "run objective");
       if (input.deadline !== undefined) integer(input.deadline, "run deadline", tx.now + 1);
@@ -35,6 +36,13 @@ export class RuntimeCommands {
         createdAt: tx.now, updatedAt: tx.now,
       }));
       for (const task of tasks) tx.insertTask(task);
+      if (input.source) recordRouting(tx, input.source, "submit", run.runId, tasks[0]!.taskId);
+      if (input.successorOf) {
+        const predecessor = tx.getRun(input.successorOf);
+        if (!predecessor || !["succeeded", "failed", "cancelled"].includes(predecessor.status)) throw new Error("Successor needs a terminal predecessor");
+        tx.saveRecord({ kind: "successor", id: run.runId, runId: run.runId, value: { predecessor: predecessor.runId } }, 0);
+        tx.event(run.runId, "run.successor", { predecessor: predecessor.runId });
+      }
       for (const task of tasks) {
         for (const dependency of task.dependsOn) tx.addDependency(task.taskId, dependency);
         tx.event(run.runId, "task.created", task, task.taskId);
@@ -249,7 +257,12 @@ export class RuntimeCommands {
   }
 
   #command<T>(input: Command, kind: string, apply: (tx: RuntimeTransaction) => T): T {
-    return this.store.command(input.commandId, { kind, input }, this.clock(), apply);
+    return this.store.command(input.commandId, { kind, input }, this.clock(), (tx) => {
+      const result = apply(tx);
+      const runId = (input as Command & { runId?: string }).runId;
+      if (runId && input.source) recordRouting(tx, input.source, kind, runId);
+      return result;
+    });
   }
 }
 

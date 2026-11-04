@@ -6,6 +6,7 @@ import { calculateCostUsd } from "../usage/cost";
 import { RuntimeStore } from "./store";
 
 export class DurableBudgetExhaustedError extends Error {}
+export class ChildRequestLimitError extends Error {}
 type RequestCharge = { requestId: string; reserved: number; reported: number; state: "pending" | "complete" | "uncertain"; usageCount: number };
 export class DurableBudget {
   readonly #gate = new UsageBudget({ maxConcurrentRequests: 8 });
@@ -19,7 +20,8 @@ export class DurableBudget {
       return sum;
     }, { reported: 0, reserved: 0, uncertain: 0 });
   }
-  wrap(raw: ModelTransport, context: { runId: string; taskId: string; route: BillingRoute; maxCostUsd?: number; maxOutputTokens: number; assertLive(): void }): ModelTransport {
+  wrap(raw: ModelTransport, context: { runId: string; taskId: string; route: BillingRoute; maxCostUsd?: number; maxOutputTokens: number; workspace?: string;
+    maxRequests?: number; runMaxRequests?: number; parentTaskId?: string; assertLive(): void }): ModelTransport {
     const budget = this;
     let runGate = this.#runGates.get(context.runId);
     if (!runGate) { runGate = new UsageBudget({ maxConcurrentRequests: 4 }); this.#runGates.set(context.runId, runGate); }
@@ -33,7 +35,16 @@ export class DurableBudget {
         outputTokens: maxOutputTokens, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 }, context.route.pricing) : 0;
       if (context.maxCostUsd !== undefined && !context.route.pricing) throw new Error("Durable dollar budgets require configured model pricing");
       budget.store.command(randomUUID(), { kind: "budget.reserve", requestId }, Date.now(), (tx) => {
+        const requests = tx.records<RequestCharge>("model-request", context.runId);
+        if (context.runMaxRequests !== undefined && requests.length >= context.runMaxRequests) throw new DurableBudgetExhaustedError("Run model request limit reached");
+        if (context.parentTaskId) {
+          if (context.maxRequests !== undefined && requests.filter((row) => row.taskId === context.taskId).length >= context.maxRequests) throw new ChildRequestLimitError("Child model request limit reached");
+          if (context.runMaxRequests !== undefined && requests.length >= context.runMaxRequests - 2) throw new ChildRequestLimitError("Model requests reserved for parent integration and verification");
+        }
         const totals = budget.totals(context.runId);
+        const parentReserve = context.parentTaskId && context.maxCostUsd !== undefined
+          ? 2 * (requests.filter((row) => row.taskId === context.parentTaskId).at(-1)?.value.reserved ?? 0) : 0;
+        if (context.maxCostUsd !== undefined && parentReserve > 0 && totals.reported + totals.reserved + reserve + parentReserve > context.maxCostUsd) throw new ChildRequestLimitError("Remaining budget is reserved for the parent");
         if (context.maxCostUsd !== undefined && totals.reported + totals.reserved + reserve > context.maxCostUsd) throw new DurableBudgetExhaustedError("Durable run budget exhausted (including uncertain reservations)");
         tx.saveRecord<RequestCharge>({ kind: "model-request", id: requestId, runId: context.runId, taskId: context.taskId,
           value: { requestId, reserved: reserve, reported: 0, state: "pending", usageCount: 0 } }, 0);
@@ -73,7 +84,7 @@ export class DurableBudget {
     } };
     // Reserve only after both gates admit a physical request, and persist usage before
     // cancellation in an outer gate can stop delivery to the model loop.
-    return runGate.wrap(this.#gate.wrap(durable, () => context.route), () => context.route);
+    return runGate.wrap(this.#gate.wrap(durable, () => context.route, context.workspace ? { workspace: context.workspace } : undefined), () => context.route);
   }
   recover(runId: string): void {
     for (const record of this.store.records<RequestCharge>("model-request", runId)) {

@@ -1,6 +1,6 @@
 # TNB 输入路由与委派策略修订
 
-日期：2026-11-04。状态：修订方案，尚未实现。实现核对基线：`d7cb45e`。本文件补充[原设计](2026-11-03-durable-task-runtime-design.md)第 4、7、11、18、19 节；复用现有任务运行时，不把原有测试通过视为本修订已完成。
+日期：2026-11-04。状态：R1–R4 的受限实现已交付，验证及剩余边界见[实现审阅第 15 节](2026-11-03-durable-task-runtime-review.md#15-输入路由与委派策略实现审阅)。差距核对基线：`d7cb45e`。本文件补充[原设计](2026-11-03-durable-task-runtime-design.md)第 4、7、11、18、19 节；下面保留设计依据，实际使用和容量以[运行时文档](../../durable-runtime.md)为准。
 
 ## 1 复核结论与源码差距
 
@@ -8,7 +8,7 @@
 
 DeepSeek Superagent 固定版本为 `8c32a9dc5d72c033816c6a8110b37f40cf94fba4`：[Router 工具](https://github.com/deepseek-ai/dsh-superagent-prototype/blob/8c32a9dc5d72c033816c6a8110b37f40cf94fba4/src/app/tools/main.ts#L47)、[dispatch](https://github.com/deepseek-ai/dsh-superagent-prototype/blob/8c32a9dc5d72c033816c6a8110b37f40cf94fba4/prompts/dispatch.md#L5)、[职责原则](https://github.com/deepseek-ai/dsh-superagent-prototype/blob/8c32a9dc5d72c033816c6a8110b37f40cf94fba4/docs/004-prompts.md)。其主 Session 路由原始 Trigger 为 accept/attach/ignore/stop，不扩展用户需求，技术判断由 Worker 负责。借鉴的是原文归属、幂等决策、职责分离和续接交付；不移植 IM/GitHub 业务流程，也不据此要求 TNB 每次额外调用一个 Router 模型。
 
-| 事项 | 当前源码事实 | 修订要求 |
+| 事项 | 修订前源码事实（`d7cb45e`） | 修订要求 |
 | --- | --- | --- |
 | 输入接纳 | [conversation-tool.ts](../../../src/services/runtime/conversation-tool.ts) 有 submit/query/answer/control，没有通用 followup 动作 | 输入路由决定与既有命令适配，增加有界补充输入 inbox |
 | 目标归属 | 同文件省略 runId 时可回退本会话/工作区最近 Run | 自然语言多目标歧义需澄清；显式命令便捷回退展示实际目标 |
@@ -82,7 +82,7 @@ flowchart TD
 
 继续复用 Run/Task/Attempt、持久队列、等待、journal、transcript、Run 预算和上下文压缩。不同 TNB_HOME 的凭据和控制数据仍分开；协调额度不意味着分享秘密。目录冲突检查需要规范路径及祖先/后代关系，不能认为不同路径哈希就足够。每步独立验收后开放 capability，增加 Router 类名或提示词不算完成。
 
-## 7 待实现的故障验收
+## 7 故障验收要求
 
 | 编号 | 场景 | 必须观察到的结果 |
 | --- | --- | --- |
@@ -96,4 +96,14 @@ flowchart TD
 | R08 | 必需/辅助失败、伪证据引用、输入过期 | 不把报告送达当结论正确；按预先合同阻塞或接管 |
 | R09 | 多终端、多 TNB_HOME、崩溃租约、目录别名/父子重叠 | 同域额度不能被分进程绕过，公平排队，冲突目录不能同时写 |
 
-原设计 I01–I12、T01–T27 继续有效；R01–R09 尚无实现通过声明。路由准确率需对有明确期望归属的样本评测，并分别统计误新建、误续接、误控制、澄清率和额外延迟。single/auto/multi 还需同任务相近预算比较验收成功率、重复工作、耗时与用量；不能凭少数演示预设多 Agent 更优。
+原设计 I01–I12、T01–T27 继续有效；R01–R09 的实现、测试映射及未覆盖维度见实现审阅第 15 节。路由准确率仍需对有明确期望归属的样本评测，并分别统计误新建、误续接、误控制、澄清率和额外延迟。single/auto/multi 还需同任务相近预算比较验收成功率、重复工作、耗时与用量；不能凭少数演示预设多 Agent 更优。
+
+## 8 交付映射与收敛范围
+
+R1/R2 由 `routing.ts`、schema v3、命令事务、Task inbox、安全轮次交付及原问答组件承接。新增 `followup/routing`、显式 successor 和来源身份；chat/query 仍是原对话路径，不建立每句话的持久路由实体。已有 `limits` 维持原修订和审计协议。原文直接有界存入路由记录，没有单独实现所有设计字段对应的 Ref 实体。
+
+R3 由 `delegation.ts` 和 engine 中的策略/提案/结构化提交/父复核实现，复用现有 plan revision 和子任务队列，没有单独建立通用 DAG 规划器。新 auto 的活跃容量/批次为 2，新 multi 为 4，默认深度 1；旧 Run 继续原策略。`input` 证据只能证明需求来源，工具证据只能证明实际成功调用，scope 是工作合同而非额外文件隔离；模型复核不等同于语义正确性的形式证明。
+
+R4 由 usage coordinator 的同用户 SQLite 租约、资源域项目排队和 workspace 规范路径重叠检查承接。覆盖接入当前预算包装器的前台与持久 Worker，请求摘要同样受控；不声称限制未接入的第三方请求、旧客户端或远端主机。
+
+当前无持久 Skill/MCP、子 Agent 并行编码、自动合并、分布式 owner；无任务质量基准或数小时 soak。路由历史有 10,000 条上限，未提供独立清理/撤销命令；这项维护限制明确保留，不静默删除身份导致重投新建业务。

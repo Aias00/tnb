@@ -1,3 +1,4 @@
+// Legacy v1 policy fixtures verify compatibility; v2 routing and delegation have separate contract tests.
 // Waiting must survive owner loss without keeping an attempt or workspace lease alive;
 // answers are versioned and idempotent, and no business tool may follow a yield in the same batch.
 import { afterEach, expect, test } from "bun:test";
@@ -26,7 +27,7 @@ async function fixture(transport: ModelTransport) {
     check: async () => "passed" });
   const runtime = new DurableRuntime(store, state, factory); runtimes.push(runtime); await runtime.start();
   const config: RuntimeConfiguration = { workspace, allowedWorkspaces: [workspace], allowWrite: false, allowShell: false,
-    checks: [], maxTurns: 10, maxRetries: 0, compactThreshold: 10000 };
+    checks: [], maxTurns: 10, maxRetries: 0, strategyVersion: 1, compactThreshold: 10000 };
   return { root, workspace, state, db, store, runtime, factory, config };
 }
 async function until(runtime: DurableRuntime, predicate: () => boolean) {

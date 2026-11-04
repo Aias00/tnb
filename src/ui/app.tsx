@@ -246,7 +246,7 @@ export function TuiApp(options: TuiAppOptions) {
       if (pending.controller.signal.aborted) return;
       pending.answering = true;
       const result = await options.durableQuestions!.answer(notice, answer);
-      if (!pending.controller.signal.aborted) dispatch({ type: "notice", message: result.paused ? "回答已保存；任务保持暂停，恢复后继续。" : "回答已保存，长任务会继续执行。" });
+      if (!pending.controller.signal.aborted) dispatch({ type: "notice", message: result.message ?? (result.paused ? "回答已保存；任务保持暂停，恢复后继续。" : "回答已保存，长任务会继续执行。") });
     }).catch((error: unknown) => {
       if (pending.controller.signal.aborted) return;
       options.durableQuestions!.dismiss(notice);

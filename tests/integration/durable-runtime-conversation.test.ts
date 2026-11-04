@@ -107,6 +107,9 @@ test("busy conversations can pause and resume the same Run with no duplicate tas
   const runId = accepted.run.runId; await until(() => f.workerCalls() === 1);
   await f.chat((_request, index) => !index ? call("durable_task", { action: "pause", runId }) : done, false, true, "暂停刚才的长任务");
   await until(() => f.store.getRun(runId)?.status === "paused");
+  expect(f.store.routes(f.runtime.configuration(runId).workspace)).toContainEqual(expect.objectContaining({
+    action: "run.pause", rawText: "暂停刚才的长任务", source: "conversation", sessionId: f.context.sessionId, runId,
+  }));
   await f.chat((_request, index) => !index ? call("durable_task", { action: "resume", runId }) : done, true, true, "继续刚才的长任务");
   await until(() => f.workerCalls() === 2); expect(f.store.runs()).toHaveLength(1);
   f.finish(); await until(() => f.store.getRun(runId)?.status === "succeeded");

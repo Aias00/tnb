@@ -1,6 +1,6 @@
 import type { PermissionAskRequest, PermissionPromptDecision } from "../core/permissions";
 import type { AskUser, UserQuestion } from "../tools/interaction";
-import { durableUserQuestion, displayQuestionText, questionNoticeKey, type QuestionInbox, type QuestionNotice } from "../services/runtime/attention";
+import { durableUserQuestion, displayQuestionText, questionNoticeKey, type QuestionInbox, type InboxQuestion } from "../services/runtime/attention";
 
 export type ReplTurn = {
   prompt: string;
@@ -23,10 +23,10 @@ export async function runRepl(options: ReplOptions): Promise<number> {
   let hasRun = false;
   options.write("tnb interactive · /exit to quit\n");
   const inbox = options.durableQuestions, announced = new Set<string>();
-  let awaitingInput = false, inputQuestion: QuestionNotice | undefined;
+  let awaitingInput = false, inputQuestion: InboxQuestion | undefined;
   const displayedNotices = new Set<string>(); let connectionMessage = "";
   const connected = () => !inbox?.connection || inbox.connection().state === "online";
-  const show = (notice: QuestionNotice) => {
+  const show = (notice: InboxQuestion) => {
     const question = durableUserQuestion(notice);
     options.write(`\n${question.header}\n${question.question}\n`);
     question.options.forEach((option, index) => options.write(`  ${index + 1}. ${option.label}\n`));
@@ -73,7 +73,7 @@ export async function runRepl(options: ReplOptions): Promise<number> {
         const answer = Number.isInteger(index) && index >= 1 && index <= question.options.length ? question.options[index - 1]!.label : input;
         try {
           const result = await inbox!.answer(asked, answer);
-          options.write(result.paused ? "回答已保存；任务保持暂停，恢复后继续。\n" : "回答已保存，长任务会继续执行。\n");
+          options.write(result.message ? result.message + "\n" : result.paused ? "回答已保存；任务保持暂停，恢复后继续。\n" : "回答已保存，长任务会继续执行。\n");
         } catch (error) {
           inbox!.dismiss(asked);
           options.write(`回答未提交：${error instanceof Error ? error.message : String(error)}。问题保留，可用 /task questions 核对并重试。\n`);

@@ -1,7 +1,8 @@
 import type { ModelEvent, ModelRequest, ModelTransport, TokenUsage } from "../../providers/types";
 import { addUsage, calculateCostUsd, EMPTY_USAGE, type ModelPricing, type UsageTotals } from "./cost";
+import { ModelRequestCoordinator } from "./coordinator";
 
-export type BillingRoute = { provider: string; model: string; pricing?: ModelPricing };
+export type BillingRoute = { provider: string; model: string; pricing?: ModelPricing; resourceDomain?: string };
 export type UsageRecord = { provider: string; model: string; usage: TokenUsage; costUsd: number };
 export const DEFAULT_MAX_CONCURRENT_MODEL_REQUESTS = 4;
 const MAX_PENDING_MODEL_REQUESTS = 64;
@@ -52,7 +53,7 @@ export class UsageBudget {
     void Promise.all([...this.#leases]).then(() => this.close());
   }
 
-  wrap(transport: ModelTransport, routeFor: (request: ModelRequest) => BillingRoute): ModelTransport {
+  wrap(transport: ModelTransport, routeFor: (request: ModelRequest) => BillingRoute, coordination?: { workspace: string }): ModelTransport {
     const budget = this;
     return {
       async *stream(request, signal): AsyncGenerator<ModelEvent> {
@@ -66,10 +67,12 @@ export class UsageBudget {
         const active = new Promise<void>((resolve) => { finish = resolve; });
         budget.#active.add(active);
         let release: (() => void) | undefined;
+        let releaseGlobal: (() => void) | undefined;
         try {
           const admission = budget.#admit(combined);
           release = typeof admission === "function" ? admission : await admission;
           combined.throwIfAborted();
+          if (coordination && route.resourceDomain) releaseGlobal = await new ModelRequestCoordinator().acquire(route.resourceDomain, coordination.workspace, combined);
           for await (const event of transport.stream(request, combined)) {
             if (event.type !== "usage") { combined.throwIfAborted(); yield event; continue; }
             // Factory attribution is per physical route, including concurrent fallback calls.
@@ -90,9 +93,8 @@ export class UsageBudget {
           }
           combined.throwIfAborted();
         } finally {
-          release?.();
-          budget.#active.delete(active);
-          finish();
+          try { releaseGlobal?.(); }
+          finally { release?.(); budget.#active.delete(active); finish(); }
         }
       },
     };

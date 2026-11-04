@@ -72,7 +72,7 @@ export type AgentLoopOptions = {
     prompt?: string | Array<TextBlock | MediaBlock>;
     context?: string[];
   }>;
-  beforeTurn?(): Promise<{ context?: string[] }>;
+  beforeTurn?(): Promise<{ context?: string[]; messages?: ConversationMessage[]; persisted?: boolean }>;
   beforeTool?(event: { id: string; name: string; input: unknown }): Promise<{
     input?: unknown;
     decision?: AuthorizationDecision;
@@ -128,6 +128,10 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<{
   for (let turn = 0; maxTurns === undefined || turn < maxTurns; turn += 1) {
     signal.throwIfAborted();
     const turnContext = await options.beforeTurn?.();
+    for (const message of turnContext?.messages ?? []) {
+      messages.push(structuredClone(message));
+      if (!turnContext?.persisted) await options.onMessage?.(structuredClone(message));
+    }
     if (turnContext?.context?.length) {
       const message: ConversationMessage = {
         role: "user",

@@ -73,6 +73,8 @@ export class RuntimeStore {
     return (this.#db.query("SELECT data FROM runs ORDER BY rowid").all() as DataRow[]).map((row) => JSON.parse(row.data));
   }
   record<T>(kind: string, id: string): RuntimeRecord<T> | undefined { return this.#reader().record<T>(kind, id); }
+  route<T>(id: string): T | undefined { return this.#reader().route<T>(id); }
+  routes<T>(workspace: string): T[] { return this.#reader().routes<T>(workspace); }
   records<T>(kind: string, runId: string, taskId?: string): RuntimeRecord<T>[] { return this.#reader().records<T>(kind, runId, taskId); }
   operationHeaders(runId: string, taskId?: string): Array<{ id: string; taskId: string; state: string; effectOutcome?: string; name: string }> {
     this.#assertOpen();
@@ -216,6 +218,16 @@ export class RuntimeTransaction {
   mutated = false;
   constructor(private readonly db: Database, private readonly limits: StoreLimits, readonly commandId: string, readonly now: number) {}
   expire(): void { this.#expired = true; }
+  route<T>(id: string): T | undefined { return this.#read<T>("SELECT data FROM routing_inputs WHERE input_id = ?", id); }
+  routes<T>(workspace: string): T[] {
+    return (this.db.query("SELECT data FROM routing_inputs WHERE workspace = ? ORDER BY rowid DESC LIMIT 256").all(workspace) as DataRow[]).map((row) => JSON.parse(row.data));
+  }
+  saveRoute(id: string, workspace: string, value: unknown): void {
+    this.#mutable();
+    if (!this.route(id) && (this.db.query("SELECT COUNT(*) AS n FROM routing_inputs").get() as { n: number }).n >= 10000) throw new Error("Routing history capacity reached");
+    this.db.query("INSERT INTO routing_inputs(input_id,workspace,data) VALUES (?,?,?) ON CONFLICT(input_id) DO UPDATE SET data=excluded.data")
+      .run(id, workspace, encodeJson(value));
+  }
 
   getRun(id: string): DurableRun | undefined { return this.#read<DurableRun>("SELECT data FROM runs WHERE run_id = ?", id); }
   getTask(id: string): DurableTask | undefined { return this.#read<DurableTask>("SELECT data FROM tasks WHERE task_id = ?", id); }

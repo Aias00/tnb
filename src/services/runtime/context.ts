@@ -6,7 +6,7 @@ import { compactConversationPipeline } from "../compact/pipeline";
 import { estimateConversationTokens } from "../compact/compact";
 import { createBoundedSummarizer } from "../compact/bounded-summary";
 import { estimateRequestTokens, prefixWithin, requestInputLimit } from "../compact/request-budget";
-import { DurableBudgetExhaustedError } from "./budget";
+import { DurableBudgetExhaustedError, ChildRequestLimitError } from "./budget";
 
 export class DurableContextCapacityError extends Error {}
 
@@ -44,7 +44,10 @@ export function createDurableContext(options: {
       const historySpace = inputLimit * scale - estimateRequestTokens(request([]));
       // Cap each result in active context only. Complete output already has a durable transcript receipt.
       const resultBytes = Math.max(256, Math.min(16000, Math.floor(historySpace / 4)));
+      const toolNames = new Map<string, string>();
       for (const message of messages) for (const block of message.content) {
+        if (block.type === "tool-use") toolNames.set(block.id, block.name);
+        if (block.type === "tool-result" && ["durable_recall", "durable_wait", "agent", "assess_delegation", "review_child_result", "complete_investigation"].includes(toolNames.get(block.toolUseId) ?? "")) continue;
         if (block.type !== "tool-result" || Buffer.byteLength(block.content) <= resultBytes) continue;
         const marker = "\n[Tool output shortened in active context. Use durable_recall for the original result; re-check files before relying on omitted details.]";
         const head = prefixWithin(block.content, (text) => Buffer.byteLength(text + marker) <= resultBytes);
@@ -83,7 +86,7 @@ export function createDurableContext(options: {
   };
 
   function recoverable(error: unknown): boolean {
-    return !(error instanceof DurableBudgetExhaustedError)
+    return !(error instanceof DurableBudgetExhaustedError) && !(error instanceof ChildRequestLimitError)
       && !/authority|budget exhausted|pricing|invalid provider usage|execution.*expired/i.test(error instanceof Error ? error.message : String(error));
   }
 

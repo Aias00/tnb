@@ -39,6 +39,7 @@ export type DurableTask = {
   candidateRef?: string;
   resultRef?: string;
   error?: string;
+  inputRevision?: number;
   createdAt: number;
   updatedAt: number;
 };
