@@ -8,6 +8,7 @@ import { createRuntimeWorkerFactory } from "./worker";
 import { lock } from "../../utils/lockfile";
 import { questionAttentionResponse } from "./attention-stream";
 import type { RoutingInput, RoutingDecision } from "./routing";
+import { presentRunDetail, presentRuns } from "./presentation";
 
 export async function runtimePaths(configDir: string): Promise<{ root: string; socket: string; token: string }> {
   const root = resolve(configDir, "runtime"); await mkdir(root, { recursive: true, mode: 0o700 });
@@ -58,6 +59,12 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
         try {
           const url = new URL(request.url);
           if (request.method === "GET") {
+            if (url.pathname === "/presentation") {
+              const workspace = await realpath(url.searchParams.get("workspace") ?? ""); const runId = url.searchParams.get("runId");
+              if (!runId) return Response.json(presentRuns(runtime, workspace));
+              if (store.record<{ workspace: string }>("configuration", runId)?.value.workspace !== workspace) throw new Error("Task is outside the current workspace");
+              return Response.json(await presentRunDetail(runtime, runId));
+            }
             if (url.pathname === "/health") return Response.json({ ready: !runtime.lastError, pid: process.pid, error: runtime.lastError, capabilities: RUNTIME_CAPABILITIES });
             if (url.pathname === "/routing") {
               const workspace = await realpath(url.searchParams.get("workspace") ?? "");
@@ -180,11 +187,14 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
   }
 }
 
+export class RuntimeRequestError extends Error {
+  constructor(message: string, readonly status: number) { super(message); }
+}
 export async function runtimeRequest(configDir: string, resource: string, body?: unknown): Promise<unknown> {
   const paths = await runtimePaths(configDir); const token = (await readFile(paths.token, "utf8")).trim();
   const response = await fetch(`http://localhost${resource}`, { unix: paths.socket, method: body === undefined ? "GET" : "POST",
     headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(10_000) });
   const value = await response.json() as { error?: string };
-  if (!response.ok) throw new Error(value.error ?? `Runtime HTTP ${response.status}`);
+  if (!response.ok) throw new RuntimeRequestError(value.error ?? `Runtime HTTP ${response.status}`, response.status);
   return value;
 }

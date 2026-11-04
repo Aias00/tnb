@@ -2,6 +2,7 @@ import type { DurableRuntime, RuntimeConfiguration } from "./engine";
 import type { InboxQuestion } from "./attention";
 import type { RoutingDecision } from "./routing";
 import { pendingRunNotices } from "./notices";
+import { presentRuns } from "./presentation";
 
 /** A reconnect always starts with authoritative open questions, so no event cursor can lose a decision. */
 export function questionAttentionResponse(runtime: DurableRuntime, workspace: string, signal: AbortSignal): Response {
@@ -23,7 +24,7 @@ export function questionAttentionResponse(runtime: DurableRuntime, workspace: st
         for (const decision of runtime.store.routes<RoutingDecision>(workspace, { pendingOnly: true, actionableOnly: true, limit: 32 })) {
           questions.push({ ...decision, routing: true, version: decision.revision });
         }
-        return JSON.stringify({ workspace, questions, notifications: pendingRunNotices(runtime, workspace), lifecycleNotifications: true, ready: !runtime.lastError });
+        return JSON.stringify({ workspace, questions, runs: presentRuns(runtime, workspace), notifications: pendingRunNotices(runtime, workspace), lifecycleNotifications: true, ready: !runtime.lastError });
       };
       send = () => {
         if (closed || (controller.desiredSize ?? 0) <= 0) return;

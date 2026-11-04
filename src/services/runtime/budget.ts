@@ -4,10 +4,11 @@ import { UsageBudget, type BillingRoute } from "../usage/budget";
 
 import { calculateCostUsd } from "../usage/cost";
 import { RuntimeStore } from "./store";
+import { recordActivity } from "./activity";
 
 export class DurableBudgetExhaustedError extends Error {}
 export class ChildRequestLimitError extends Error {}
-type RequestCharge = { requestId: string; reserved: number; reported: number; state: "pending" | "complete" | "uncertain"; usageCount: number };
+type RequestCharge = { requestId: string; reserved: number; reported: number; state: "pending" | "complete" | "uncertain"; usageCount: number; priced?: boolean };
 export class DurableBudget {
   readonly #gate = new UsageBudget({ maxConcurrentRequests: 8 });
   readonly #runGates = new Map<string, UsageBudget>();
@@ -47,11 +48,12 @@ export class DurableBudget {
         if (context.maxCostUsd !== undefined && parentReserve > 0 && totals.reported + totals.reserved + reserve + parentReserve > context.maxCostUsd) throw new ChildRequestLimitError("Remaining budget is reserved for the parent");
         if (context.maxCostUsd !== undefined && totals.reported + totals.reserved + reserve > context.maxCostUsd) throw new DurableBudgetExhaustedError("Durable run budget exhausted (including uncertain reservations)");
         tx.saveRecord<RequestCharge>({ kind: "model-request", id: requestId, runId: context.runId, taskId: context.taskId,
-          value: { requestId, reserved: reserve, reported: 0, state: "pending", usageCount: 0 } }, 0);
+          value: { requestId, reserved: reserve, reported: 0, state: "pending", usageCount: 0, priced: Boolean(context.route.pricing) } }, 0);
         tx.event(context.runId, "budget.reserved", { requestId, reserve }, context.taskId);
         return true;
       });
       let complete = false; let count = 0; let seenUsage = false; let responseBytes = 0;
+      const task = budget.store.getTask(context.taskId); if (task && budget.store.record<{ phase: string }>("task-activity", task.taskId)?.value.phase !== "compacting") recordActivity(budget.store, task, "model");
       try {
         for await (const event of raw.stream({ ...request, maxOutputTokens }, signal)) {
           responseBytes += JSON.stringify(event).length;
@@ -64,7 +66,8 @@ export class DurableBudget {
             const sequence = count++;
             budget.store.command(`${requestId}:${sequence}`, { kind: "budget.usage", event }, Date.now(), (tx) => {
               const record = tx.record<RequestCharge>("model-request", requestId)!;
-              tx.saveRecord({ ...record, value: { ...record.value, reported: record.value.reported + cost, usageCount: sequence + 1 } }, record.revision);
+              tx.saveRecord({ ...record, value: { ...record.value, reported: record.value.reported + cost, usageCount: sequence + 1,
+                priced: record.value.priced === true && Boolean((event.billing ?? context.route).pricing) } }, record.revision);
               tx.event(context.runId, "budget.reported", { requestId, sequence, cost }, context.taskId);
               return true;
             });

@@ -268,4 +268,4 @@ test.each([false, true])("a rejected structured child report is reinvestigated, 
   if (!crashFeedback) expect(currentStore.record<number>("retries", child.taskId)?.value).toBe(1);
   expect(currentStore.record<{ invalidated?: boolean; report: string }>("submitted-report", child.taskId)?.value).toMatchObject({ report: JSON.stringify({ summary: "Inspected version 2", evidenceRefs: ["input"], uncertainties: [] }) });
   expect(currentStore.events(run.runId).filter((event) => event.type === "report.invalidated")).toHaveLength(1);
-});
+}, 20000); // Includes owner shutdown, SQLite reopen and a second bounded recovery wait.

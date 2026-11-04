@@ -37,6 +37,7 @@ for (const entry of await readdir(nativeLibrary, { withFileTypes: true })) {
   }
 }
 await copyFile(join(nativePackage, "NOTICE.txt"), join(outputDirectory, "typescript-NOTICE.txt"));
+await cp(join(root, "third_party", "licenses"), join(outputDirectory, "licenses"), { recursive: true, force: true });
 await cp(
   join(root, "src", "services", "skills", "bundled"),
   join(outputDirectory, "skills", "bundled"),

@@ -6,13 +6,14 @@ import { digestJson } from "./json";
 import { runtimePaths, runtimeRequest } from "./server";
 import type { RunNotice } from "./notices";
 import type { RoutingDecision } from "./routing";
+import type { RunDetail, RunPresentation } from "./presentation";
 
 export type QuestionNotice = WaitView & { runObjective: string; runStatus: RunStatus };
 export type RoutingNotice = RoutingDecision & { routing: true; version: number; waitId?: never; runObjective?: never; runStatus?: never; proposal?: never };
 export type InboxQuestion = QuestionNotice | RoutingNotice;
 export type ConnectionStatus = { state: "connecting" | "online" | "offline" | "stopped" | "incompatible" | "unauthorized"; message: string; lastConnectedAt?: number };
 export type QuestionInbox = Pick<DurableQuestionInbox, "current" | "subscribe" | "next" | "dismiss" | "answer">
-  & Partial<Pick<DurableQuestionInbox, "notifications" | "connection" | "acknowledge">>;
+  & Partial<Pick<DurableQuestionInbox, "notifications" | "connection" | "acknowledge" | "runs" | "inspect" | "followup" | "control">>;
 export const questionNoticeKey = (notice: InboxQuestion) => `${"routing" in notice ? `routing:${notice.inputId}` : notice.waitId}:${notice.version}`;
 const routingLabel = (candidate: RoutingDecision["candidates"][number]) => `${candidate.runId} · ${displayQuestionText(candidate.objective).slice(0, 80)}`;
 
@@ -20,6 +21,7 @@ const routingLabel = (candidate: RoutingDecision["candidates"][number]) => `${ca
 export class DurableQuestionInbox {
   #questions: readonly InboxQuestion[] = [];
   #notifications: readonly RunNotice[] = [];
+  #runs: readonly RunPresentation[] = [];
   #connection: ConnectionStatus = { state: "connecting", message: "正在连接长任务后台服务" };
   readonly #acknowledging = new Map<string, Promise<void>>();
   readonly #listeners = new Set<() => void>();
@@ -30,6 +32,29 @@ export class DurableQuestionInbox {
   constructor(readonly options: { configDir: string; workspace(): string }) {}
   current = (): readonly InboxQuestion[] => this.#questions;
   notifications = (): readonly RunNotice[] => this.#notifications;
+  runs = (): readonly RunPresentation[] => this.#runs;
+  async #runScope(runId: string): Promise<string> {
+    if (this.#controller.signal.aborted || this.#connection.state !== "online") throw new Error("后台未连接，操作没有提交");
+    const scope = await realpath(this.options.workspace());
+    if (scope !== this.#scope || !this.#runs.some((run) => run.runId === runId && run.workspace === scope)) throw new Error("任务或工作区已变化，请重新选择");
+    return scope;
+  }
+  async inspect(runId: string): Promise<RunDetail> {
+    const scope = await this.#runScope(runId);
+    const detail = await runtimeRequest(this.options.configDir, `/presentation?workspace=${encodeURIComponent(scope)}&runId=${encodeURIComponent(runId)}`) as RunDetail;
+    if (scope !== await this.#runScope(runId)) throw new Error("工作区已切换"); return detail;
+  }
+  async followup(runId: string, text: string, inputId: string): Promise<RoutingDecision> {
+    const workspace = await this.#runScope(runId);
+    const result = await runtimeRequest(this.options.configDir, "/command", { action: "followup", commandId: inputId, runId,
+      source: { inputId, workspace, rawText: text, source: "conversation" } }) as RoutingDecision;
+    if (result.status !== "accepted") throw new Error(`补充没有接纳：${result.reason}`); return result;
+  }
+  async control(runId: string, action: "pause" | "resume" | "cancel", revision: number, commandId: string): Promise<void> {
+    const workspace = await this.#runScope(runId);
+    await runtimeRequest(this.options.configDir, "/command", { action, runId, expectedRevision: revision, commandId,
+      source: { inputId: commandId, workspace, rawText: `${action} ${runId}`, source: "conversation" } });
+  }
   connection = (): ConnectionStatus => this.#connection;
   subscribe = (listener: () => void): (() => void) => { this.#listeners.add(listener); return () => { this.#listeners.delete(listener); }; };
   next = (): InboxQuestion | undefined => this.#questions.find((question) => !this.#dismissed.has(questionNoticeKey(question)));
@@ -78,7 +103,7 @@ export class DurableQuestionInbox {
       let lastFrameAt = Date.now(), stale = false;
       // Changing projects must revoke an old dialog before its answer can target another scope.
       const scopeTimer = setInterval(() => {
-        if (workspace !== this.options.workspace()) { this.#scope = undefined; this.#publish([]); this.#notifications = []; this.#emit(); connection.abort(); }
+        if (workspace !== this.options.workspace()) { this.#scope = undefined; this.#publish([]); this.#notifications = []; this.#runs = []; this.#emit(); connection.abort(); }
         else if (Date.now() - lastFrameAt > 45000) { stale = true; connection.abort(); }
       }, 250);
       scopeTimer.unref();
@@ -105,13 +130,14 @@ export class DurableQuestionInbox {
               const frame = pending.slice(0, end); pending = pending.slice(end + 2);
               if (frame.length > 2 * 1024 * 1024) throw new Error("Question notification exceeds limit");
               if (!frame.startsWith("data: ")) continue;
-              const snapshot = JSON.parse(frame.slice(6)) as { workspace: string; questions: QuestionNotice[]; notifications?: RunNotice[]; lifecycleNotifications?: boolean; ready?: boolean };
+              const snapshot = JSON.parse(frame.slice(6)) as { workspace: string; questions: InboxQuestion[]; runs?: RunPresentation[]; notifications?: RunNotice[]; lifecycleNotifications?: boolean; ready?: boolean };
               if (snapshot.workspace !== scope || !Array.isArray(snapshot.questions) || snapshot.questions.length > 4096) throw new Error("Question notification scope mismatch");
               if (!snapshot.lifecycleNotifications || !Array.isArray(snapshot.notifications)) throw new NotificationConnectionError("incompatible", "后台服务版本较旧，请使用新版 tnb runtime restart 后继续接收提醒");
               if (snapshot.ready === false) throw new NotificationConnectionError("offline", "后台调度已停止，请使用 tnb runtime restart 重启后恢复");
               if (this.options.workspace() !== workspace) { connection.abort(); break; }
               if (JSON.stringify(snapshot.questions) !== JSON.stringify(this.#questions)) this.#publish(snapshot.questions);
               if (JSON.stringify(snapshot.notifications) !== JSON.stringify(this.#notifications)) { this.#notifications = snapshot.notifications; this.#emit(); }
+              if (snapshot.runs && Array.isArray(snapshot.runs) && snapshot.runs.length <= 32 && JSON.stringify(snapshot.runs) !== JSON.stringify(this.#runs)) { this.#runs = snapshot.runs; this.#emit(); }
               this.#setConnection("online", "长任务后台已连接");
             }
             if (pending.length > 2 * 1024 * 1024) throw new Error("Question notification exceeds limit");

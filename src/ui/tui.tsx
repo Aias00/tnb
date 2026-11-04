@@ -11,6 +11,10 @@ import type { RefObject } from "react";
 import { TranscriptEntryView } from "./transcript/entry-view";
 import type { UserQuestion } from "../tools/interaction";
 import type { TaskRecord } from "../services/tasks/manager";
+import { WorkbenchView } from "./workbench-view";
+import { permissionDetails } from "./permission-details";
+import { parseRecommendedLabel } from "./question-label";
+import wrapAnsi from "wrap-ansi";
 import type { ExternalSlashCommand, SLASH_COMMANDS } from "./slash-commands";
 import type { ManagementView } from "./slash-commands";
 import type { McpActivity } from "./mcp-activity-controller";
@@ -38,6 +42,13 @@ export type TuiViewProps = {
   completionNotice?: string;
   tasks?: readonly TaskRecord[];
   durableQuestionCount?: number;
+  workbench?: Omit<React.ComponentProps<typeof WorkbenchView>, "height" | "width">;
+  permissionOffset?: number;
+  queuedInputCount?: number;
+  inputTarget?: string;
+  inputSending?: boolean;
+  workspaceLabel?: string;
+  backgroundSummary?: string;
   runtimeConnectionMessage?: string;
   management?: ManagementView;
   managementSelection?: number;
@@ -76,6 +87,13 @@ export const TuiView = memo(function TuiView({
   completionNotice,
   tasks = [],
   durableQuestionCount = 0,
+  workbench,
+  permissionOffset = 0,
+  queuedInputCount = 0,
+  inputTarget,
+  inputSending = false,
+  workspaceLabel,
+  backgroundSummary,
   runtimeConnectionMessage,
   management,
   managementSelection = 0,
@@ -108,10 +126,13 @@ export const TuiView = memo(function TuiView({
     terminalColumns: columns,
     prefixColumns: columns - contentColumns,
   });
-  const transcriptHeight = measureTranscriptHeight({ terminalRows: rows, promptLayout, suggestionRows });
+  const auxiliaryRows = (state.todos.length ? Math.min(3, state.todos.length) + 4 : 0) + (tasks.length ? Math.min(3, tasks.length) + 4 : 0)
+    + Number(Boolean(durableQuestionCount)) + Number(Boolean(queuedInputCount)) + Number(Boolean(inputTarget)) + Number(Boolean(runtimeConnectionMessage))
+    + Number(Boolean(backgroundSummary)) + Number(state.busy);
+  const transcriptHeight = Math.max(0, measureTranscriptHeight({ terminalRows: rows, promptLayout, suggestionRows }) - auxiliaryRows);
   return (
     <Box width={columns} height={rows} overflow="hidden" flexDirection="column" paddingX={1}>
-      {!management && !shellPanel ? (
+      {!management && !shellPanel && !workbench ? (
         <Box flexGrow={1} flexBasis={0} overflow="hidden" flexDirection="column" marginTop={1}>
           {transcriptViewportRef
             ? <TranscriptViewport ref={transcriptViewportRef} entries={state.transcript} width={Math.max(1, columns - 2)} height={transcriptHeight} theme={primaryColor} verbose={verboseTranscript} {...(selectedTranscriptEntryId ? { selectedEntryId: selectedTranscriptEntryId } : {})} onStateChange={updateViewportStatus} />
@@ -119,20 +140,23 @@ export const TuiView = memo(function TuiView({
                 {state.transcript.slice(-Math.max(1, Math.floor(transcriptHeight / 3))).map((entry) => <TranscriptEntryView key={entry.id} entry={entry} verbose={verboseTranscript} selected={entry.id === selectedTranscriptEntryId} />)}
               </Box>}
           <Box flexDirection="column" flexShrink={0}>
-            {state.todos.length ? <TodoList todos={state.todos} /> : null}
-            {tasks.length ? <TaskList tasks={tasks} /> : null}
+            {state.todos.length ? <TodoList todos={state.todos.slice(0, 3)} total={state.todos.length} /> : null}
+            {tasks.length ? <TaskList tasks={tasks.slice(0, 3)} total={tasks.length} /> : null}
+            {backgroundSummary ? <Text color="cyan" wrap="truncate-end">{backgroundSummary}</Text> : null}
             {durableQuestionCount ? <Text color="yellow">{durableQuestionCount} 个长任务问题待你决定 · 空闲时自动询问 · /task questions 查看</Text> : null}
+            {queuedInputCount ? <Text color="cyan">{queuedInputCount} 条对话输入排队 · Ctrl+T → 排队输入</Text> : null}
+            {inputTarget ? <Text color="cyan">{inputTarget}</Text> : null}
             {runtimeConnectionMessage ? <Text color="yellow">{runtimeConnectionMessage}</Text> : null}
             {state.busy && mcpActivity
               ? <McpActivityRow activity={mcpActivity} color={primaryColor} />
               : state.busy
-                ? <Text color={primaryColor}>{figures.star} Working…</Text>
+                ? <Text color={primaryColor}>{figures.star} {state.activity === "compacting" ? "整理上下文… 输入仍可排队" : "Working…"}</Text>
                 : null}
           </Box>
         </Box>
       ) : null}
       {permission ? (
-        <PermissionDialog request={permission} selection={permissionSelection} />
+        <PermissionDialog request={permission} selection={permissionSelection} offset={permissionOffset} width={columns} height={rows} />
       ) : question ? (
         <QuestionDialog
           question={question}
@@ -140,7 +164,7 @@ export const TuiView = memo(function TuiView({
           selected={questionSelected}
           {...(questionOtherInput !== undefined ? { otherInput: questionOtherInput } : {})}
         />
-      ) : management ? (
+      ) : workbench ? <WorkbenchView {...workbench} width={Math.max(12, columns - 2)} height={Math.max(8, rows - 2)} /> : management ? (
         <ManagementDialog
           view={management}
           selection={managementSelection}
@@ -160,7 +184,7 @@ export const TuiView = memo(function TuiView({
           {!commandSuggestions.length && !inputCompletions.length && completionNotice ? <CompletionNotice message={completionNotice} /> : null}
           {!transcriptSearch && !historySearch ? <PromptInputView
             layout={promptLayout}
-            disabled={state.busy}
+            disabled={inputSending}
             color={primaryColor}
             {...(promptMode ? { mode: promptMode } : {})}
             {...(onPromptClick ? { onClick: onPromptClick } : {})}
@@ -174,7 +198,8 @@ export const TuiView = memo(function TuiView({
         usage={state.usage}
         lastInputTokens={state.lastInputTokens}
         contextWindowTokens={state.contextWindowTokens}
-        modal={Boolean(permission || question || management || transcriptSearch || historySearch || shellPanel)}
+        modal={Boolean(permission || question || management || workbench || transcriptSearch || historySearch || shellPanel)}
+        {...(workspaceLabel ? { workspaceLabel } : {})}
         transcriptOffset={newerRows}
         verboseTranscript={verboseTranscript}
       />
@@ -378,10 +403,10 @@ function ManagementDetail({
   );
 }
 
-function TaskList({ tasks }: { tasks: readonly TaskRecord[] }) {
+function TaskList({ tasks, total = tasks.length }: { tasks: readonly TaskRecord[]; total?: number }) {
   return (
     <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1} marginBottom={1}>
-      <Text bold>Task runtime</Text>
+      <Text bold>Task runtime{total > tasks.length ? `（另 ${total - tasks.length} 项 · Ctrl+T）` : ""}</Text>
       {tasks.map((task) => {
         const running = task.status === "running" || task.status === "in_progress";
         const successful = task.status === "completed";
@@ -451,10 +476,10 @@ function CompletionNotice({ message }: { message: string }) {
   );
 }
 
-function TodoList({ todos }: { todos: TuiState["todos"] }) {
+function TodoList({ todos, total = todos.length }: { todos: TuiState["todos"]; total?: number }) {
   return (
     <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1} marginBottom={1}>
-      <Text bold>Tasks</Text>
+      <Text bold>Tasks{total > todos.length ? `（另 ${total - todos.length} 项）` : ""}</Text>
       {todos.map((todo, index) => {
         const icon = todo.status === "completed" ? figures.tick : todo.status === "in_progress" ? figures.pointer : figures.circle;
         const color = todo.status === "completed" ? "green" : todo.status === "in_progress" ? "cyan" : "gray";
@@ -488,7 +513,7 @@ function QuestionDialog({
       <Box flexDirection="column" marginTop={1}>
         {options.map((option, index) => (
           <Text key={option.label} {...(selection === index ? { color: "cyan" as const } : {})} bold={selection === index}>
-            {selection === index ? figures.pointer : " "} {question.multiSelect ? (selected.has(index) ? "[x]" : "[ ]") : `${index + 1}.`} {option.label} — {option.description}
+            {selection === index ? figures.pointer : " "} {question.multiSelect ? (selected.has(index) ? "[x]" : "[ ]") : `${index + 1}.`} {parseRecommendedLabel(option.label).label}{parseRecommendedLabel(option.label).recommended ? " ★ 推荐" : ""} — {option.description}
           </Text>
         ))}
       </Box>
@@ -511,18 +536,19 @@ function PromptInputView({ layout, disabled, mode, color, onClick }: { layout: P
   );
 }
 
-function PermissionDialog({ request, selection }: { request: PermissionAskRequest; selection: PermissionPromptDecision }) {
+function PermissionDialog({ request, selection, offset, width, height }: { request: PermissionAskRequest; selection: PermissionPromptDecision; offset: number; width: number; height: number }) {
   const plan = request.tool.name === "exit_plan_mode" &&
     request.input && typeof request.input === "object" && "plan" in request.input &&
     typeof (request.input as { plan?: unknown }).plan === "string"
     ? (request.input as { plan: string }).plan
     : undefined;
+  const lines = permissionDetails(request).flatMap((line) => wrapAnsi(line, Math.max(8, width - 6), { hard: true, wordWrap: false }).split("\n"));
+  const page = Math.max(2, height - 10), start = Math.min(offset, Math.max(0, lines.length - page));
   return (
     <Box flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1}>
       <Text bold color="yellow">Permission required</Text>
-      <Text>{request.message}</Text>
-      <Text bold>{request.tool.name}</Text>
-      {plan ? <Markdown>{plan}</Markdown> : <Text dimColor>{compactJson(request.input)}</Text>}
+      {lines.slice(start, start + page).map((line, index) => <Text key={index}>{line || " "}</Text>)}
+      {plan ? <Text dimColor>计划内容可用 PgUp/PgDn 查看；不会因未显示的内容自动批准。</Text> : null}
       <Box marginTop={1} gap={2}>
         <Text {...(selection === "allow" ? { color: "green" as const } : {})} bold={selection === "allow"}>
           {selection === "allow" ? figures.pointer : " "} Allow once
@@ -541,7 +567,7 @@ function PermissionDialog({ request, selection }: { request: PermissionAskReques
           {selection === "deny" ? figures.pointer : " "} Deny
         </Text>
       </Box>
-      <Text dimColor>←/→ select · Enter confirm · Esc deny</Text>
+      <Text dimColor>←/→ select · Enter confirm · Esc deny · PgUp/PgDn 全文 {start + 1}/{lines.length}</Text>
     </Box>
   );
 }
@@ -556,6 +582,7 @@ function StatusLine({
   modal,
   transcriptOffset,
   verboseTranscript,
+  workspaceLabel,
 }: {
   model: string;
   permissionMode: PermissionMode;
@@ -566,6 +593,7 @@ function StatusLine({
   modal: boolean;
   transcriptOffset: number;
   verboseTranscript: boolean;
+  workspaceLabel?: string;
 }) {
   const inputTokens = usage.inputTokens + usage.cacheReadInputTokens + usage.cacheCreationInputTokens;
   const cost = usage.costUsd ? ` · $${usage.costUsd.toFixed(4)}` : "";
@@ -578,10 +606,10 @@ function StatusLine({
           : transcriptOffset > 0
             ? `PgUp/PgDn · Shift+↑/↓ · Ctrl+End latest · ${transcriptOffset} newer`
             : busy
-              ? `esc interrupt · ctrl+o ${verboseTranscript ? "compact" : "expand"} · PgUp scroll`
-              : `enter send · ctrl+o ${verboseTranscript ? "compact" : "expand"} · PgUp scroll · ctrl+c ×2 exit`}
+              ? `enter queue · esc interrupt · ctrl+t tasks · ctrl+o ${verboseTranscript ? "compact" : "expand"}`
+              : `enter send · ctrl+t tasks · ctrl+o ${verboseTranscript ? "compact" : "expand"} · ctrl+c ×2 exit`}
       </Text>
-      <Text dimColor>{model} · {permissionMode} · {context} · ↑{inputTokens.toLocaleString()} ↓{usage.outputTokens.toLocaleString()}{cost}</Text>
+      <Text dimColor>{workspaceLabel ? `${workspaceLabel.slice(-36)} · ` : ""}{model} · {permissionMode} · {context} · 前台 ↑{inputTokens.toLocaleString()} ↓{usage.outputTokens.toLocaleString()}{cost}</Text>
     </Box>
   );
 }

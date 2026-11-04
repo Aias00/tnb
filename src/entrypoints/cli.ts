@@ -192,6 +192,7 @@ import {
   type TodoItem,
 } from "../tools/interaction";
 import { createTerminalPermissionPrompt, createTerminalQuestionPrompt, runRepl } from "../ui/repl";
+import { FileInputQueueStorage } from "../ui/input-queue";
 import { formatResumeHint, runTui } from "../ui/app";
 import { editPromptInExternalEditor } from "../ui/external-editor";
 import { loadKeybindings } from "../ui/keybindings";
@@ -249,6 +250,7 @@ export type CliOptions = {
   quiet?: boolean;
   signal?: AbortSignal;
   onEvent?(event: ModelEvent): void;
+  onActivity?(phase: "working" | "compacting"): void;
   onToolEvent?(event: ToolExecutionEvent): void;
   onPermissionModeChange?(mode: PermissionMode): void;
   teamRecoveryActive?: boolean;
@@ -2106,6 +2108,8 @@ export async function runCli(options: CliOptions): Promise<number> {
       },
       onMessage: (message) => session.append([message]),
       compactMessages: async (messages, signal, context) => {
+        try { options.onActivity?.("compacting"); } catch { /* UI observers cannot change execution. */ }
+        try {
         const result = await compactConversationPipeline({
           messages,
           thresholdTokens: compactThresholdTokens,
@@ -2138,6 +2142,7 @@ export async function runCli(options: CliOptions): Promise<number> {
           hooks.queueSessionContext(compactContext);
         }
         return result;
+        } finally { try { options.onActivity?.("working"); } catch { /* UI observer only. */ } }
       },
       onCompact: ({ messages, preTokens, postTokens }) => {
         const mode = permissionModeState.snapshot();
@@ -2801,6 +2806,8 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
       permissionController,
       questionController,
       durableQuestions,
+      workspace: () => activeWorkspaceState.current(),
+      queueStorage: new FileInputQueueStorage(configDir),
       mcpActivityController,
       taskManager,
       shellManager: activeShellManager,
@@ -3095,6 +3102,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
             quiet: true,
             signal: turn.signal,
             onEvent: turn.onModelEvent,
+            onActivity: turn.onActivity,
             onToolEvent: turn.onToolEvent,
             onPermissionModeChange(mode) {
               activePermissionMode = mode;

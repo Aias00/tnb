@@ -13,7 +13,7 @@ export function pendingRunNotices(runtime: DurableRuntime, workspace: string): R
     const event = runtime.store.latestEvent(run.runId, NOTICE_EVENTS);
     if (!event || runtime.store.record("attention-ack", event.eventId)) continue;
     const kind = run.status === "paused" ? ((run.pauseReason && run.pauseReason !== "user") || (!run.pauseReason && event.type === "run.blocked") ? "blocked" : "paused") : run.status as "succeeded" | "failed" | "cancelled";
-    const description = kind === "succeeded" ? "已完成并通过当前配置的验收，可用 /task result 查看结果。"
+    const description = kind === "succeeded" ? (runtime.configuration(run.runId).checks?.length ? "已完成并通过配置的验收命令，可用 /task result 查看结果。" : "报告已交付；未执行验收命令，可用 /task result 查看结果。")
       : kind === "failed" ? "执行失败，可用 /task status 查看原因和已有产物。"
       : kind === "cancelled" ? "已取消，停止了后续执行。"
       : kind === "paused" ? "已暂停，恢复前不会继续执行。"

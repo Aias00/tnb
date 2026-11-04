@@ -80,6 +80,11 @@ export async function runRepl(options: ReplOptions): Promise<number> {
         }
         continue;
       }
+      if (["/task", "/tasks"].includes(input) && inbox?.runs) {
+        const runs = inbox.runs();
+        options.write(runs.length ? runs.map((run) => `${displayQuestionText(run.title)}\n  ${run.runId} · ${run.mode} · ${run.phase}\n  ${run.budget.requests}/${run.budget.limit ?? "—"} 请求 · ${run.workspace}\n`).join("\n") : "当前工作区没有长任务。\n");
+        options.write("用 /task status|result|pause|resume RUN_ID；补充用 /task followup RUN_ID --text \"要求\"。\n"); continue;
+      }
       if (await options.handleCommand?.(input)) continue;
       const exitCode = await options.runTurn({ prompt: input, sessionId, resume: hasRun });
       if (exitCode === 0) hasRun = true;

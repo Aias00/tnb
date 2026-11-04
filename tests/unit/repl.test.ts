@@ -6,6 +6,16 @@ import {
 } from "../../src/ui/repl";
 
 describe("interactive REPL", () => {
+  test("bare task command shows the live overview without invoking a model", async () => {
+    const answers = ["/task", "/exit"]; let output = "", calls = 0;
+    await runRepl({ question: async () => answers.shift() ?? "/exit", write: (text) => { output += text; }, sessionIdFactory: () => "session",
+      runTurn: async () => { calls++; return 0; }, durableQuestions: {
+        current: () => [], next: () => undefined, dismiss: () => {}, answer: async () => ({ paused: false }), subscribe: () => () => {},
+        runs: () => [{ runId: "run", revision: 1, title: "后台任务", workspace: "/work", mode: "single", status: "paused", phase: "预算不足", updatedAt: 1,
+          checks: 0, budget: { requests: 2, limit: 8, priced: false, reported: 0, reserved: 0 }, inputs: [], tasks: [] }],
+      } });
+    expect(output).toContain("后台任务"); expect(output).toContain("预算不足"); expect(output).toContain("2/8 请求"); expect(calls).toBe(0);
+  });
   test("runs multiple prompts in one session and exits on slash exit", async () => {
     const answers = ["first task", "", "second task", "/exit"];
     const turns: Array<{ prompt: string; sessionId: string; resume: boolean }> = [];

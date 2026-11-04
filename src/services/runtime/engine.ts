@@ -11,6 +11,7 @@ import { createDurableContext } from "./context";
 import { prefixWithin } from "../compact/request-budget";
 import type { TaskProgress } from "./progress";
 import { TaskRouter, TaskInputChanged, type TaskInput, type RoutingInput } from "./routing";
+import { recordActivity } from "./activity";
 import { validateProposal, verifyEvidence, parseEvidenceReport, type DelegationProposal } from "./delegation";
 import { RuntimeStore } from "./store";
 import { RuntimeCommands, wakeWaiting, type TaskDefinition } from "./commands";
@@ -172,7 +173,7 @@ export class DurableRuntime {
         if (this.#recovering.has(run.runId)) { retryAt = Date.now() + 100; continue; }
         if (this.#running.has(task.taskId)) { retryAt = Date.now() + 100; continue; }
         const active = [...this.#running.keys()].filter((id) => this.store.getTask(id)?.status !== "waiting").length;
-        if (active >= 8 || this.store.tasks(run.runId).filter((item) => this.#running.has(item.taskId) && item.status === "running").length >= run.policy.maxActiveAgents) { retryAt = Date.now() + 200; continue; }
+        if (active >= 8 || this.store.tasks(run.runId).filter((item) => this.#running.has(item.taskId) && item.status === "running").length >= run.policy.maxActiveAgents) { recordActivity(this.store, task, "capacity"); retryAt = Date.now() + 200; continue; }
         if (["ready", "validating"].includes(task.status)) {
           let workspace: string; let locked: boolean;
           try { workspace = this.configuration(run.runId, task.taskId).workspace; locked = !this.#sharesWorkspace(workspace, task) && await workspaceIsLocked(workspace); }
@@ -181,6 +182,7 @@ export class DurableRuntime {
             continue;
           }
           if (locked) {
+            recordActivity(this.store, task, "workspace");
             retryAt = Date.now() + 1000;
             if (!this.store.record("workspace-wait", task.taskId)) this.store.command(randomUUID(), { kind: "workspace.wait", taskId: task.taskId }, Date.now(), (tx) => {
               tx.saveRecord({ kind: "workspace-wait", id: task.taskId, runId: run.runId, taskId: task.taskId, value: { workspace } }, 0);
@@ -224,6 +226,7 @@ export class DurableRuntime {
     }, 10_000); heartbeat.unref();
     try {
       const initialInput = !config.allowWrite ? (await workspaceManifest(config.workspace)).digest : undefined;
+      recordActivity(this.store, task, "preparing");
       resources = await this.factory({ run, task, configuration: config, signal });
       const tools = resources.tools.filter((tool) => tool.access === "read" || (tool.access === "write" && config.allowWrite) || (tool.access === "execute" && config.allowShell));
       tools.push(this.#waitTool(task, identity));
@@ -336,6 +339,7 @@ export class DurableRuntime {
           + (resources.projectInstructions ?? ""),
         beforeTurn: async () => {
           assertLive();
+          recordActivity(this.store, task, "preparing");
           const delivered = await this.#deliverInputs(task, transcript, assertLive);
           observedInputRevision = this.store.getTask(taskId)?.inputRevision ?? 0;
           if (strict && !assessed() && (run.policy.mode !== "multi" || !canDelegate)) this.store.command(randomUUID(), { kind: "strategy.default", taskId, observedInputRevision }, Date.now(), (tx) => {
@@ -434,7 +438,11 @@ export class DurableRuntime {
         tools: tools.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })), transcriptPath: transcript.path });
       loop.systemPrompt = systemPrompt;
       loop.transport = context.transport;
-      loop.compactMessages = (history, compactSignal, reason) => context.compact(history, compactSignal, reason?.reason === "context-overflow");
+      loop.compactMessages = async (history, compactSignal, reason) => {
+        recordActivity(this.store, task, "compacting");
+        try { return await context.compact(history, compactSignal, reason?.reason === "context-overflow"); }
+        finally { recordActivity(this.store, task, "preparing"); }
+      };
       messages = await journal.recover(messages, (call, scope) => executeTool(call, loop, signal, scope), (items) => transcript.append(items));
       recoveringCalls = false;
       const pendingWait = this.waits.current(taskId);
@@ -505,10 +513,12 @@ export class DurableRuntime {
       if (!candidate.inputDigest || candidate.inputDigest !== before.digest) throw new Error("Workspace changed since the report inputs were captured; inspect the current version again");
       resources = await this.factory({ run, task, configuration: config, signal });
       const checks: Array<{ command: string; output: string }> = [];
+      recordActivity(this.store, task, "verification", { completed: 0, total: config.checks.length });
       for (const command of config.checks) {
         signal.throwIfAborted();
         if (!resources.check) throw new Error("Verification command executor unavailable");
         checks.push({ command, output: await resources.check(command, signal) });
+        recordActivity(this.store, task, "verification", { completed: checks.length, total: config.checks.length });
       }
       const after = await workspaceManifest(config.workspace);
       if (before.digest !== after.digest) throw new Error("Verification changed its code inputs; evidence cannot be accepted");

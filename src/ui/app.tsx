@@ -1,6 +1,7 @@
 import React, {
   useCallback,
   useEffect,
+  useMemo,
   useReducer,
   useRef,
   useState,
@@ -33,6 +34,11 @@ import type { ExternalEditorResult } from "./external-editor";
 import { DEFAULT_KEYBINDINGS, matchesKeybinding, type KeybindingMap } from "./keybindings";
 import type { UsageTotals } from "../services/usage/cost";
 import type { TranscriptEntry } from "./transcript/model";
+import { InputQueue, type InputQueueStorage } from "./input-queue";
+import { workbenchItems, runDetailLines, type WorkbenchTab } from "./workbench";
+import { RuntimeRequestError } from "../services/runtime/server";
+import type { RunDetail } from "../services/runtime/presentation";
+import { watchWorkspaceBranch } from "./workspace-status";
 import {
   parseSlashCommand,
   slashCommandHelp,
@@ -53,6 +59,7 @@ export type TuiTurn = {
   permissionPrompt: PermissionController["request"];
   questionPrompt: AskUser;
   onPermissionModeChange(mode: PermissionMode): void;
+  onActivity?(phase: "working" | "compacting"): void;
 };
 
 export type TuiAppOptions = {
@@ -61,6 +68,8 @@ export type TuiAppOptions = {
   permissionController?: PermissionController;
   questionController?: QuestionController;
   durableQuestions?: QuestionInbox;
+  workspace?(): string;
+  queueStorage?: InputQueueStorage;
   mcpActivityController?: McpActivityController;
   taskManager?: TaskManager;
   scheduleManager?: ScheduleManager;
@@ -118,6 +127,16 @@ export function formatResumeHint(sessionId: string): string {
   return `\nResume this session with:\ntnb --resume ${sessionId}\n`;
 }
 
+// Terminal packets may contain several keys before React renders the next frame.
+function useImmediateState<T>(initial: T) {
+  const [value, publish] = useState(initial), current = useRef(initial);
+  const update = useCallback((next: T | ((old: T) => T)) => {
+    current.current = typeof next === "function" ? (next as (old: T) => T)(current.current) : next;
+    publish(current.current);
+  }, []);
+  return [value, update, current] as const;
+}
+
 export function TuiApp(options: TuiAppOptions) {
   const { exit } = useApp();
   const selection = useSelection();
@@ -126,6 +145,9 @@ export function TuiApp(options: TuiAppOptions) {
   const keybindings = options.keybindings ?? DEFAULT_KEYBINDINGS;
   const stdout = options.stdout ?? process.stdout;
   const sessionId = useRef(options.sessionIdFactory());
+  const inputQueue = useMemo(() => new InputQueue(sessionId.current, options.queueStorage), [sessionId.current, options.queueStorage]);
+  const queuedInputs = useSyncExternalStore(inputQueue.subscribe, inputQueue.current, inputQueue.current);
+  const turnRunning = useRef(false), queueClaiming = useRef(false), sendingInput = useRef(false);
   const ownedPermissionController = useRef(new PermissionController()).current;
   const permissionController = options.permissionController ?? ownedPermissionController;
   const ownedQuestionController = useRef(new QuestionController()).current;
@@ -144,6 +166,8 @@ export function TuiApp(options: TuiAppOptions) {
     options.durableQuestions?.current ?? emptyTasks, options.durableQuestions?.current ?? emptyTasks);
   const runNotifications = useSyncExternalStore(options.durableQuestions?.subscribe ?? emptySubscribe,
     options.durableQuestions?.notifications ?? emptyTasks, options.durableQuestions?.notifications ?? emptyTasks);
+  const durableRuns = useSyncExternalStore(options.durableQuestions?.subscribe ?? emptySubscribe,
+    options.durableQuestions?.runs ?? emptyTasks, options.durableQuestions?.runs ?? emptyTasks);
   const runtimeConnection = useSyncExternalStore(options.durableQuestions?.subscribe ?? emptySubscribe,
     options.durableQuestions?.connection ?? onlineConnection, options.durableQuestions?.connection ?? onlineConnection);
   const displayedRunNotifications = useRef(new Set<string>());
@@ -168,12 +192,28 @@ export function TuiApp(options: TuiAppOptions) {
   const [questionOther, setQuestionOther] = useState<InputBuffer | undefined>();
   const [management, setManagement] = useState<ManagementView | undefined>(options.initialManagement);
   const [managementSelection, setManagementSelection] = useState(0);
+  const [workbench, setWorkbench, workbenchRef] = useImmediateState(false), [workbenchTab, setWorkbenchTab, workbenchTabRef] = useImmediateState<WorkbenchTab>("tasks");
+  const [workbenchSelection, setWorkbenchSelection, workbenchSelectionRef] = useImmediateState(0), [workbenchDetail, setWorkbenchDetail] = useState(false), [workbenchOffset, setWorkbenchOffset] = useState(0);
+  const [workbenchBusy, setWorkbenchBusy, workbenchBusyRef] = useImmediateState(false), [workbenchError, setWorkbenchError] = useState<string | undefined>();
+  const [workbenchResult, setWorkbenchResult] = useState<RunDetail | undefined>();
+  const [confirmation, setConfirmation, confirmationRef] = useImmediateState<{ kind: "cancel" | "shell" | "delete"; id: string } | undefined>(undefined);
+  const panelRequest = useRef(0);
+  const controlRetry = useRef<{ runId: string; action: "pause" | "resume" | "cancel"; revision: number; commandId: string } | undefined>(undefined);
+  const [inputTarget, setInputTarget] = useState<{ runId: string; title: string; workspace: string } | undefined>();
+  const followupRetry = useRef<{ id: string; runId: string; text: string } | undefined>(undefined);
+  const [inputSending, setInputSending] = useState(false);
+  const [restoredDraft, setRestoredDraft] = useState<{ input: PromptInputSubmit; nonce: string; queueId?: string } | undefined>();
+  const [requestedDecision, setRequestedDecision] = useState<string | undefined>();
+  const decisionDrafts = useRef(new Map<string, { selection: number; selected: Set<number>; other?: InputBuffer }>());
+  const [permissionOffset, setPermissionOffset] = useState(0);
   const [sessionAction, setSessionAction] = useState<{ type: "rename" | "delete"; input: InputBuffer } | undefined>();
   const [scheduledPrompts, setScheduledPrompts] = useState<string[]>([]);
   const [shellPanel, setShellPanel] = useState(false);
   const [shellSelection, setShellSelection] = useState(0);
   const [shellInput, setShellInput] = useState<InputBuffer | undefined>();
   const [shellRuntimes, setShellRuntimes] = useState<ShellRuntimeSnapshot[]>([]);
+  const workItems = useMemo(() => workbenchItems(workbenchTab, { runs: durableRuns, questions: durableQuestions, queue: queuedInputs, tasks, shells: shellRuntimes }),
+    [workbenchTab, durableRuns, durableQuestions, queuedInputs, tasks, shellRuntimes]);
   const initialPromptHistory = useRef(options.initialInputHistory ?? []).current;
   const initialInput = useRef(restoreInputHistory(initialPromptHistory.map(({ display }) => display))).current;
   const [state, dispatch] = useReducer(
@@ -210,6 +250,30 @@ export function TuiApp(options: TuiAppOptions) {
   const hasRun = useRef(options.initialResume === true);
   const editorActive = useRef(false);
   const imageToolPaths = useRef(new Map<string, string>());
+  const workspacePath = options.workspace?.() ?? process.cwd();
+  const [branch, setBranch] = useState("");
+  useEffect(() => {
+    let closed = false, release = () => {};
+    void watchWorkspaceBranch(workspacePath, (value) => { if (!closed) setBranch(displayQuestionText(value)); }).then((stop) => { if (closed) stop(); else release = stop; });
+    return () => { closed = true; release(); };
+  }, [workspacePath]);
+  const restoringDecision = useRef(false);
+  const restoredQueue = useRef<InputQueue | undefined>(undefined);
+  useEffect(() => { void inputQueue.load().catch((error) => dispatch({ type: "notice", message: `排队输入恢复失败：${String(error)}；原文件保留。` })); }, [inputQueue]);
+  useEffect(() => {
+    if (!inputQueue.ready || restoredQueue.current === inputQueue) return;
+    restoredQueue.current = inputQueue;
+    const item = queuedInputs.find((row) => row.state === "draft" && row.workspace === workspacePath);
+    if (item && !bufferRef.current.value) { const draft = createInputBuffer(item.input.display, history); bufferRef.current = draft; setBuffer(draft); setRestoredDraft({ input: item.input, nonce: item.id, queueId: item.id }); }
+  }, [inputQueue, queuedInputs, workspacePath]);
+  useEffect(() => { setPermissionOffset(0); }, [permission]);
+  useEffect(() => {
+    panelRequest.current++; setWorkbenchResult(undefined); setWorkbenchDetail(false); setInputTarget(undefined); setRestoredDraft(undefined); controlRetry.current = undefined;
+  }, [workspacePath, sessionId.current]);
+  useEffect(() => {
+    const keys = new Set(durableQuestions.map(questionNoticeKey));
+    for (const key of decisionDrafts.current.keys()) if (!keys.has(key)) decisionDrafts.current.delete(key);
+  }, [durableQuestions]);
 
   useEffect(() => {
     for (const notice of runNotifications) {
@@ -238,14 +302,17 @@ export function TuiApp(options: TuiAppOptions) {
       return;
     }
     if (!options.durableQuestions || runtimeConnection.state !== "online" || state.busy || permission || question || questionController.current() || management
-      || shellPanel || historySearch || transcriptSearch || editorActive.current || buffer.value.length) return;
-    const notice = options.durableQuestions.next(); if (!notice) return;
+      || workbench || shellPanel || historySearch || transcriptSearch || editorActive.current || (!requestedDecision && buffer.value.length)) return;
+    const notice = requestedDecision ? durableQuestions.find((row) => questionNoticeKey(row) === requestedDecision) : options.durableQuestions.next();
+    if (!notice) { if (requestedDecision) setRequestedDecision(undefined); return; }
+    setRequestedDecision(undefined);
     const pending = { key: questionNoticeKey(notice), controller: new AbortController(), answering: false };
     activeDurableQuestion.current = pending;
     void questionController.request(durableUserQuestion(notice), pending.controller.signal).then(async (answer) => {
       if (pending.controller.signal.aborted) return;
       pending.answering = true;
       const result = await options.durableQuestions!.answer(notice, answer);
+      decisionDrafts.current.delete(pending.key);
       if (!pending.controller.signal.aborted) dispatch({ type: "notice", message: result.message ?? (result.paused ? "回答已保存；任务保持暂停，恢复后继续。" : "回答已保存，长任务会继续执行。") });
     }).catch((error: unknown) => {
       if (pending.controller.signal.aborted) return;
@@ -257,7 +324,7 @@ export function TuiApp(options: TuiAppOptions) {
       if (activeDurableQuestion.current === pending) activeDurableQuestion.current = undefined;
       if (questionUiMounted.current) setDurablePromptEpoch((value) => value + 1);
     });
-  }, [durableQuestions, options.durableQuestions, state.busy, permission, question, questionController, management,
+  }, [durableQuestions, options.durableQuestions, state.busy, permission, question, questionController, management, workbench, requestedDecision,
     shellPanel, historySearch, transcriptSearch, buffer.value, durablePromptEpoch, runtimeConnection]);
 
   useEffect(() => {
@@ -285,11 +352,18 @@ export function TuiApp(options: TuiAppOptions) {
   }, [permissionController, questionController]);
 
   useEffect(() => {
-    questionSelectionRef.current = 0;
-    setQuestionSelection(0);
-    setQuestionSelected(new Set());
-    setQuestionOther(question?.options.length === 0 ? createInputBuffer() : undefined);
+    const draft = activeDurableQuestion.current && decisionDrafts.current.get(activeDurableQuestion.current.key);
+    restoringDecision.current = true;
+    questionSelectionRef.current = draft?.selection ?? 0;
+    setQuestionSelection(draft?.selection ?? 0);
+    setQuestionSelected(draft?.selected ?? new Set());
+    setQuestionOther(draft?.other ?? (question?.options.length === 0 ? createInputBuffer() : undefined));
   }, [question]);
+  useEffect(() => {
+    if (restoringDecision.current) { restoringDecision.current = false; return; }
+    const active = activeDurableQuestion.current;
+    if (active && question) decisionDrafts.current.set(active.key, { selection: questionSelection, selected: new Set(questionSelected), other: questionOther });
+  }, [question, questionSelection, questionSelected, questionOther]);
 
   useEffect(() => {
     setManagementSelection(0);
@@ -316,18 +390,54 @@ export function TuiApp(options: TuiAppOptions) {
     if (selectedId) transcriptViewportRef.current?.reveal(selectedId);
   }, [transcriptSearch?.index, transcriptSearch?.matches]);
 
-  const submit = useCallback((submitted: string | PromptInputSubmit) => {
-    if (state.busy) return;
+  const submit = useCallback((submitted: string | PromptInputSubmit, queuedId?: string) => {
+    if (sendingInput.current || (!queuedId && queueClaiming.current)) return;
     const structured: PromptInputSubmit = typeof submitted === "string"
       ? { display: submitted, expanded: submitted, mode: "prompt", pastedContents: {} }
       : submitted;
     const prompt = structured.expanded;
+    const clearSubmitted = () => {
+      if (bufferRef.current.value.trim() !== structured.display.trim()) return;
+      const empty = createInputBuffer("", history); bufferRef.current = empty; setBuffer(empty);
+    };
+    if (inputTarget && !queuedId) {
+      if (structured.mode !== "prompt" || prompt.startsWith("/")) { setCompletionNotice("补充模式只接收文字；Esc 返回普通对话。"); return; }
+      if (!options.durableQuestions?.followup || workspacePath !== inputTarget.workspace) { setCompletionNotice("后台或工作区已变化，请重新选择任务。"); return; }
+      const retry = followupRetry.current;
+      const delivery = retry?.runId === inputTarget.runId && retry.text === prompt ? retry : { id: `ui-input:${crypto.randomUUID()}`, runId: inputTarget.runId, text: prompt };
+      followupRetry.current = delivery; sendingInput.current = true; setInputSending(true);
+      void options.durableQuestions.followup(delivery.runId, prompt, delivery.id).then(async () => {
+        if (restoredDraft?.queueId) { await inputQueue.remove(restoredDraft.queueId); setRestoredDraft(undefined); }
+        clearSubmitted(); setInputTarget(undefined); followupRetry.current = undefined;
+        dispatch({ type: "notice", message: `补充已保存到「${inputTarget.title}」，待安全工具边界送达；可在 Ctrl+T 查看送达状态。` });
+      }).catch((error) => setCompletionNotice(`补充未确认，草稿保留；Enter 用同一身份重试：${String(error)}`))
+        .finally(() => { sendingInput.current = false; setInputSending(false); });
+      return;
+    }
+    if (restoredDraft?.queueId && !queuedId) {
+      sendingInput.current = true; setInputSending(true);
+      void inputQueue.requeue(restoredDraft.queueId, structured, workspacePath).then(() => { clearSubmitted(); setRestoredDraft(undefined); setCompletionNotice("编辑后的输入已保存排队。"); })
+        .catch((error) => setCompletionNotice(`输入未重新派发，草稿保留：${String(error)}`)).finally(() => { sendingInput.current = false; setInputSending(false); });
+      return;
+    }
+    if (!queuedId && (state.busy || turnRunning.current || queuedInputs[0]?.state === "pending")) {
+      if (prompt.trimStart().startsWith("/")) { setCompletionNotice("命令请在前台结束后执行；Ctrl+T 可随时管理后台任务，普通文字可排队。"); return; }
+      sendingInput.current = true; setInputSending(true);
+      void inputQueue.enqueue(structured, workspacePath).then(() => {
+        clearSubmitted(); setCompletionNotice("对话输入已保存排队 · Ctrl+T → 排队输入可取回编辑；未发送给后台任务。");
+      }).catch((error) => setCompletionNotice(`排队失败，草稿保留：${String(error)}`)).finally(() => { sendingInput.current = false; setInputSending(false); });
+      return;
+    }
+    if (state.busy || turnRunning.current) return;
     transcriptViewportRef.current?.scroll("bottom");
     completionController.current?.abort();
     setInputCompletions(undefined);
     setCompletionNotice(undefined);
     const externalCommands = resolveExternalCommands(options.externalCommands);
     const parsedCommand = parseSlashCommand(prompt);
+    if (!queuedId && parsedCommand.kind === "command" && ["longtask", "tasks"].includes(parsedCommand.command.name) && !parsedCommand.command.argument.trim()) {
+      setWorkbench(true); setWorkbenchTab("tasks"); setWorkbenchSelection(0); setWorkbenchDetail(false); clearSubmitted(); return;
+    }
     const isExternal = parsedCommand.kind === "unknown" && externalCommands.some(
       (command) => command.name.toLowerCase() === parsedCommand.name.toLowerCase(),
     );
@@ -342,9 +452,11 @@ export function TuiApp(options: TuiAppOptions) {
       mode: structured.mode,
       pastedContents: structuredClone(structured.pastedContents),
     }]);
-    const emptyBuffer = createInputBuffer("", nextHistory);
-    bufferRef.current = emptyBuffer;
-    setBuffer(emptyBuffer);
+    if (!queuedId) {
+      const emptyBuffer = createInputBuffer("", nextHistory);
+      bufferRef.current = emptyBuffer;
+      setBuffer(emptyBuffer);
+    }
     if (parsedCommand.kind === "unknown" && !isExternal) {
       dispatch({ type: "command-start", text: prompt });
       dispatch({
@@ -397,6 +509,7 @@ export function TuiApp(options: TuiAppOptions) {
       });
       return;
     }
+    turnRunning.current = true;
     dispatch({ type: "submit", text: structured.display });
     const controller = new AbortController();
     abortController.current = controller;
@@ -444,8 +557,10 @@ export function TuiApp(options: TuiAppOptions) {
       onPermissionModeChange(mode) {
         dispatch({ type: "permission-mode-change", mode });
       },
-    }).then(() => {
+      onActivity(phase) { dispatch({ type: "activity", phase }); },
+    }).then(async () => {
       hasRun.current = true;
+      if (queuedId) await inputQueue.remove(queuedId);
       dispatch({ type: "turn-complete" });
     }).catch((error: unknown) => {
       dispatch({
@@ -457,35 +572,65 @@ export function TuiApp(options: TuiAppOptions) {
             : String(error),
       });
     }).finally(() => {
+      turnRunning.current = false;
       if (abortController.current === controller) abortController.current = undefined;
     });
-  }, [exit, history, options, permissionController.request, questionController, state.busy]);
+  }, [exit, history, options, permissionController.request, questionController, state.busy, inputQueue, queuedInputs, workspacePath, inputTarget, restoredDraft]);
+
+  useEffect(() => {
+    const first = queuedInputs[0];
+    if (!first || first.state !== "pending" || first.workspace !== workspacePath || state.busy || turnRunning.current || queueClaiming.current || sendingInput.current
+      || workbench || permission || question || management || inputTarget || !inputQueue.ready) return;
+    queueClaiming.current = true;
+    void inputQueue.claim(first.id, workspacePath).then((item) => {
+      if (!questionUiMounted.current || sessionId.current !== item.sessionId || (options.workspace?.() ?? process.cwd()) !== item.workspace) return;
+      submit(item.input, item.id);
+    }).catch((error) => dispatch({ type: "notice", message: `排队输入没有派发：${String(error)}` })).finally(() => { queueClaiming.current = false; });
+  }, [queuedInputs, workspacePath, state.busy, inputSending, workbench, permission, question, management, inputTarget, inputQueue, submit]);
 
   useEffect(() => options.scheduleManager?.subscribe((prompt, source) => {
     setScheduledPrompts((current) => [...current, `[Scheduled wakeup ${source}]\n${prompt}`]);
   }), [options.scheduleManager]);
 
   useEffect(() => {
-    if (!shellPanel || !options.shellManager) return;
+    if ((!shellPanel && !workbench) || !options.shellManager) return;
     const refresh = () => setShellRuntimes(options.shellManager!.runtimeSnapshots());
     refresh();
     const timer = setInterval(refresh, 500);
     timer.unref?.();
     return () => clearInterval(timer);
-  }, [options.shellManager, shellPanel]);
+  }, [options.shellManager, shellPanel, workbench]);
 
   useEffect(() => {
-    if (state.busy || permission || question || management || scheduledPrompts.length === 0) return;
+    if (state.busy || permission || question || management || workbench || scheduledPrompts.length === 0) return;
     const [prompt, ...remaining] = scheduledPrompts;
     setScheduledPrompts(remaining);
     if (prompt) submit(prompt);
-  }, [management, permission, question, scheduledPrompts, state.busy, submit]);
+  }, [management, permission, question, workbench, scheduledPrompts, state.busy, submit]);
+
+  const controlRun = (action: "pause" | "resume" | "cancel") => {
+    const items = workbenchItems(workbenchTabRef.current, { runs: durableRuns, questions: durableQuestions, queue: queuedInputs, tasks, shells: shellRuntimes });
+    const run = items[Math.min(workbenchSelectionRef.current, Math.max(0, items.length - 1))]?.run;
+    if (!run || !options.durableQuestions?.control || workbenchBusyRef.current) return;
+    if (action === "resume" && run.reason === "unknown-effects") { setWorkbenchError("先核对未知操作的影响；Enter 查看操作详情，L 准备状态查询命令。"); return; }
+    const old = controlRetry.current;
+    const request = old?.runId === run.runId && old.action === action ? old : { runId: run.runId, action, revision: run.revision, commandId: `ui-control:${crypto.randomUUID()}` };
+    controlRetry.current = request; setWorkbenchBusy(true); setWorkbenchError(undefined);
+    void options.durableQuestions.control(run.runId, action, request.revision, request.commandId).then(() => {
+      controlRetry.current = undefined; dispatch({ type: "notice", message: `已记录 ${action} 请求：${run.title}；排空状态以任务面板为准。` });
+    }).catch((error) => {
+      if (error instanceof RuntimeRequestError && error.status >= 400 && error.status < 500) {
+        controlRetry.current = undefined; setWorkbenchError(`请求被拒绝，请核对最新任务状态后重试：${error.message}`);
+      } else setWorkbenchError(`请求未确认，原身份保留；再次按同一操作可重试：${String(error)}`);
+    }).finally(() => setWorkbenchBusy(false));
+  };
 
   useInput((input, key, event) => {
     const promptMode = vimMode ? (vimInsert ? "INSERT" : "NORMAL") : undefined;
     const promptColumns = promptContentColumns(terminalSize.columns, promptMode);
     if (permission) {
-      if (key.leftArrow || key.rightArrow || key.upArrow || key.downArrow) {
+      if (key.pageDown || key.pageUp) setPermissionOffset((offset) => Math.max(0, offset + (key.pageDown ? 6 : -6)));
+      else if (key.leftArrow || key.rightArrow || key.upArrow || key.downArrow) {
         const decisions: PermissionPromptDecision[] = permission.suggestedRule
           ? ["allow", "allow-session", "allow-project", "deny"]
           : ["allow", "deny"];
@@ -549,6 +694,72 @@ export function TuiApp(options: TuiAppOptions) {
           questionController.resolve(indexes.sort().map((index) => question.options[index]!.label).join(", "));
         } else {
           questionController.resolve(question.options[selectedIndex]!.label);
+        }
+      }
+      return;
+    }
+    if (workbenchRef.current) {
+      const workItems = workbenchItems(workbenchTabRef.current, { runs: durableRuns, questions: durableQuestions, queue: queuedInputs, tasks, shells: shellRuntimes });
+      const workbenchSelection = workbenchSelectionRef.current, confirmation = confirmationRef.current;
+      const selected = workItems[Math.min(workbenchSelection, Math.max(0, workItems.length - 1))];
+      const close = () => { panelRequest.current++; setWorkbench(false); setConfirmation(undefined); };
+      if (workbenchBusyRef.current) { if (key.escape) close(); return; }
+      if (confirmation) {
+        if (key.escape || input.toLowerCase() === "n") setConfirmation(undefined);
+        else if (input.toLowerCase() === "y") {
+          setConfirmation(undefined);
+          if (selected?.id !== confirmation.id) { setWorkbenchError("任务选择已变化，没有提交操作。"); return; }
+          if (confirmation.kind === "cancel") controlRun("cancel");
+          else if (confirmation.kind === "shell" && selected.shell) { options.shellManager?.kill(selected.shell.kind === "pty" ? selected.shell.pid : selected.shell.taskId); setShellRuntimes(options.shellManager?.runtimeSnapshots() ?? []); }
+          else if (confirmation.kind === "delete" && selected.queued) void inputQueue.remove(selected.queued.id).catch((error) => setWorkbenchError(String(error)));
+        }
+        return;
+      }
+      if (key.escape || matchesKeybinding(keybindings, "toggleTasks", input, key)) {
+        if (workbenchDetail) { setWorkbenchDetail(false); setWorkbenchOffset(0); } else close(); return;
+      }
+      if (key.tab) { setWorkbenchTab((tab) => tab === "tasks" ? "decisions" : tab === "decisions" ? "queue" : "tasks"); setWorkbenchSelection(0); setWorkbenchDetail(false); setWorkbenchError(undefined); return; }
+      if (key.pageDown || key.pageUp || (workbenchDetail && (key.upArrow || key.downArrow))) {
+        setWorkbenchOffset((offset) => Math.max(0, offset + (key.pageDown ? 10 : key.pageUp ? -10 : key.downArrow ? 1 : -1))); return;
+      }
+      if (key.upArrow || key.downArrow) { setWorkbenchSelection((value) => workItems.length ? (value + (key.downArrow ? 1 : -1) + workItems.length) % workItems.length : 0); setWorkbenchResult(undefined); return; }
+      if (!selected) return;
+      if (selected.shell && input.toLowerCase() === "i") {
+        setShellSelection(Math.max(0, shellRuntimes.indexOf(selected.shell))); setShellInput(undefined); close(); setShellPanel(true); return;
+      }
+      if (key.return) {
+        if (selected.decision) { setRequestedDecision(questionNoticeKey(selected.decision)); close(); return; }
+        setWorkbenchDetail(true); setWorkbenchOffset(0); setWorkbenchError(undefined);
+        if (selected.run && options.durableQuestions?.inspect) {
+          const request = ++panelRequest.current; setWorkbenchBusy(true);
+          void options.durableQuestions.inspect(selected.run.runId).then((result) => { if (request === panelRequest.current) setWorkbenchResult(result); })
+            .catch((error) => { if (request === panelRequest.current) setWorkbenchError(String(error)); }).finally(() => setWorkbenchBusy(false));
+        }
+        return;
+      }
+      if (selected.queued && input.toLowerCase() === "e") {
+        if (bufferRef.current.value) { setWorkbenchError("当前编辑器已有草稿，请先发送或清空；排队内容没有删除。"); return; }
+        sendingInput.current = true; setWorkbenchBusy(true);
+        void inputQueue.edit(selected.queued.id, workspacePath).then((item) => {
+          if ((options.workspace?.() ?? process.cwd()) !== item.workspace || sessionId.current !== item.sessionId) return;
+          const draft = createInputBuffer(item.input.display, history); bufferRef.current = draft; setBuffer(draft); setRestoredDraft({ input: item.input, nonce: crypto.randomUUID(), queueId: item.id }); close();
+        }).catch((error) => setWorkbenchError(String(error))).finally(() => { sendingInput.current = false; setWorkbenchBusy(false); }); return;
+      }
+      if (selected.queued && input.toLowerCase() === "d") { setConfirmation({ kind: "delete", id: selected.id }); return; }
+      if (selected.shell && input.toLowerCase() === "k") { setConfirmation({ kind: "shell", id: selected.id }); return; }
+      if (selected.run) {
+        if (input.toLowerCase() === "p") controlRun("pause");
+        else if (input.toLowerCase() === "r") controlRun("resume");
+        else if (input.toLowerCase() === "x") setConfirmation({ kind: "cancel", id: selected.id });
+        else if (input.toLowerCase() === "f") {
+          if (!["active", "paused", "pausing"].includes(selected.run.status)) { setWorkbenchError("终态任务不能追加要求，请显式创建后续任务。"); return; }
+          setInputTarget({ runId: selected.run.runId, workspace: selected.run.workspace, title: selected.run.title }); close();
+        } else if (input.toLowerCase() === "l") {
+          if (bufferRef.current.value) { setWorkbenchError("当前已有草稿，先保存草稿再准备控制命令。"); return; }
+          const command = selected.run.reason === "unknown-effects" ? `/task status ${selected.run.runId}`
+            : `/task limits ${selected.run.runId} --revision ${selected.run.revision} `;
+          const draft = createInputBuffer(command, history); bufferRef.current = draft; setBuffer(draft); close();
+          setCompletionNotice("控制命令已放入编辑器；填入明确决定后提交，不会自动提高预算或核对结果。");
         }
       }
       return;
@@ -707,15 +918,17 @@ export function TuiApp(options: TuiAppOptions) {
       else if (key.downArrow) setShellSelection((value) => Math.min(Math.max(0, shellRuntimes.length - 1), value + 1));
       else if (input.toLowerCase() === "i" && selected?.kind === "pty" && selected.alive) setShellInput(createInputBuffer());
       else if (input.toLowerCase() === "k" && selected) {
-        options.shellManager?.kill(selected.kind === "pty" ? selected.pid : selected.taskId);
-        setShellRuntimes(options.shellManager?.runtimeSnapshots() ?? []);
+        const items = workbenchItems("tasks", { runs: durableRuns, questions: durableQuestions, queue: queuedInputs, tasks, shells: shellRuntimes });
+        const index = items.findIndex((item) => item.shell === selected);
+        setShellPanel(false); setWorkbench(true); setWorkbenchTab("tasks"); setWorkbenchSelection(Math.max(0, index)); setWorkbenchDetail(false);
+        if (items[index]) setConfirmation({ kind: "shell", id: items[index]!.id });
       }
       return;
     }
-    if (matchesKeybinding(keybindings, "toggleTasks", input, key) && options.shellManager) {
-      setShellRuntimes(options.shellManager.runtimeSnapshots());
+    if (matchesKeybinding(keybindings, "toggleTasks", input, key)) {
+      setShellRuntimes(options.shellManager?.runtimeSnapshots() ?? []);
       setShellSelection(0);
-      setShellPanel(true);
+      setWorkbench(true); setWorkbenchTab("tasks"); setWorkbenchSelection(0); setWorkbenchDetail(false); setWorkbenchError(undefined);
       return;
     }
     if (matchesKeybinding(keybindings, "transcriptSearch", input, key)) {
@@ -736,7 +949,10 @@ export function TuiApp(options: TuiAppOptions) {
       setCompletionNotice(undefined);
       return;
     }
-    const promptControllerActive = !state.busy && !permission && !question && !management && !historySearch && !transcriptSearch && !shellPanel;
+    if (inputSending) return;
+    if (key.escape && inputTarget) { event.stopImmediatePropagation(); setInputTarget(undefined); setCompletionNotice("已返回普通对话，草稿保留。"); return; }
+    if (key.escape && state.busy) { event.stopImmediatePropagation(); abortController.current?.abort(); return; }
+    const promptControllerActive = !permission && !question && !management && !historySearch && !transcriptSearch && !shellPanel;
     if (promptControllerActive && promptControllerOwnsInput(input, key, event.keypress.isPasted, Boolean(inputCompletions?.values.length), bufferRef.current.value.length > 0)) {
       return;
     }
@@ -838,6 +1054,7 @@ export function TuiApp(options: TuiAppOptions) {
       });
       return;
     }
+    if (key.escape && inputTarget) { setInputTarget(undefined); setCompletionNotice("已返回普通对话，草稿保留。"); return; }
     if (key.escape && state.busy) {
       abortController.current?.abort();
       return;
@@ -952,7 +1169,7 @@ export function TuiApp(options: TuiAppOptions) {
   return (
     <>
       <PromptInputController
-        active={!state.busy && !permission && !question && !management && !historySearch && !transcriptSearch && !shellPanel}
+        active={!inputSending && !permission && !question && !management && !workbench && !historySearch && !transcriptSearch && !shellPanel}
         columns={promptContentColumns(terminalSize.columns, vimMode ? (vimInsert ? "INSERT" : "NORMAL") : undefined)}
         value={buffer.value}
         cursorOffset={buffer.cursor}
@@ -963,6 +1180,7 @@ export function TuiApp(options: TuiAppOptions) {
         {...(options.editInput ? { editInput: options.editInput } : {})}
         onChange={updatePromptEditor}
         onSubmit={submit}
+        {...(restoredDraft ? { restoredInput: restoredDraft } : {})}
         onNotice={(message) => setCompletionNotice(message)}
         {...(promptMouse ? { mousePosition: promptMouse } : {})}
       />
@@ -985,6 +1203,18 @@ export function TuiApp(options: TuiAppOptions) {
       inputCompletionIndex={inputCompletions?.index ?? 0}
       {...(completionNotice ? { completionNotice } : {})}
       tasks={tasks}
+      {...(workbench ? { workbench: { tab: workbenchTab, items: workItems, selection: workbenchSelection, offset: workbenchOffset, busy: workbenchBusy,
+        ...(workbenchDetail ? { detail: [...(workItems[workbenchSelection]?.lines ?? []), ...(workbenchResult && workItems[workbenchSelection]?.run?.runId === workbenchResult.run.runId ? ["", ...runDetailLines(workbenchResult)] : [])] } : {}),
+        ...(workbenchError ? { error: workbenchError } : {}), ...(confirmation ? { confirming: confirmation.kind === "delete" ? "删除这条排队输入？" : confirmation.kind === "shell" ? "终止这个 Shell/PTY？" : "取消选定长任务并停止后续派发？" } : {}) } } : {})}
+      permissionOffset={permissionOffset}
+      queuedInputCount={queuedInputs.length}
+      {...(inputTarget ? { inputTarget: `补充到「${inputTarget.title}」· ${inputTarget.runId.slice(0, 8)} · Esc 返回对话` } : {})}
+      inputSending={inputSending}
+      workspaceLabel={`${workspacePath}${branch ? ` (${branch})` : ""}`}
+      {...(durableRuns.some((run) => !["succeeded", "failed", "cancelled"].includes(run.status)) ? { backgroundSummary: (() => {
+        const run = durableRuns.find((row) => !["succeeded", "failed", "cancelled"].includes(row.status))!;
+        return `后台 ${run.runId.slice(0, 8)} · ${run.mode} · ${run.phase} · ${run.budget.requests}/${run.budget.limit ?? "—"} 请求 · Ctrl+T 查看`;
+      })() } : {})}
       durableQuestionCount={durableQuestions.length}
       {...(["offline", "stopped", "incompatible", "unauthorized"].includes(runtimeConnection.state) ? { runtimeConnectionMessage: runtimeConnection.message } : {})}
       shellRuntimes={shellRuntimes}

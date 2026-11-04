@@ -462,3 +462,37 @@ schema v4 从 v1/v2/v3 迁移，不改原能力绑定和执行策略。墓碑保
 另以 `0933c23` 完整旧二进制建立 schema v3 的活跃任务，在请求中暂停并关闭 owner，使用新二进制迁移至 v4、接纳补充并恢复完成。保留原 Run/Task ID、agent schema 和能力绑定，独立核对成功 read 操作；本地 HTTP fixture 共 3 请求，无外部模型调用。本轮未调用 Magpie，也未将上一轮真实模型矩阵算为新增修复实测；未新增数小时 soak 或语义准确率基准。
 
 证据位于 `/Volumes/data/tnb-review-2026-11-04/review-fixes/`：`all-five.log`、`report-recovery.log`、`typecheck.log`、`full-tests.log`、`build.log`、升级记录及 Linux 归档。使用新版时需显式重启原后台 owner；不会自动重启用户正在运行的服务。
+
+## 17 交互改造与源码复用
+
+日期：2026-11-04。基线 `6879384`。本轮从用户操作路径收敛实现：工作中继续输入、找回排队内容、为指定后台任务补充要求、主动处理问题、查看执行阶段、审阅审批全文、处理阻塞及检查交付。入口复用现有 Ctrl+T、斜杠命令、PromptInput、QuestionController、PermissionController、ShellRuntimePanel 和持久运行时的 inbox/控制接口，不增加另一套任务状态机。
+
+对照的本地源码快照及采用方式如下。下表是具体实现参考，不代表把各项目的全部能力移植进 TNB。
+
+| 项目 / 快照 | 具体源码依据 | TNB 采用方式 |
+| --- | --- | --- |
+| Codex `57d4fac64adb` | `codex-rs/tui/src/chatwidget/input_queue.rs` 的 queued / pending / unconfirmed 状态；`bottom_pane/approval_overlay.rs` 的命令与授权范围 | 区分保存与派发确认，保留输入身份和草稿；审批显示全文及规则范围；按 TNB 协议重写，没有复制 Rust 组件 |
+| Pi `16f5f0af4d85` | `packages/coding-agent/src/core/agent-session.ts` 的 `steer` 与 `followUp`；interactive 模式的压缩期间队列 | 区分当前执行安全边界补充与下一轮对话输入；不把后台补充默认为新前台回合 |
+| DeepSeek Harness `687f282e8625` | `ui-conversation/.../queue/QueueDock.tsx` 的已接纳队列、待提交状态、编辑和附件；`ui-user-questions/.../QuestionComposer.tsx` | 队列可取回编辑、保存后才确认；复用小函数 `parseRecommendedLabel`，只改变显示、不改变回答原值 |
+| Claude Code 本地提取材料 | `claude-code-source-book/source/context/QueuedMessageContext.tsx` 及原任务、权限交互材料；该目录非 Git 仓库 | 参考排队项独立呈现和任务面板入口；未复制提取代码，不将其视为可直接复用的开源组件 |
+| DSH Superagent `8c32a9dc5d72` | `src/app/views/threads.ts` 的 timeline/decision 投影；`views/tickets.ts` 的 ticket 阶段、input delivered 与容量视图 | 从已落盘业务事实派生工作区任务视图，待决定独立入口，补充已保存/已送达分开展示 |
+| Pizza `ffa72f018e35` | `packages/tui/interactive-mode.ts` 的 steer/followUp、approval、footer 组合和 Git 分支观察 | 保留原 TNB 渲染器，增加工作区/分支及独立后台状态，不另引一套终端框架 |
+| agent-autoloop `cecec75be3ca` | `worker/contract.ts` 的 ask/notice/resolve 与等待本人处理约定 | 复用原持久 wait 和通知，展示明确阻塞原因、下一步操作；报告交付不说成检查通过，不自动重做未知操作 |
+
+唯一直接移入的上述上游函数位于 `src/ui/question-label.ts`，MIT 全文与版权保存在 `third_party/licenses/deepseek-harness.txt`，构建复制至 `dist/licenses`。其他为行为参考和既有 TNB 组件复用，未移入上游状态存储、完整前端或新依赖。
+
+实现与审阅结论：
+
+- `input-queue.ts` 将 foreground 输入按会话私有保存，先写入/fsync 后确认。pending → uncertain 在派发前持久化，成功回合后删除；取回为 draft 保留原记录。失败/重开不自动重做 uncertain，原输入的粘贴与图片引用元数据保留。队列不是持久后台 Run 的替代，不提供同一 foreground session 的多进程并发编辑协议。
+- `activity.ts` 记录展示阶段，`presentation.ts` 读取业务状态和工具/验收回执；展示读取不增加 Run revision，不改变权限。SSE 和鉴权 `/presentation` 都按工作区筛选，列表有界为 32 个 Run，详情最多 40 项成功文件写入预览与 16 项待核对操作。Shell 修改不会伪装成完整 diff。
+- `app.tsx` 工作台沿原命令身份、revision 和来源审计提交控制；网络未确认时保留身份重试，明确 4xx 拒绝后允许基于最新状态重新提交。快捷键选择、确认和 busy 同步更新，防止同批终端事件操作旧任务或重复提交。待决定允许保留主草稿主动进入，回答失败的草稿在当前进程保留；跨重启只保证问题事实恢复。
+- 权限详情分页保留命令/文件替换/计划全文和作用域；取消、删除排队项、终止 Shell/PTY 均确认。Shell 面板保留原输出和 PTY 输入入口，未因合并任务面板删除旧能力。未知副作用只能检查并显式 reconcile，不从界面盲目 resume。
+- 前后台用量分开，未配置/确认计价不说免费。交付报告与实际验收通过明确区分；任务状态不使用虚构百分比。普通 REPL 保持串行，新增裸 `/task` 概览，执行中编辑与排队仅适用于全屏 TUI。
+
+验证使用脚本 transport、本地 Unix 服务与真实 PTY，没有外部模型调用。新增终端用例验证执行中排队及主草稿保留、暂停/恢复/取消确认、定向补充、同批按键的新任务选择、审批全文翻页、真实 PTY 输入输出和终止确认、回答失败后保留两份草稿；另有文件队列重开/错误保存/取回编辑、Git worktree 分支观察、工作区隔离、送达区分、实际验收计数和 REPL 概览回归。
+
+初期 PTY 驱动曾把文字与 Enter 当作同批粘贴、使用累计 ANSI 字节误判画面，以及错误等待已被移除的终止 PTY 显示“已退出”；均保留失败日志，更正为独立按键和 `@xterm/headless` 当前屏幕断言。Linux 首轮原恢复用例触及 Bun 默认 5 秒测试超时，清理与尚未完成的重开竞争，产生 short-read；将包含 shutdown/reopen/两次等待的该用例外层时限改为 20 秒，内部等待与业务断言不变，完整复测结果见下。没有把这一测试驱动超时归类为已证明的生产 SQLite 故障。
+
+证据目录：`/Volumes/data/tnb-review-2026-11-04/interaction/`；保留所有探索与失败记录。本轮不新增数小时 soak、真实桌面通知、在线模型质量评测、持久 Skill/MCP 或并行编码能力。
+
+最终验证：macOS 类型检查、构建、编译后 `--help` 和全量测试 **867 pass / 2 skip / 0 fail**；Linux Ubuntu 24.04.4 ARM64 / Bun 1.3.14，在 `TNB_REQUIRE_NATIVE_SANDBOX=1` 下类型检查、构建、编译后 `--help` 和全量测试 **862 pass / 7 skip / 0 fail**。两端均为 **869 tests / 137 files**，跳过项均为原平台专属测试；新增 **15 项**回归，包括 **7 项真实 PTY 交互测试**。`macos-all.log`、`typecheck-final.log`、`macos-build-final.log` 与 `linux-evidence.tar.gz` 保存最终结果，二进制及 MIT 附件摘要另存 SHA-256。
