@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   macos:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     env:
       TNB_REQUIRE_NATIVE_SANDBOX: "1"

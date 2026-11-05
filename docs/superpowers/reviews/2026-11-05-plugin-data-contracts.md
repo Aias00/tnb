@@ -40,3 +40,5 @@
 ## 本地验证
 
 macOS 最终版本在 `TNB_REQUIRE_NATIVE_SANDBOX=1` 下通过 1134 项测试，2 项其他平台专属测试跳过，0 失败；覆盖 165 个文件和 4669 次断言。新增数据合同测试 21 项，相关七文件专项 66 项通过。类型检查、完整构建、28 处本地文档链接及可运行迁移样例通过。Windows 专项 CI 增加两份数据合同测试文件；Linux/macOS 继续全量回归。
+
+CI 首轮 macOS 作业在执行步骤前被平台拒绝，原标签 macos-14 已按 [GitHub 公告](https://github.blog/changelog/2026-10-01-github-actions-macos-14-runner-image-retirement/)于 2026 年 11 月 2 日退休；验证工作流改用 macos-15，保持原生沙箱必需与完整测试集合。
