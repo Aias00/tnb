@@ -13,6 +13,8 @@
 
 7. MCP manager 的工具数组还包含客户端生成的资源读取辅助工具，不能把它当成服务器原始 tools 白名单。新增普通工具投影，durable 只从该投影选择；同名资源辅助工具不会获得原始工具的授权。
 
+8. Windows 扩大定向测试后暴露现有 owner/coordinator 的 POSIX 目录权限和 Unix socket 依赖。没有把该平台误当成已支持完整后台服务：4 项 owner 流程仅在 macOS/Linux 运行，Windows 继续运行 5 项便携能力测试（含真实 stdio、环境收缩、目录冻结、工具白名单、allowed-tools/deny）及 MCP manager 测试。allowed-tools 测试直接装配真实 worker，避免为权限单元场景引入 owner。
+
 ## 校验结果
 
 - macOS：1015 pass / 2 skip / 0 fail，1017 tests / 153 files。

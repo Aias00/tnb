@@ -12,6 +12,9 @@ import type { ModelTransport } from "../../src/providers/types";
 const cleanup: (() => Promise<unknown>)[] = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
 const signal = () => new AbortController().signal;
+// The existing durable owner/workspace coordinator uses POSIX ownership and Unix sockets.
+// Keep portable capability assembly and real stdio MCP coverage enabled on Windows.
+const ownerTest = test.skipIf(process.platform === "win32");
 async function fixture() {
   const root = await realpath(await mkdtemp(join(tmpdir(), "tnb-durable-capabilities-")));
   cleanup.push(() => rm(root, { recursive: true, force: true }));
@@ -96,17 +99,16 @@ test("durable MCP list changes cannot replace the admitted tool generation", asy
 test("skill allowed-tools narrows task tools and explicit deny remains authoritative", async () => {
   const f = await fixture(); await writeFile(join(f.skillDir, "SKILL.md"), f.markdown("allowed-tools: [read]\n"));
   await f.factory.prepareCapabilities!(f.config);
-  const owner = await open(f, { async *stream() { yield* done(); } });
-  const submitted = await owner.runtime.submit({ commandId: "narrow", objective: "Inspect", configuration: f.config });
-  const worker = await f.factory({ ...submitted, task: submitted.tasks[0]!, configuration: owner.runtime.configuration(submitted.run.runId), signal: signal() }); cleanup.push(async () => worker.close?.());
+  const context = { run: { runId: "assembly-fixture" }, task: { taskId: "assembly-fixture" }, configuration: f.config, signal: signal() } as Parameters<typeof f.factory>[0];
+  const worker = await f.factory(context); cleanup.push(async () => worker.close?.());
   expect(worker.tools.map(tool => tool.name)).toEqual(["read", "skill", "skill_resource"]);
   await writeFile(join(f.configDir, "settings.json"), JSON.stringify({ permissions: { deny: ["skill"] } }));
-  const again = await f.factory({ ...submitted, task: submitted.tasks[0]!, configuration: owner.runtime.configuration(submitted.run.runId), signal: signal() }); cleanup.push(async () => again.close?.());
+  const again = await f.factory(context); cleanup.push(async () => again.close?.());
   const skill = again.tools.find(tool => tool.name === "skill")!;
   expect((await again.authorize(skill, skill.validate({ name: "inspect" }), { toolUseId: "denied" })).behavior).toBe("deny");
 });
 
-test("selected capabilities survive owner restart; children inherit no skill or MCP authority", async () => {
+ownerTest("selected capabilities survive owner restart; children inherit no skill or MCP authority", async () => {
   const f = await fixture(); let requests = 0;
   const transport: ModelTransport = { async *stream(request) {
     expect(request.tools.map(tool => tool.name)).toContain("skill");
@@ -132,7 +134,7 @@ test("selected capabilities survive owner restart; children inherit no skill or 
   expect(JSON.stringify(second.runtime.configuration(submitted.run.runId))).not.toContain("fixture-credential");
 });
 
-test("a disconnected unsafe MCP effect pauses and never redispatches after owner restart", async () => {
+ownerTest("a disconnected unsafe MCP effect pauses and never redispatches after owner restart", async () => {
   const f = await fixture(); let requests = 0;
   const transport: ModelTransport = { async *stream() { requests++; yield* call("mcp__fixture__inspect", { disconnect: true }); } };
   const first = await open(f, transport); const { run } = await first.runtime.submit({ commandId: "unsafe", objective: "Call external service", configuration: f.config });
@@ -145,7 +147,7 @@ test("a disconnected unsafe MCP effect pauses and never redispatches after owner
   expect(requests).toBe(1); expect((await readFile(f.log, "utf8")).trim().split("\n")).toHaveLength(1);
 });
 
-test("recovery rejects changed MCP schemas/descriptions before a new model request", async () => {
+ownerTest("recovery rejects changed MCP schemas/descriptions before a new model request", async () => {
   const f = await fixture(); let requests = 0;
   const transport: ModelTransport = { async *stream() { requests++; yield* call("durable_wait", { kind: "question", key: "wait", question: "Continue?", about: "Waiting" }); } };
   const first = await open(f, transport); const { run, tasks } = await first.runtime.submit({ commandId: "drift", objective: "Inspect", configuration: f.config });
@@ -156,7 +158,7 @@ test("recovery rejects changed MCP schemas/descriptions before a new model reque
   await until(second.runtime, () => second.store.getRun(run.runId)?.status === "paused"); expect(requests).toBe(1);
 });
 
-test("slash and approved conversational handoffs carry explicit capability selections without enabling control-time expansion", async () => {
+ownerTest("slash and approved conversational handoffs carry explicit capability selections without enabling control-time expansion", async () => {
   const f = await fixture();
   const owner = await open(f, { async *stream() { yield* done(); } }, false);
   const { serveDurableRuntime } = await import("../../src/services/runtime/server");

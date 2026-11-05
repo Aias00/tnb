@@ -68,3 +68,5 @@ tnb runtime submit "查找相关 API 文档" --mcp-tool mcp__docs__search
 MCP stdio 服务器属于宿主信任的进程，不在 Coding Shell 沙箱内。它只自动继承 PATH/HOME/TMPDIR/LANG 和服务器显式配置的 env；需要的 MCP 凭据应显式配置。环境、URL 和 headers 只保存摘要到任务配置，但服务端主动返回的内容仍会进入工具结果与 transcript，不能保证服务响应中没有秘密。
 
 子 Agent 不继承这些额外能力。skill 资源要求恢复时仍在原路径并保持内容一致，每个 skill 最多 1 MiB/128 个资源；二进制资源暂不支持读取。MCP sampling、交互 elicitation 和 prompts 暂不接入持久 worker；OAuth 需事先通过 `tnb mcp auth` 完成登录。
+
+平台范围：持久 owner 服务及 workspace coordinator 当前使用 POSIX 目录所有权与 Unix socket，本轮完整服务验证覆盖 macOS/Linux。Windows 验证能力装配、真实 stdio MCP、权限与目录冻结等便携路径；不代表 Windows 已支持完整持久后台服务。
