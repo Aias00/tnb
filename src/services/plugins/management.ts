@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { cp, mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import type { PluginRuntimeState } from "./lifecycle";
 import { loadPlugins, type LoadedPlugin } from "./loader";
@@ -22,7 +22,7 @@ export async function installLocalPlugin(options: {
   const info = await stat(source);
   if (!info.isDirectory()) throw new Error("Plugin install source must be a directory");
   const stageRoot = join(options.targetRoot, `.install-stage-${randomUUID()}`);
-  const stagedPlugin = join(stageRoot, source.split("/").at(-1) ?? "plugin");
+  const stagedPlugin = join(stageRoot, basename(source));
   await mkdir(stageRoot, { recursive: true });
   try {
     await cp(source, stagedPlugin, { recursive: true, errorOnExist: true });
