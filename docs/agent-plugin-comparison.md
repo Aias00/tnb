@@ -1,5 +1,7 @@
 # 领域插件：与 DeepSeek Harness、Pi 的源码比较及调整
 
+后续规范研究见 [插件规范的源码比较与设计取舍](plugin-specification-research.md)，包含 Pi、DeepSeek Harness、OpenCode、VS Code、Backstage 和 Stream Agent 的对应机制，以及尚未落实的规范草案。下面保留原领域插件改造的设计记录。
+
 本次基于本地源码，不把其他项目的能力直接归为 TNB 已有功能。Pi 快照为 `16f5f0af4d85ca583d045ceb5ed6d646fcaf7761`，DeepSeek Harness 为 `687f282e8625c6b8d11ff58211a90524be2e4317`。没有复制整套框架、引入 Cordis/jiti 或新增一套安装器；下面的实现由 TNB 自己维护。
 
 后续进展（2026-11-05）：以下比较保留最初实现的约束；已安装领域包现已增加历史字节留存、多代际精确解析、宿主引用与回收，不热替换、不覆盖内置 factory 或历史渠道。当前使用与范围以 [历史代际指南](guides/plugin-generations.md) 为准。
