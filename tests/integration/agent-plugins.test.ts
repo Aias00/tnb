@@ -11,8 +11,14 @@ import { loadPlugins } from "../../src/services/plugins/loader";
 import { installLocalPlugin } from "../../src/services/plugins/management";
 import { trustPlugin, computePluginTreeSha256, revokePluginTrust } from "../../src/services/plugins/trust";
 import { pluginGenerationKey, pluginGenerationReferences } from "../../src/agent/plugin-generations";
+import { RuntimeStore } from "../../src/services/runtime/store";
+import { RuntimeCommands } from "../../src/services/runtime/commands";
+import { DomainRegistry } from "../../src/agent/domain";
 
 const cleanup: Array<() => Promise<unknown>> = [];
+// The durable owner artifact barrier currently requires POSIX directory fsync.
+// Windows runs real installation/retention/registry tests below without claiming owner execution support.
+const ownerTest = test.skipIf(process.platform === "win32");
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
 async function fixture(settings: Record<string, unknown> = {}) {
   const root = await mkdtemp(join(tmpdir(), "tnb-plugin-agent-")); cleanup.push(() => rm(root, { recursive: true, force: true }));
@@ -36,6 +42,30 @@ async function until(host: AgentRuntimeHost, predicate: () => boolean) {
   const end = Date.now() + 8000;
   while (!predicate()) { if (Date.now() > end) throw new Error(`Timed out: ${JSON.stringify(host.store.runs())}; ${JSON.stringify(host.store.runs().flatMap(run => host.store.tasks(run.runId)))}`); await host.runtime.tick(); await Bun.sleep(10); }
 }
+
+test("portable installed generations retain bytes, pin SQLite references, enforce revocation and collect after pruning", async () => {
+  const f = await fixture(); await trustPlugin(f.trust, f.installedRoot);
+  const stateRoot = join(f.root, "portable-state"), snapshotRoot = join(stateRoot, "plugin-snapshots"), historyRoot = join(stateRoot, "plugin-generations");
+  const store = new RuntimeStore(join(stateRoot, "state.sqlite")); cleanup.push(async () => store.close());
+  let loaded = await loadAdapterPlugins({ ...f.options, generationReferences: [] }, [], snapshotRoot); cleanup.push(() => loaded.close());
+  const registry = new DomainRegistry([], loaded.registrations), pinned = registry.prepare(descriptor()), old = pinned.plugin!;
+  const commands = new RuntimeCommands(store), { run } = commands.createRun({ commandId: "portable", objective: "Keep code", configuration: { domain: pinned } });
+  expect(loaded.list()[0], JSON.stringify(loaded.list())).toMatchObject({ status: "active", generation: "current" }); await loaded.close();
+  const entry = join(f.installedRoot, "index.mjs"); await writeFile(entry, await readFile(entry, "utf8") + "\n// portable upgraded generation\n"); await trustPlugin(f.trust, f.installedRoot);
+  loaded = await loadAdapterPlugins({ ...f.options, generationReferences: pluginGenerationReferences(store) }, [], snapshotRoot); cleanup.push(() => loaded.close());
+  expect(loaded.list().map(item => [item.generation, item.status]), JSON.stringify(loaded.list())).toEqual([["current", "active"], ["retained", "active"]]);
+  const upgraded = new DomainRegistry([], loaded.registrations);
+  expect(upgraded.prepare(descriptor()).plugin?.fingerprint).not.toBe(old.fingerprint);
+  expect(upgraded.resolve(pinned).id).toBe("fixture"); expect(() => upgraded.prepare(pinned)).toThrow("recovery only");
+  await loaded.close(); await revokePluginTrust(f.trust, f.installedRoot); await trustPlugin(f.trust, f.installedRoot);
+  loaded = await loadAdapterPlugins({ ...f.options, generationReferences: pluginGenerationReferences(store) }, [], snapshotRoot); cleanup.push(() => loaded.close());
+  expect(loaded.list().find(item => item.generation === "retained")?.error).toContain("no longer trusted");
+  expect(await readdir(historyRoot)).toContain(pluginGenerationKey(old)); await loaded.close();
+  store.command("terminal", {}, Date.now(), tx => { const value = tx.getRun(run.runId)!; tx.saveRun({ ...value, status: "cancelled", revision: value.revision + 1 }, value.revision); return true; });
+  store.deleteTerminalRun(run.runId);
+  loaded = await loadAdapterPlugins({ ...f.options, generationReferences: pluginGenerationReferences(store) }, [], snapshotRoot); cleanup.push(() => loaded.close());
+  expect(await readdir(historyRoot)).not.toContain(pluginGenerationKey(old));
+});
 
 test("existing installation discovers adapters and forces restart lifecycle; untrusted/disabled code is never imported", async () => {
   const f = await fixture();
@@ -71,7 +101,7 @@ test("a failed plugin remains visible while an independent plugin activates", as
   } finally { await host.close(); }
 });
 
-test("trusted installed adapter executes tools, pins provenance, waits, restarts and resumes the original task", async () => {
+ownerTest("trusted installed adapter executes tools, pins provenance, waits, restarts and resumes the original task", async () => {
   const f = await fixture(); await trustPlugin(f.trust, f.installedRoot);
   const first = await f.open();
   const input = { commandId: "create", objective: "Read evidence then ask", namespace: "fixture", adapter: descriptor({ wait: true }), mode: "single" as const };
@@ -90,7 +120,7 @@ test("trusted installed adapter executes tools, pins provenance, waits, restarts
   expect(result.acceptance).toBe("domain-verified");
 });
 
-test("upgrading identical package/adapter versions restores the old waiting task while new roots use current bytes", async () => {
+ownerTest("upgrading identical package/adapter versions restores the old waiting task while new roots use current bytes", async () => {
   const f = await fixture(); await trustPlugin(f.trust, f.installedRoot);
   let host = await f.open(); const { run, tasks } = await host.submit({ commandId: "create", objective: "Wait", namespace: "fixture", adapter: descriptor({ wait: true }) });
   await until(host, () => host.store.getTask(tasks[0]!.taskId)?.status === "waiting");
@@ -119,7 +149,7 @@ test("upgrading identical package/adapter versions restores the old waiting task
   expect((await f.events()).filter(event => event === "tool")).toHaveLength(2);
 });
 
-test("history collection retains terminal Run references and task overrides, then collects only after explicit pruning", async () => {
+ownerTest("history collection retains terminal Run references and task overrides, then collects only after explicit pruning", async () => {
   const f = await fixture(); await trustPlugin(f.trust, f.installedRoot);
   let host = await f.open(); const first = await host.submit({ commandId: "terminal", objective: "Finish", namespace: "fixture", adapter: descriptor() });
   await until(host, () => host.store.getRun(first.run.runId)?.status === "succeeded");
@@ -145,7 +175,7 @@ test("history collection retains terminal Run references and task overrides, the
   host = await f.open(); expect(await readdir(history)).not.toContain(oldKey);
 });
 
-test("a failed current factory cannot make retained adapters the default or restart historical application entries", async () => {
+ownerTest("a failed current factory cannot make retained adapters the default or restart historical application entries", async () => {
   const f = await fixture();
   const manifest = { ...f.manifest, apiVersion: "tnb.host-plugin/v1", contributes: { ...f.manifest.contributes,
     applications: [{ id: "panel", version: "1", entry: "panel.mjs" }] } };
@@ -199,7 +229,7 @@ test.skipIf(process.platform === "win32")("SIGKILL preserves referenced plugin b
   } finally { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await exited; }
 });
 
-test("revocation followed by trusting only the new installation does not resurrect the old generation", async () => {
+ownerTest("revocation followed by trusting only the new installation does not resurrect the old generation", async () => {
   const f = await fixture(); await trustPlugin(f.trust, f.installedRoot);
   let host = await f.open(); const { run, tasks } = await host.submit({ commandId: "wait", objective: "Wait", namespace: "fixture", adapter: descriptor({ wait: true }) });
   await until(host, () => host.store.getTask(tasks[0]!.taskId)?.status === "waiting"); await host.close();
@@ -211,7 +241,7 @@ test("revocation followed by trusting only the new installation does not resurre
   expect((await f.events()).filter(item => item === "import")).toHaveLength(imports + 1);
 });
 
-test("disabled, removed, and changed unapproved current installations cannot activate retained code", async () => {
+ownerTest("disabled, removed, and changed unapproved current installations cannot activate retained code", async () => {
   for (const mode of ["disabled", "removed", "changed"] as const) {
     const f = await fixture(); await trustPlugin(f.trust, f.installedRoot);
     let host = await f.open(); const { run, tasks } = await host.submit({ commandId: "wait", objective: "Wait", namespace: "fixture", adapter: descriptor({ wait: true }) });
@@ -228,7 +258,7 @@ test("disabled, removed, and changed unapproved current installations cannot act
   }
 });
 
-test("corrupted or missing retained packages block recovery without executing their bytes", async () => {
+ownerTest("corrupted or missing retained packages block recovery without executing their bytes", async () => {
   for (const mode of ["corrupted", "missing"] as const) {
     const f = await fixture(); await trustPlugin(f.trust, f.installedRoot);
     let host = await f.open(); const { run, tasks } = await host.submit({ commandId: "wait", objective: "Wait", namespace: "fixture", adapter: descriptor({ wait: true }) });
@@ -245,7 +275,7 @@ test("corrupted or missing retained packages block recovery without executing th
   }
 });
 
-test("shutdown drains workers before disposers, concurrent close is shared and ownership lasts through cleanup", async () => {
+ownerTest("shutdown drains workers before disposers, concurrent close is shared and ownership lasts through cleanup", async () => {
   for (const abortBeforeSubscribe of [false, true]) {
     const f = await fixture(); await trustPlugin(f.trust, f.installedRoot);
     const host = await f.open(); await host.submit({ commandId: "hold", objective: "Hold", namespace: "fixture", adapter: descriptor({ hold: true, abortBeforeSubscribe }) });

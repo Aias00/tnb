@@ -22,6 +22,7 @@
 6. 运行时仍从独立临时副本执行，避免插件自己的可变资产操作改写永久历史包；关闭不删除被任务引用的历史证据。
 7. 新增 Windows 安装/恢复覆盖发现原安装器按 `/` 分割路径，把 Windows 盘符路径误拼进暂存目录。改用平台 basename；本地安装/代际相关 34 项及类型检查通过，最终跨平台结果以主分支 CI 为准。
 8. Windows 历史文件刷新使用读写句柄，POSIX 保留只读 fsync；Windows 的 [FlushFileBuffers 合同](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-flushfilebuffers) 要求 GENERIC_WRITE。为测试断言补充插件 inventory 错误，避免仅报告 adapter unavailable 而隐藏加载失败原因。
+9. Windows 验证安装/归档/多代际 registry、SQLite 引用、撤权和回收；执行 owner 测试沿用现有能力边界跳过。原有 artifact barrier 依赖 POSIX 目录 fsync，本轮没有以跳过刷新来放宽运行时持久保证，也不声称 Windows 全量 owner 恢复已可用。新增 portable 用例真实保存包、升级、精确解析旧代际、撤销再信任及 prune 回收，不用 mocks 替代文件系统。
 
 ## 验证
 
