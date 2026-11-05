@@ -6037,6 +6037,9 @@ if (import.meta.main) {
   } else if (argv[0] === "collaboration") {
     const { runCollaborationCommand } = await import("./collaboration");
     process.exitCode = await runCollaborationCommand({ argv, cwd: process.cwd(), env: process.env, stdout: process.stdout, stderr: process.stderr });
+  } else if (argv[0] === "web") {
+    const { runWebCommand } = await import("./web");
+    process.exitCode = await runWebCommand({ argv, cwd: process.cwd(), env: process.env, stdout: process.stdout, stderr: process.stderr });
   } else if (argv[0] === "runtime") {
     const { runRuntimeCommand } = await import("./runtime");
     process.exitCode = await runRuntimeCommand({ argv, cwd: process.cwd(), env: process.env, stdout: process.stdout, stderr: process.stderr });

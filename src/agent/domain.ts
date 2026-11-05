@@ -123,6 +123,7 @@ export class DomainRegistry {
     if (!this.#legacy?.runtime?.legacyDescriptor) throw new Error("Legacy execution adapter unavailable; configure the original plugin explicitly");
     return this.prepare(this.#legacy.runtime.legacyDescriptor(configuration));
   }
+  has(id: string, version: string): boolean { return this.#adapters.has(digestJson({ id, version })); }
   /** Pin new submissions. Recovery must use resolve directly and cannot acquire a new identity. */
   prepare(descriptor: DomainDescriptor): DomainDescriptor {
     const value = validateDomainDescriptor(descriptor);

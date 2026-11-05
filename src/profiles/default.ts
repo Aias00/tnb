@@ -7,19 +7,23 @@ import { loadSettings } from "../services/settings/load";
 import { pluginTrustStorePath } from "../services/plugins/trust";
 import { loadHostPlugins } from "../agent/plugins";
 import type { DurableRuntime } from "../services/runtime/engine-core";
+import { createWebPlugin } from "../plugins/web/plugin";
+import { TASK_SERVICE } from "../agent/task-service";
+import { createTaskService } from "../services/workbench/tasks";
 
 /** Product composition only; the generic plugin host knows neither Coding nor collaboration. */
 export async function loadDefaultProfile(options: { configDir: string; root: string; env: Record<string, string | undefined>; coding: boolean }) {
   const { configDir, root, env } = options, settings = await loadSettings({ configDir, cwd: configDir });
   const configuration = { "tnb-coding": { configDir, env }, "tnb-collaboration": { configDir, env }, "tnb-channels": { env } };
-  const builtins = [ ...(options.coding ? [await createCodingPlugin({ configDir, runtimeRoot: root, env })] : []), await createChannelsPlugin(env), await createCollaborationPlugin({ configDir, env }) ];
+  const builtins = [ ...(options.coding ? [await createCodingPlugin({ configDir, runtimeRoot: root, env })] : []), await createChannelsPlugin(env), await createCollaborationPlugin({ configDir, env }), await createWebPlugin() ];
   const plugins = await loadHostPlugins({ roots: [{ directory: join(configDir, "plugins"), source: "user" }],
     trustStorePath: pluginTrustStorePath(configDir), enabled: settings.enabledPlugins, builtins, configuration }, [], join(root, "plugin-snapshots"));
   return { plugins, async start(runtime: DurableRuntime, signal?: AbortSignal) {
     await plugins.extensions.start({ store: runtime.store, signal, services: new Map<string, unknown>([
       [INTERNAL_RUNTIME_SERVICE, runtime], [CHANNEL_SERVICE, plugins.extensions.channels],
+      [TASK_SERVICE, createTaskService({ runtime, configDir, env, coding: runtime.domains.has("coding", "1") })],
       ["tnb.runtime.read/v1", Object.freeze({ runs: () => runtime.store.runs(), status: (runId: string) => ({ run: runtime.store.getRun(runId), tasks: runtime.store.tasks(runId) }), configuration: (runId: string) => runtime.configuration(runId) })],
-    ]), grants: { "tnb-collaboration": [INTERNAL_RUNTIME_SERVICE, CHANNEL_SERVICE], ...settings.pluginServices } });
+    ]), grants: { "tnb-collaboration": [INTERNAL_RUNTIME_SERVICE, CHANNEL_SERVICE], "tnb-web": [TASK_SERVICE], ...settings.pluginServices } });
     const config = await loadCollaborationConfig(configDir);
     if (config.enabled && settings.enabledPlugins?.["tnb-collaboration"] !== false) {
       const state = plugins.extensions.list().find(item => item.kind === "application" && item.id === "collaboration" && item.version === "1");

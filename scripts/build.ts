@@ -35,7 +35,7 @@ if (!plugin.success) throw new AggregateError(plugin.logs, "Coding plugin bundle
 await copyFile(join(root, "src/adapters/coding/plugin.json"), join(pluginRoot, "plugin.json"));
 await cp(join(root, "src/services/skills/bundled"), join(pluginRoot, "bundled"), { recursive: true, force: true });
 
-for (const name of ["channels", "collaboration"]) {
+for (const name of ["channels", "collaboration", "web"]) {
   const target = join(outputDirectory, "plugins", `tnb-${name}`); await mkdir(target, { recursive: true });
   const result = await Bun.build({ entrypoints: [join(root, "src/plugins", name, "plugin.ts")], target: "bun", outdir: target, naming: "index.mjs" });
   if (!result.success) throw new AggregateError(result.logs, `${name} plugin bundle failed`);

@@ -28,7 +28,7 @@ export const RUNTIME_CAPABILITIES = Object.freeze({ protocol: 2, defaultMode: "a
   durableWaits: true, durableDelegation: true, deadlineScheduling: true, questionNotifications: true, lifecycleNotifications: true, adjustableLimits: true,
   taskRouting: true, safeFollowups: true, delegationStrategyVersion: 2, defaultDelegationDepth: 1, autoParallelBranches: 2,
   structuredChildReports: true, machineModelCoordination: true, overlappingWorkspaceLocks: true,
-  domainAdapters: true, codingPlugin: true, pluginInventory: true, collaborationProfile: true, hostPluginExtensions: true });
+  domainAdapters: true, codingPlugin: true, pluginInventory: true, collaborationProfile: true, hostPluginExtensions: true, webWorkbench: true, workspaceTaskApi: true });
 export async function serveDurableRuntime(options: ServerOptions): Promise<void> {
   const paths = await runtimePaths(options.configDir);
   const release = await lock(paths.root, { realpath: true, stale: 5000, update: 1000, retries: 0 });
@@ -224,10 +224,10 @@ function composeRuntime(root: string, plugins: Awaited<ReturnType<typeof loadDef
 export class RuntimeRequestError extends Error {
   constructor(message: string, readonly status: number) { super(message); }
 }
-export async function runtimeRequest(configDir: string, resource: string, body?: unknown): Promise<unknown> {
+export async function runtimeRequest(configDir: string, resource: string, body?: unknown, signal?: AbortSignal): Promise<unknown> {
   const paths = await runtimePaths(configDir); const token = (await readFile(paths.token, "utf8")).trim();
   const response = await fetch(`http://localhost${resource}`, { unix: paths.socket, method: body === undefined ? "GET" : "POST",
-    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: AbortSignal.timeout(10_000) });
+    headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, ...(body === undefined ? {} : { body: JSON.stringify(body) }), signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000) });
   const value = await response.json() as { error?: string };
   if (!response.ok) throw new RuntimeRequestError(value.error ?? `Runtime HTTP ${response.status}`, response.status);
   return value;

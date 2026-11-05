@@ -55,5 +55,7 @@ export type { AgentDomainAdapter, DomainDescriptor, DomainContext, DomainAccepta
 export type { AgentPluginOptions, AdapterPluginAPI, AdapterPluginFactory, AdapterPluginState, BuiltinAdapterPlugin } from "./plugins";
 
 export { loadHostPlugins } from "./plugins";
+export type { TaskService, WorkspaceTaskService } from "./task-service";
+export { TASK_SERVICE } from "./task-service";
 export type { HostPluginAPI, HostPluginFactory, BuiltinHostPlugin, HostPluginOptions, HostPluginState } from "./plugins";
 export type { PluginApplication, PluginInterface, PluginChannel, ExtensionContext, ActiveExtension, ChannelPort, ChannelDescriptor, ChannelRegistry, PluginStateStore, ContributionReference, ExtensionState } from "./extensions";

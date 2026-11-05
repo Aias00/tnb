@@ -1,0 +1,185 @@
+'use strict';
+const $ = id => document.getElementById(id);
+const node = (tag, text, className) => { const element = document.createElement(tag); if (text !== undefined) element.textContent = text; if (className) element.className = className; return element; };
+const scope = location.pathname;
+const storageKey = name => 'tnb:web:' + scope + ':' + name;
+const stored = name => { try { return JSON.parse(localStorage.getItem(storageKey(name)) || 'null'); } catch { return null; } };
+const save = (name, value) => { if (value === null) localStorage.removeItem(storageKey(name)); else localStorage.setItem(storageKey(name), JSON.stringify(value)); };
+const state = { runs: [], questions: [], notices: [], selected: null, detail: null, question: null, routeChoice: null, operation: null, stream: null, seen: new Set(), offered: new Set(), connectionError: false, pending: stored('pending'), tab: 'report', sequence: 0, events: [], busy: false, coding: false };
+const statusText = { active: '进行中', paused: '已暂停', pausing: '暂停中', cancelling: '取消中', cancelled: '已取消', succeeded: '已完成', failed: '失败' };
+function error(message) { $('error').textContent = message; $('error').classList.toggle('hidden', !message); document.querySelectorAll('dialog[open] .dialog-error').forEach(element => { element.textContent = message; element.classList.toggle('hidden', !message); }); }
+function toast(message) { $('toast').textContent = message; $('toast').classList.remove('hidden'); clearTimeout(toast.timer); toast.timer = setTimeout(() => $('toast').classList.add('hidden'), 5000); }
+function connection(online, text) { $('connection').textContent = text; $('connection').classList.toggle('online', online); }
+async function api(path, input) {
+  const response = await fetch(path, { credentials: 'same-origin', ...(input === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }) });
+  const value = await response.json();
+  if (!response.ok) { if (response.status === 401) { state.stream?.close(); connection(false, '授权已失效'); } throw new Error(value.error || '请求失败'); }
+  return value;
+}
+function updateControls() {
+  document.querySelector('main').setAttribute('aria-busy', String(state.busy));
+  document.querySelectorAll('form [type=submit]').forEach(element => element.disabled = state.busy);
+  $('new-task').disabled = $('empty-new').disabled = state.busy || !state.coding;
+  if (!state.detail) return;
+  const status = state.detail.run.status;
+  $('pause').disabled = state.busy || !['active', 'pausing'].includes(status); $('resume').disabled = state.busy || status !== 'paused'; $('limits').disabled = state.busy || status !== 'paused'; $('cancel').disabled = state.busy || !['active', 'paused', 'pausing', 'cancelling'].includes(status);
+}
+function showPending() { $('retry-box').classList.toggle('hidden', !state.pending); $('submit-form').querySelector('[type=submit]').textContent = state.pending?.action === 'submit' ? '重试原提交' : '提交任务'; }
+async function perform(input, retry = false) {
+  if (state.busy) { toast('正在处理上一条请求，请稍候'); throw new Error('正在处理上一条请求'); }
+  if (state.pending && !retry) throw new Error('上一条请求结果尚未确认，请先重试原请求或放弃重试');
+  const command = retry ? state.pending : { ...input, commandId: crypto.randomUUID() };
+  if (!command) return;
+  state.pending = command; save('pending', command); showPending(); state.busy = true; updateControls(); error('');
+  try {
+    const result = await api('api/command', command);
+    state.pending = null; save('pending', null); showPending();
+    if (command.action === 'submit') { state.selected = result.run.runId; save('selected', state.selected); $('submit-dialog').close(); const model = $('model').value; $('submit-form').reset(); $('model').value = model; save('model', model); save('draft', null); updateGrants(); }
+    if (command.action === 'followup' && !command.resolveInputId) { $('followup').value = ''; save('followup:' + command.runId, null); }
+    if (command.action === 'answer') save('answer:' + command.waitId + ':' + command.expectedVersion, null);
+    if (command.action === 'answer' || command.resolveInputId) $('question-dialog').close();
+    if (command.action === 'limits') $('limits-dialog').close();
+    if (command.action === 'reconcile') $('reconcile-dialog').close();
+    await refresh(); renderAttention(); toast(command.action === 'submit' ? '任务已持久保存，将在后台执行' : '操作已记录'); return result;
+  } catch (issue) { error(issue.message); throw issue; }
+  finally { state.busy = false; updateControls(); }
+}
+function action(input) { return perform(input).catch(() => {}); }
+function button(text, onClick, className) { const element = node('button', text, className); element.type = 'button'; element.addEventListener('click', onClick); return element; }
+function renderRuns() {
+  const query = $('search').value.toLowerCase(); $('runs').replaceChildren();
+  for (const run of state.runs.filter(item => item.title.toLowerCase().includes(query))) {
+    const item = button('', () => select(run.runId), 'run-card' + (run.runId === state.selected ? ' active' : ''));
+    item.append(node('strong', run.title), node('span', run.phase, 'muted')); item.dataset.runId = run.runId; $('runs').append(item);
+  }
+  if (!state.runs.length) $('runs').append(node('p', '当前工作区还没有任务', 'muted small'));
+}
+async function select(runId) { state.selected = runId; save('selected', runId); state.events = []; renderRuns(); await loadDetail(); }
+async function loadDetail() {
+  if (!state.selected) { $('empty').classList.remove('hidden'); $('detail').classList.add('hidden'); return; }
+  const selected = state.selected, sequence = ++state.sequence;
+  try {
+    const detail = await api('api/runs/' + encodeURIComponent(selected));
+    if (sequence !== state.sequence || selected !== state.selected) return;
+    const changed = state.detail?.run.runId !== selected; state.detail = detail; renderDetail(changed);
+  } catch (issue) { error(issue.message); }
+}
+function renderDetail(changed) {
+  const detail = state.detail, run = detail.run;
+  $('empty').classList.add('hidden'); $('detail').classList.remove('hidden'); $('task-title').textContent = run.title; $('task-phase').textContent = run.phase;
+  $('task-status').textContent = statusText[run.status] || run.status; $('task-status').className = 'pill ' + run.status;
+  $('metrics').replaceChildren();
+  const cost = run.budget.priced ? '$' + run.budget.reported.toFixed(4) : run.budget.requests ? '未完全定价' : '尚未产生';
+  for (const [label, value] of [['已记录费用', cost], ['模型请求', run.budget.requests + (run.budget.limit ? ' / ' + run.budget.limit : '')], ['执行方式', run.mode === 'single' ? '单 Agent' : run.mode === 'multi' ? '允许协作' : '自动判断']]) {
+    const metric = node('div', undefined, 'metric'); metric.append(node('span', label), node('strong', value)); $('metrics').append(metric);
+  }
+  updateControls();
+  $('tasks').replaceChildren(...run.tasks.map(task => node('p', (task.parentTaskId ? '↳ ' : '● ') + task.title + ' · ' + task.phase)));
+  $('report').textContent = detail.report; $('limitations').replaceChildren(...detail.limitations.map(value => node('p', value, 'error')));
+  $('checks').replaceChildren(node('h3', '验收检查'));
+  for (const check of detail.checks) { const section = node('details'); section.append(node('summary', check.command), node('pre', check.output, 'preview')); $('checks').append(section); }
+  if (!detail.checks.length) $('checks').append(node('p', '没有已完成的验收命令记录', 'muted small'));
+  $('changes').replaceChildren(node('h3', '工作区改动'));
+  for (const change of detail.changes) { const section = node('details'); section.append(node('summary', change.path), node('pre', change.preview, 'preview')); $('changes').append(section); }
+  if (!detail.changes.length) $('changes').append(node('p', '暂无已确认的文件改动', 'muted small'));
+  $('unresolved').replaceChildren();
+  for (const operation of detail.unresolved) { const section = node('div', undefined, 'question-card'); section.append(node('h3', '待核对：' + operation.name), node('pre', operation.input, 'preview'), button('提供已确认的结果', () => { state.operation = operation; $('operation-name').textContent = operation.name + ' · ' + operation.id; $('confirmed-result').value = ''; $('reconcile-dialog').showModal(); })); $('unresolved').append(section); }
+  $('followup-form').classList.toggle('hidden', !['active', 'paused', 'pausing'].includes(run.status));
+  if (changed) { $('followup').value = stored('followup:' + run.runId) || ''; state.events = []; }
+  if (state.tab === 'events') loadEvents(true);
+}
+async function refresh() { state.runs = await api('api/runs'); if (!state.selected || !state.runs.some(run => run.runId === state.selected)) state.selected = state.runs[0]?.runId ?? null; renderRuns(); await loadDetail(); }
+function qkey(question) { return (question.routing ? 'route:' + question.inputId : question.waitId) + ':' + question.version; }
+function alertNotice(id, title, text) {
+  if (state.seen.has(id)) return false; state.seen.add(id); toast(text);
+  if ('Notification' in window && Notification.permission === 'granted' && stored('notifications') && document.hidden) {
+    const notification = new Notification(title, { body: text, tag: id }); notification.onclick = () => { window.focus(); notification.close(); };
+  }
+  return true;
+}
+function renderAttention() {
+  $('questions').replaceChildren(); $('notices').replaceChildren(); $('attention-count').textContent = String(state.questions.length + state.notices.length);
+  $('no-attention').classList.toggle('hidden', !!(state.questions.length || state.notices.length));
+  document.title = (state.questions.length ? '(' + state.questions.length + ') ' : '') + 'TNB 工作台';
+  for (const question of state.questions) {
+    const title = question.routing ? '选择需要接收指令的任务' : question.proposal.question;
+    const card = node('div', undefined, 'question-card'); card.append(node('p', question.routing ? question.rawText : question.runObjective, 'eyebrow'), node('h3', title), button('现在处理', () => openQuestion(question))); $('questions').append(card);
+    alertNotice(qkey(question), 'TNB 需要你的决定', title);
+    const editing = ['INPUT', 'TEXTAREA', 'SELECT'].includes(document.activeElement?.tagName);
+    if (!state.offered.has(qkey(question)) && !editing && !document.querySelector('dialog[open]')) openQuestion(question);
+  }
+  if (state.question && !state.questions.some(question => qkey(question) === qkey(state.question))) { $('question-dialog').close(); state.question = null; }
+  for (const notice of state.notices) {
+    const card = node('div', undefined, 'notice-card'); card.append(node('p', notice.message), button('查看结果', () => select(notice.runId)), button('已读', () => action({ action: 'ack', runId: notice.runId, noticeId: notice.noticeId }), 'quiet')); $('notices').append(card); alertNotice(notice.noticeId, 'TNB 任务更新', notice.message);
+  }
+}
+function openQuestion(question) {
+  state.offered.add(qkey(question)); state.question = question; state.routeChoice = null; $('question-title').textContent = question.routing ? '请选择目标任务' : question.proposal.question;
+  $('question-about').textContent = question.routing ? question.rawText : question.proposal.about;
+  $('answer').value = stored('answer:' + qkey(question)) || ''; $('answer').required = !question.routing; $('answer').parentElement.classList.toggle('hidden', !!question.routing); $('question-options').replaceChildren();
+  const options = question.routing ? question.candidates.map(candidate => ({ label: candidate.objective + ' · ' + candidate.runId.slice(0, 8), value: candidate.runId })) : (question.proposal.options || []).map(value => ({ label: value, value }));
+  for (const option of options) { const element = button(option.label, () => { $('question-options').querySelectorAll('button').forEach(item => item.classList.remove('selected')); element.classList.add('selected'); if (question.routing) state.routeChoice = option.value; else { $('answer').value = option.value; save('answer:' + qkey(question), option.value); } }, 'option'); $('question-options').append(element); }
+  if (!$('question-dialog').open) $('question-dialog').showModal();
+}
+async function loadEvents(reset = false) {
+  if (!state.selected) return;
+  try {
+    const selected = state.selected;
+    const after = reset ? 0 : state.events.at(-1)?.sequence ?? 0;
+    const events = await api('api/runs/' + encodeURIComponent(selected) + '/events?after=' + after);
+    if (selected !== state.selected) return;
+    state.events = reset ? events : [...state.events, ...events]; $('events').replaceChildren();
+    for (const event of state.events) { const row = node('div', undefined, 'event'); const details = node('details'); details.append(node('summary', event.type), node('pre', JSON.stringify(event.data, null, 2), 'preview')); row.append(node('time', new Date(event.at).toLocaleString()), details); $('events').append(row); }
+    if (events.length === 100) $('events').append(button('加载更多事件', () => loadEvents(false)));
+  } catch (issue) { error(issue.message); }
+}
+function updateGrants() { if ($('allow-shell').checked) $('allow-write').checked = true; $('checks-field').classList.toggle('hidden', !$('allow-write').checked); $('submit-checks').required = $('allow-write').checked; }
+function formDraft() { return Object.fromEntries(new FormData($('submit-form'))); }
+function restoreDraft() { const draft = stored('draft'); if (!draft) return; for (const [key, value] of Object.entries(draft)) { const element = $('submit-form').elements.namedItem(key); if (element && element.type === 'checkbox') element.checked = value === 'on'; else if (element) element.value = value; } }
+async function boot() {
+  showPending(); state.selected = stored('selected');
+  const fragment = new URLSearchParams(location.hash.slice(1)), code = fragment.get('code');
+  history.replaceState(null, '', location.pathname);
+  if (code) await api('auth/exchange', { code });
+  const info = await api('api/info'); $('workspace').textContent = info.workspace;
+  $('model').replaceChildren(...info.models.map(model => { const option = node('option', model.providerName + ' / ' + model.name); option.value = JSON.stringify([model.provider, model.id]); return option; }));
+  $('model').value = stored('model') || JSON.stringify([info.defaults.provider, info.defaults.model]); if (!$('model').value) $('model').selectedIndex = 0;
+  state.coding = info.coding; updateControls(); restoreDraft(); updateGrants();
+  await refresh();
+  state.stream = new EventSource('api/attention');
+  state.stream.onmessage = event => {
+    try { const snapshot = JSON.parse(event.data); state.questions = snapshot.questions; state.notices = snapshot.notifications || []; state.runs = snapshot.runs;
+      connection(snapshot.ready, snapshot.ready ? '● 已连接' : '后台执行受阻'); if (state.connectionError) { error(''); state.connectionError = false; } renderRuns(); renderAttention(); loadDetail();
+    } catch (issue) { error(issue.message); }
+  };
+  state.stream.onerror = () => { connection(false, '连接中断，正在重连'); api('api/info').catch(issue => { state.connectionError = true; error(issue.message); }); };
+}
+$('new-task').onclick = $('empty-new').onclick = () => $('submit-dialog').showModal();
+document.querySelectorAll('[data-close]').forEach(element => element.onclick = () => $(element.dataset.close).close());
+$('search').oninput = renderRuns; $('allow-write').onchange = () => { if (!$('allow-write').checked) $('allow-shell').checked = false; updateGrants(); }; $('allow-shell').onchange = updateGrants;
+$('submit-form').oninput = () => save('draft', formDraft()); $('submit-form').onchange = () => save('draft', formDraft());
+$('followup').oninput = () => { if (state.selected) save('followup:' + state.selected, $('followup').value); };
+$('answer').oninput = () => { if (state.question) save('answer:' + qkey(state.question), $('answer').value); };
+$('submit-form').onsubmit = async event => {
+  event.preventDefault(); if (state.pending?.action === 'submit') { await perform(null, true).catch(() => {}); return; } const form = new FormData(event.currentTarget), [provider, model] = JSON.parse($('model').value);
+  const input = { action: 'submit', objective: form.get('objective'), mode: form.get('mode'), provider, model, allowWrite: $('allow-write').checked, allowShell: $('allow-shell').checked, checks: $('allow-write').checked ? $('submit-checks').value.split('\n').map(value => value.trim()).filter(Boolean) : [], maxTurns: Number(form.get('maxTurns')) };
+  for (const key of ['skills', 'mcpTools']) { const values = String(form.get(key) || '').split(',').map(value => value.trim()).filter(Boolean); if (values.length) input[key] = values; }
+  if (form.get('maxCostUsd')) input.maxCostUsd = Number(form.get('maxCostUsd')); if (form.get('deadline')) input.deadline = new Date(String(form.get('deadline'))).toISOString();
+  await action(input);
+};
+$('followup-form').onsubmit = event => { event.preventDefault(); if ($('followup').value.trim()) action({ action: 'followup', runId: state.selected, text: $('followup').value }); };
+for (const operation of ['pause', 'resume', 'cancel']) $(operation).onclick = () => { if (operation === 'cancel' && !confirm('取消当前任务，停止后续执行？')) return; action({ action: operation, runId: state.selected, expectedRevision: state.detail.run.revision }); };
+$('limits').onclick = () => $('limits-dialog').showModal();
+$('limits-form').onsubmit = event => { event.preventDefault(); const form = new FormData(event.currentTarget), input = { action: 'limits', runId: state.selected, expectedRevision: state.detail.run.revision }; if (form.get('maxCostUsd')) input.maxCostUsd = Number(form.get('maxCostUsd')); if (form.get('extendHours')) input.extendMs = Number(form.get('extendHours')) * 3600000; action(input); };
+$('question-form').onsubmit = event => { event.preventDefault(); const question = state.question; if (!question) return;
+  if (question.routing) { if (!state.routeChoice) { toast('请先选择目标任务'); return; } action({ action: question.action === 'followup' ? 'followup' : 'resolve-route', runId: state.routeChoice, resolveInputId: question.inputId, expectedRevision: question.version }); }
+  else action({ action: 'answer', runId: question.runId, waitId: question.waitId, expectedVersion: question.version, answer: $('answer').value });
+};
+$('reconcile-form').onsubmit = event => { event.preventDefault(); if (state.operation) action({ action: 'reconcile', runId: state.selected, taskId: state.operation.taskId, operationId: state.operation.id, result: $('confirmed-result').value }); };
+document.querySelectorAll('[data-tab]').forEach(element => element.onclick = () => { state.tab = element.dataset.tab; document.querySelectorAll('[data-tab]').forEach(item => item.classList.toggle('active', item === element)); for (const tab of ['report', 'changes', 'events']) $(tab + '-panel').classList.toggle('hidden', tab !== state.tab); if (state.tab === 'events') loadEvents(true); });
+$('retry').onclick = () => perform(null, true).catch(() => {}); $('discard').onclick = () => { if (confirm('请求可能已经执行。先检查任务状态，再决定是否放弃原请求重试。')) { state.pending = null; save('pending', null); showPending(); } };
+$('logout').onclick = async () => { try { await api('auth/logout', {}); state.stream?.close(); connection(false, '已退出'); $('detail').classList.add('hidden'); $('runs').replaceChildren(); $('questions').replaceChildren(); $('notices').replaceChildren(); error('已退出。重新运行 tnb web 获取新入口。'); } catch (issue) { error(issue.message); } };
+$('notify').onclick = async () => { if (!('Notification' in window)) { toast('此浏览器不支持桌面提醒'); return; } const permission = await Notification.requestPermission(); save('notifications', permission === 'granted'); toast(permission === 'granted' ? '已开启。页面在后台时会提醒新问题和结果。' : '未开启桌面提醒，网页内提醒仍然有效。'); };
+window.addEventListener('pagehide', () => state.stream?.close());
+window.addEventListener('pageshow', event => { if (event.persisted) location.reload(); });
+boot().catch(issue => { connection(false, '无法连接'); error(issue.message); });

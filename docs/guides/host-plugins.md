@@ -6,7 +6,7 @@ TNB 的执行内核管理任务、恢复、预算、权限和持久状态；插�
 | --- | --- | --- |
 | adapters | registerAdapter | 工具、资源、领域验收；Coding 保持旧接口兼容 |
 | applications | registerApplication | 常驻应用、接单与业务状态，例如协作工单 |
-| interfaces | registerInterface | 用户交互协议或视图 handler，例如未来网页工作台 |
+| interfaces | registerInterface | 用户交互协议或视图 handler，例如本地网页工作台 |
 | channels | registerChannel | receive/poll/send/find/observe 网络或本地渠道 |
 
 ## 统一包格式
@@ -57,7 +57,7 @@ tnb runtime plugins
 
 包安装状态用 `tnb plugins list/show` 查看；后台中的贡献状态用 `tnb runtime plugins` 查看。禁用使用 `tnb plugins disable NAME`，重启后生效。没有对活跃 Agent 热替换插件代码；更新后的内容需要重新信任。显式安装的同名包不论禁用、未信任、损坏还是加载失败，都不会绕过它回退到内置实现。
 
-默认产品 profile 在一个宿主内组合 `tnb-coding`、`tnb-channels`、`tnb-collaboration`。这三者也在构建产物的 dist/plugins 下提供可安装包，运行中的内置版本和安装版本走相同注册与生命周期。停用协作插件不会删除工单、通知或原 Run。
+默认产品 profile 在一个宿主内组合 `tnb-coding`、`tnb-channels`、`tnb-collaboration`、`tnb-web`。这些包也在构建产物的 dist/plugins 下提供可安装包，运行中的内置版本和安装版本走相同注册与生命周期。停用协作插件不会删除工单、通知或原 Run。
 
 ## 服务、状态和依赖
 
@@ -65,7 +65,7 @@ tnb runtime plugins
 
 - identity、独立状态目录、生命周期 signal；状态目录使用宿主生成的路径，不拼接插件任意路径。
 - state.get/list/command：同一 SQLite 中按包名+贡献种类+id+接口版本隔离；变更沿用 command receipt 与 revision CAS。重启不重做已提交命令，冲突输入拒绝；包字节更新不自动删除同接口版本状态。需要数据迁移时由插件显式处理，接口不兼容时提升贡献 version。
-- service(name)：名称必须同时在贡献 manifest 声明、宿主 grants 授予、服务表存在；默认不注入 env、SQLite、控制 token。默认 profile 提供 tnb.runtime.read/v1；tnb.runtime.internal/v1 是协作应用所需的高权限桥，tnb.channels/v1 是渠道注册表，其他包使用前必须由宿主显式授权。
+- service(name)：名称必须同时在贡献 manifest 声明、宿主 grants 授予、服务表存在；默认不注入 env、SQLite、控制 token。默认 profile 提供 tnb.runtime.read/v1 和受限的 tnb.tasks/v1 工作目录任务服务；tnb.runtime.internal/v1 是协作应用所需的高权限桥，tnb.channels/v1 是渠道注册表，其他包使用前必须由宿主显式授权。
 - request(reference, Request)：只能调用自己声明的精确依赖，宿主再次校验目标 active 状态；自动移除 authorization、proxy-authorization、cookie。
 - onDispose：清理回调，启动失败和关闭均逆序执行。部分资源创建后立即登记清理；每个插件负责自己的 timer/listener。清理可保存自己的状态，但不能重新注册贡献或取得新服务。
 
@@ -104,8 +104,8 @@ tnb runtime plugins
 
 ## 宿主请求和关闭
 
-认证 Unix IPC 新增 `/extensions` 清单及 `/extensions/application|interface/<encoded-id>/<encoded-version>/...` 请求派发，`/collaboration` 保留兼容别名。handler 获取业务 Request，拿不到宿主认证头。网页尚未暴露一个 HTTP 控制端口，不能直接把私有 Unix RPC 或控制 key 交给浏览器。
+认证 Unix IPC 新增 `/extensions` 清单及 `/extensions/application|interface/<encoded-id>/<encoded-version>/...` 请求派发，`/collaboration` 保留兼容别名。handler 获取业务 Request，拿不到宿主认证头。网页插件可通过 `tnb web` 按需建立独立的本机 HTTP 工作台，使用工作目录视图和单次入口/cookie，不把私有 Unix RPC 或控制 key 交给浏览器，见 [网页指南](web-workbench.md)。
 
 停止先拒绝新请求/连接并取消信号；应用和接口按依赖逆序排空，再回收渠道连接，等待在途 handler/网络调用，最后停止 Runtime、清理包快照、关闭数据库并释放 owner lock。插件必须尊重 signal 并为网络设置超时；受信任进程内代码无法被安全强制终止，忽略取消且永不结束的 handler 仍可能阻塞退出。
 
-这一轮交付了可用插件基础、协作和渠道迁移及安装示例。网页工作台、浏览器登录/用户隔离、现有 TUI 视图整体迁入交互插件、热更新和自动跨代际迁移留作后续，没有把接口注册当成这些产品功能已经完成。
+已交付插件基础、协作/渠道迁移、安装示例，以及按工作目录授权的本地网页工作台。远程多用户登录、现有 TUI 视图整体迁入交互插件、热更新和自动跨代际迁移仍留作后续。

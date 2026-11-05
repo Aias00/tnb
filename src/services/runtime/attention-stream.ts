@@ -5,7 +5,7 @@ import { pendingRunNotices } from "./notices";
 import { presentRuns } from "./presentation";
 
 /** A reconnect always starts with authoritative open questions, so no event cursor can lose a decision. */
-export function questionAttentionResponse(runtime: DurableRuntime, workspace: string, signal: AbortSignal): Response {
+export function questionAttentionResponse(runtime: DurableRuntime, workspace: string, signal: AbortSignal, onClose?: () => void): Response {
   const encoder = new TextEncoder();
   let unsubscribe = () => {}, cleanup = () => {};
   let send = () => {};
@@ -38,7 +38,7 @@ export function questionAttentionResponse(runtime: DurableRuntime, workspace: st
       }, 15_000); heartbeat.unref();
       cleanup = () => {
         if (closed) return;
-        closed = true; clearInterval(heartbeat); unsubscribe(); signal.removeEventListener("abort", abort);
+        closed = true; clearInterval(heartbeat); unsubscribe(); signal.removeEventListener("abort", abort); onClose?.();
       };
       const abort = () => { cleanup(); try { controller.close(); } catch { /* The peer may already have cancelled. */ } };
       unsubscribe = runtime.store.onChange(send);
