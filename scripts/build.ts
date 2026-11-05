@@ -1,6 +1,7 @@
 import { chmod, copyFile, cp, mkdir, readdir } from "node:fs/promises";
 import { arch, platform } from "node:os";
 import { join, resolve } from "node:path";
+import { codingPluginFingerprint } from "../src/adapters/coding/identity";
 
 const root = resolve(import.meta.dir, "..");
 const outputDirectory = join(root, "dist");
@@ -23,9 +24,15 @@ const build = Bun.spawn([
   join(root, "src", "entrypoints", "cli.ts"),
   "--compile",
   `--outfile=${join(outputDirectory, cliName)}`,
+  `--define=TNB_BUILD_SOURCE_SHA256=${JSON.stringify(await codingPluginFingerprint(root))}`,
 ], { cwd: root, stdout: "inherit", stderr: "inherit" });
 const exitCode = await build.exited;
 if (exitCode !== 0) process.exit(exitCode);
+const pluginRoot = join(outputDirectory, "plugins", "tnb-coding");
+await mkdir(pluginRoot, { recursive: true });
+const plugin = await Bun.build({ entrypoints: [join(root, "src/adapters/coding/plugin.ts")], target: "bun", outdir: pluginRoot, naming: "index.mjs" });
+if (!plugin.success) throw new AggregateError(plugin.logs, "Coding plugin bundle failed");
+await copyFile(join(root, "src/adapters/coding/plugin.json"), join(pluginRoot, "plugin.json"));
 
 const nativeExecutable = join(nativeLibrary, platform() === "win32" ? "tsc.exe" : "tsc");
 const companionExecutable = join(outputDirectory, compilerName);

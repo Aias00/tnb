@@ -14,3 +14,5 @@ export type { TaskDefinition } from "./commands";
 export { createRuntimeWorkerFactory } from "./worker";
 export { serveDurableRuntime, runtimeRequest, RUNTIME_CAPABILITIES } from "./server";
 export type { DurableRun, DurableTask, DurableAttempt, ExecutionPolicy, RuntimeEvent } from "./types";
+export { DomainRegistry } from "../../agent/domain";
+export type { AgentDomainAdapter, DomainDescriptor, DomainContext, ResourceClaim, CapabilityGrant } from "../../agent/domain";

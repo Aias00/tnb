@@ -145,6 +145,13 @@ export class RuntimeStore {
     this.#assertOpen(); this.#db.exec("PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);");
   }
 
+  /** Read a matching historical receipt without mutating or relaxing its input digest. */
+  replayCommand<T>(commandId: string, input: unknown): T | undefined {
+    this.#assertOpen(); text(commandId, "command ID", 128);
+    const digest = digestJson({ version: 1, input }, 256 * 1024);
+    const receipt = this.#db.query("SELECT digest, result FROM commands WHERE command_id = ?").get(commandId) as { digest: string; result: string } | null;
+    return receipt?.digest === digest ? JSON.parse(receipt.result) as T : undefined;
+  }
   /** A successful receipt, state, events and effects commit together. Failed commands have no receipt. */
   command<T>(commandId: string, input: unknown, now: number, apply: (tx: RuntimeTransaction) => T): T {
     text(commandId, "command ID", 128); integer(now, "command time");

@@ -2,9 +2,13 @@ import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmod, mkdir, readFile, writeFile, unlink, lstat, realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { digestJson } from "./json";
-import { DurableRuntime, type RuntimeConfiguration } from "./engine";
+import { DurableRuntime, type RuntimeConfiguration } from "./engine-core";
 import { RuntimeStore } from "./store";
-import { createRuntimeWorkerFactory } from "./worker";
+import { createCodingPlugin } from "../../adapters/coding/plugin";
+import { loadAdapterPlugins } from "../../agent/plugins";
+import { DomainRegistry } from "../../agent/domain";
+import { pluginTrustStorePath } from "../plugins/trust";
+import { loadSettings } from "../settings/load";
 import { lock } from "../../utils/lockfile";
 import { questionAttentionResponse } from "./attention-stream";
 import type { RoutingInput, RoutingDecision } from "./routing";
@@ -24,7 +28,8 @@ export const RUNTIME_CAPABILITIES = Object.freeze({ protocol: 2, defaultMode: "a
   readOnlyDelegation: true, parallelWrites: false, skills: false, mcp: false, remoteFederation: false, offlineBackup: true, conversationHandoff: true,
   durableWaits: true, durableDelegation: true, deadlineScheduling: true, questionNotifications: true, lifecycleNotifications: true, adjustableLimits: true,
   taskRouting: true, safeFollowups: true, delegationStrategyVersion: 2, defaultDelegationDepth: 1, autoParallelBranches: 2,
-  structuredChildReports: true, machineModelCoordination: true, overlappingWorkspaceLocks: true });
+  structuredChildReports: true, machineModelCoordination: true, overlappingWorkspaceLocks: true,
+  domainAdapters: true, codingPlugin: true, pluginInventory: true });
 export async function serveDurableRuntime(options: ServerOptions): Promise<void> {
   const paths = await runtimePaths(options.configDir);
   const release = await lock(paths.root, { realpath: true, stale: 5000, update: 1000, retries: 0 });
@@ -32,9 +37,8 @@ export async function serveDurableRuntime(options: ServerOptions): Promise<void>
 }
 async function serveLockedRuntime(options: ServerOptions): Promise<void> {
   const paths = await runtimePaths(options.configDir);
-  const store = options.runtime?.store ?? new RuntimeStore(join(paths.root, "state.sqlite"));
-  const runtime = options.runtime ?? new DurableRuntime(store, paths.root,
-    createRuntimeWorkerFactory({ configDir: options.configDir, runtimeRoot: paths.root, env: options.env }));
+  const { store, runtime, plugins } = options.runtime ? { store: options.runtime.store, runtime: options.runtime, plugins: undefined }
+    : await composeRuntime(options, paths.root);
   let server: ReturnType<typeof Bun.serve> | undefined;
   const stopped = Promise.withResolvers<void>();
   let started = false;
@@ -58,6 +62,7 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
         if (suppliedBytes.length !== tokenBytes.length || !timingSafeEqual(suppliedBytes, tokenBytes)) return Response.json({ error: "Unauthorized" }, { status: 403 });
         try {
           const url = new URL(request.url);
+            if (url.pathname === "/plugins") return Response.json(plugins?.list() ?? []);
           if (request.method === "GET") {
             if (url.pathname === "/presentation") {
               const workspace = await realpath(url.searchParams.get("workspace") ?? ""); const runId = url.searchParams.get("runId");
@@ -181,10 +186,31 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
   } finally {
     try { if (started) await runtime.close(); }
     finally {
-      try { await server?.stop(true); }
-      finally { if (started) await unlink(paths.socket).catch(() => undefined); if (!options.runtime) store.close(); }
+      try { await plugins?.close(); }
+      finally {
+        try { await server?.stop(true); }
+        finally { if (started) await unlink(paths.socket).catch(() => undefined); if (!options.runtime) store.close(); }
+      }
     }
   }
+}
+
+/** Called only while the server owns the state-directory lock. */
+async function composeRuntime(options: ServerOptions, root: string) {
+  const settings = await loadSettings({ configDir: options.configDir, cwd: options.configDir });
+  let installed = false;
+  try { await lstat(join(options.configDir, "plugins", "tnb-coding")); installed = true; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  const plugins = await loadAdapterPlugins({ roots: [{ directory: join(options.configDir, "plugins"), source: "user" }],
+    trustStorePath: pluginTrustStorePath(options.configDir), enabled: settings.enabledPlugins,
+    builtins: installed ? [] : [await createCodingPlugin({ configDir: options.configDir, runtimeRoot: root, env: options.env })],
+    configuration: { "tnb-coding": { configDir: options.configDir, env: options.env } },
+  }, [], join(root, "plugin-snapshots"));
+  let store: RuntimeStore | undefined;
+  try {
+    store = new RuntimeStore(join(root, "state.sqlite"));
+    return { plugins, store, runtime: new DurableRuntime(store, root, new DomainRegistry([], plugins.registrations, "coding")) };
+  } catch (error) { try { await plugins.close(); } finally { store?.close(); } throw error; }
 }
 
 export class RuntimeRequestError extends Error {

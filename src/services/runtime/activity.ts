@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { RuntimeStore } from "./store";
 import type { DurableTask } from "./types";
 
-export type TaskActivity = { phase: "preparing" | "model" | "compacting" | "workspace" | "capacity" | "verification";
+export type TaskActivity = { phase: "preparing" | "model" | "compacting" | "workspace" | "resources" | "capacity" | "verification";
   at: number; completed?: number; total?: number };
 
 /** A durable display projection; never an execution or permission decision. */

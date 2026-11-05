@@ -1,0 +1,7 @@
+{
+  "name": "tnb-coding",
+  "manifestVersion": 2,
+  "apiVersion": "tnb.plugin/v1",
+  "version": "0.1.0",
+  "contributes": { "adapters": [{ "id": "coding", "version": "1", "entry": "index.mjs" }] }
+}

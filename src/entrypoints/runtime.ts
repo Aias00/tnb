@@ -9,7 +9,7 @@ import type { DurableRun } from "../services/runtime/types";
 import { registerCleanup } from "../utils/cleanup-registry";
 import { withOfflineRuntime, backupRuntime, restoreRuntime, pruneRuntime, runtimeStorageUsage } from "../services/runtime/maintenance";
 
-const HELP = `Usage: tnb runtime <submit|status|result|list|events|questions|answer|limits|pause|resume|cancel|reconcile|start|restart|serve|stop|backup|restore|prune|storage> [options]
+const HELP = `Usage: tnb runtime <submit|status|result|list|events|questions|answer|limits|pause|resume|cancel|reconcile|start|restart|serve|stop|backup|restore|prune|storage|plugins> [options]
 
 followup [run-id] --text "requirements" [--task ID] [--input-id ID]
   Select an unresolved input with --resolve-input ID --revision N and a run-id.
@@ -29,6 +29,7 @@ start / restart  Start or explicitly drain/restart the persistent service.
 stop   Drain and stop the service; accepted tasks remain recoverable.
 backup <directory> / restore <directory> / prune <run-id>  Offline maintenance; stop the service first.
 storage  Show state size and free disk space.
+plugins  Show the running host's built-in and installed domain plugin generations.
 
 All actions accept --config-dir PATH. Submitting starts a persistent local service;
 closing the client does not cancel accepted work. Checks are explicitly authorized
@@ -76,6 +77,7 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
     if (action === "submit" && !args.includes("--no-start")) await ensureRuntime(configDir, options.env);
     let result: unknown;
     if (action === "list") result = await runtimeRequest(configDir, "/runs");
+    else if (action === "plugins") result = await runtimeRequest(configDir, "/plugins");
     else if (action === "routing") {
       const query = new URLSearchParams({ workspace: await realpath(resolve(value("--cwd") ?? options.cwd)), pending: String(args.includes("--pending")) });
       if (value("--before-input")) query.set("beforeInput", value("--before-input")!);
@@ -140,7 +142,7 @@ export type RuntimeChatOptions = { args: string[]; cwd: string; workspace: strin
   env: Record<string, string | undefined>; provider: string; model: string; sessionId: string; sourceText?: string };
 export async function runRuntimeChatCommand(options: RuntimeChatOptions): Promise<string> {
   const args = options.args.length ? [...options.args] : ["list"]; const action = args[0]!;
-  if (!["followup", "routing", "submit", "list", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel", "storage", "start", "restart", "stop"].includes(action)) throw new Error("/runtime supports submit, list, status, result, events, questions, answer, limits, pause, resume, cancel, storage, start, restart and stop.");
+  if (!["followup", "routing", "submit", "list", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel", "storage", "start", "restart", "stop", "plugins"].includes(action)) throw new Error("/runtime supports submit, list, status, result, events, questions, answer, limits, pause, resume, cancel, storage, start, restart, stop and plugins.");
   const valueFlags = new Set(["--before-input", "--text", "--input-id", "--resolve-input", "--successor", "--cwd", "--mode", "--check", "--allow-workspace", "--provider", "--model", "--max-budget-usd", "--max-turns", "--command-id", "--config-dir", "--after", "--task", "--question", "--answer", "--version", "--deadline", "--extend-hours", "--revision"]);
   const flags = new Set(["--pending", "--allow-write", "--allow-shell", "--no-start", "--help", "-h"]);
   if (action === "followup" && (!args[1] || args[1].startsWith("--"))) args.splice(1, 0, "");

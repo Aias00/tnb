@@ -44,6 +44,10 @@
     "tnb": "./src/entrypoints/cli.ts"
   },
   "exports": {
+    "./agent": "./src/agent/index.ts",
+    "./agent/runtime": "./src/agent/runtime.ts",
+    "./adapters/coding": "./src/adapters/coding/index.ts",
+    "./adapters/research": "./src/adapters/research/index.ts",
     ".": "./src/index.ts",
     "./sdk": "./src/entrypoints/sdk.ts",
     "./runtime": "./src/services/runtime/index.ts"
@@ -51,6 +55,8 @@
   "license": "Apache-2.0",
   "private": true,
   "scripts": {
+    "agent:research-demo": "bun ./examples/research-agent.ts",
+    "agent:plugin-demo": "bun ./examples/research-plugin-agent.ts",
     "test": "bun test",
     "typecheck": "bun x tsc --noEmit",
     "build": "bun ./scripts/build.ts",

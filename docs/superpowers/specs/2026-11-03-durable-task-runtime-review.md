@@ -504,3 +504,53 @@ schema v4 从 v1/v2/v3 迁移，不改原能力绑定和执行策略。墓碑保
 两套前台队列统一到 `InputQueue`：Ctrl+Q 快捷面板与 Ctrl+T 工作台读取同一组持久身份；删除均需确认，取回编辑仍保存原记录，未知派发不自动重放。新增跨入口编辑并只执行一次的交互回归。队列面板、Shell 面板与搜索期间不自动派发，切换会话保留原会话文件。保留排空取消提示，取消中的队列项不错误删除；窄屏先显示模型与用量，再显示工作区，防止路径挤掉模型名称。同步修正文档中的旧“仅内存队列”描述。
 
 初轮全量测试发现中性文字使用 ANSI 光标前进表示空格，旧 PTY 驱动按原始连续空格等待造成超时。更正终端驱动对 `ESC[1C` 的识别，保留实际模型请求、工具限制、问答、草稿与退出断言；失败和最终复测日志都保存。最终 macOS **896 pass / 2 skip / 0 fail**，Linux Ubuntu 24.04.4 ARM64 / Bun 1.3.14、`TNB_REQUIRE_NATIVE_SANDBOX=1` 下 **891 pass / 7 skip / 0 fail**；两端均 **898 tests / 140 files**，类型检查和构建通过。验证使用脚本 transport 与本地服务，没有新增外部模型调用，也不替代推送后的 GitHub CI 结果。证据在 `/Volumes/data/tnb-review-2026-11-04/merge-origin-main/`。
+
+## 19 通用执行内核与场景适配器
+
+日期：2026-11-04。基线 `00d70db`。将 `tnb/agent` 作为无界面内核入口，增加 `tnb/agent/runtime` 的本机持久宿主与版本注册表。现有编码 Worker、文件摘要、编码提示词、目录配置和 Shell 验收移入 `src/adapters/coding/`；旧入口保留兼容转发。旧 Coding 配置、schema v4、调用身份、预算、恢复和 CLI 语义继续使用原实现，不把通用化变成另一套调度状态机。
+
+通用 Run 的 JSON 描述保存 id/version、配置、资源与能力授权，宿主重建真实客户端。默认拒绝无分类工具；模型可见工具先经过能力范围筛选，每次业务调用再授权。`agent:` 命名空间仅为路由分组键，不扫描其文件系统。资源精确 ID 的读写租约支持多资源原子准入、读读并行、写互斥、死亡进程回收；不是分布式锁，也不保证公平排队。子任务只继承所选资源的只读声明和原 read 能力，保留结构化报告与父复核。
+
+适配器 snapshot/accept 从真实输入版本和成功操作回执验收，最多 128 项回执，每项最多 16,000 字符并标记截断；验收检查和产物有界。通用工具收到持久 operationId，可传给远端幂等接口。结果未知时继续沿原日志暂停，显式 `reconcileDomainOperation` 仅查询原操作，不重发业务、不隐式恢复；仍不承诺跨系统 exactly-once。适配器版本缺失、工作能力指纹变化时不继续旧任务。
+
+Research 示例使用宿主资料客户端，完全不依赖项目目录、Git、文件工具或 Shell 验收。实际读取回执和引用一致性通过后提交 `domain-verified`，明确不证明所有论断的语义正确。`bun run agent:research-demo` 为离线脚本模型示例，无外部模型调用；重开同一状态目录复用原 Run/Task。包仍 private，没有发布 npm、Web 服务或分布式 owner。
+
+审阅补充：创建执行记录失败也必须释放已经获得的资源租约，不能把数据库失败变成长期资源占用；已加故障注入回归。适配器权限检查只处理业务工具，runtime 自身的提问/回忆/委派控制沿原受限实现，否则严格业务授权会误挡用户问答。描述拒绝函数、稀疏数组等不能按原语义持久恢复的数据；配置校验必须同步。MCP/Skill 不自动获得业务能力或持久连接生命周期，仍需宿主适配与版本绑定。
+
+新增 **15 项**单元/集成回归：无项目的研究执行、虚构引用拒绝、问答重开恢复、精确适配器版本、未授权工具隐藏、验收期间输入变化、未知远端写入查询后继续且只写一次、委派资源/权限收窄及父复核、能力指纹变化拒绝、双 owner 拒绝、业务授权与 runtime 控制分离、启动事务失败释放资源、JSON 描述校验、原子读写准入、SIGKILL 后租约回收。
+
+最终 macOS **912 pass / 2 skip / 0 fail**，Linux Ubuntu 24.04.4 ARM64 / Bun 1.3.14、`TNB_REQUIRE_NATIVE_SANDBOX=1` 下 **907 pass / 7 skip / 0 fail**；均 **914 tests / 142 files**。两端类型检查、构建和研究示例通过。内核打包依赖检查不包含 CLI、TUI、Coding 适配器、Shell、Settings 或 SQLite。没有新增 Windows 实机、数小时 soak、线上模型质量或分布式恢复验证。证据在 `/Volumes/data/tnb-review-2026-11-04/general-agent/`，保留初始问答夹具只有一个选项而被原协议拒绝的失败记录；修正为两个选项后通过，未放松协议。
+
+## 20 基于 Pi 与 DeepSeek Harness 的领域插件调整
+
+日期：2026-11-04。基线 `af29c85`。对照 Pi loader 的 commit/discard 和 DSH preset generation/inventory 后，将领域适配器接入原插件安装、兼容性、启用与内容信任机制，未新增独立包管理器。源码快照、路径和调用方法见 [领域插件比较](../../agent-plugin-comparison.md)。
+
+清单以 `contributes.adapters` 声明 `.mjs` 入口和 id/version；每包所有 factory 成功后才提交，失败全部回滚并逆序执行 disposer。API 离开所属 factory 后封闭，加载失败保留 inventory 诊断，不阻塞健康的独立插件，也不能覆盖宿主同身份实现。owner 锁先于导入；受信树复制到私有目录并复核指纹，本代包内资源不受原目录升级影响。重启清理崩溃副本，不自动恢复历史包的信任。
+
+任务持久化插件 name/package version/tree SHA256；只有新提交可补来源，恢复不能在 inline 与插件之间静默切换。同版本代码变化也暂停旧任务，恢复原受信字节后可显式继续。当前采用重启生效，没有多 generation 热替换、历史包保留或自动迁移。代码为受信进程内扩展，撤销信任不强制卸载本代已导入代码，需停止宿主后重启重新检查。
+
+审阅发现直接 `runtime.close()` 与 `host.close()` 并发时，原 close 提前返回可能让插件先于 Worker 释放；已改为共享关闭 Promise。关闭先排空 Worker，再释放插件、关闭数据库，最后释放 owner；清理异常也尝试全部 disposer。新增 `bun run agent:plugin-demo`，实际编译安装、首次显式信任、资料工具调用和回执验收；重开复用原 Run/Task。
+
+上一轮 GitHub macOS CI 暴露 branch watcher 首次事件丢失；现先订阅再读初始 HEAD，以单文件 stat 兜底并去重回调，不增加目录扫描或 Git 子进程。
+
+新增 **14 项**回归，覆盖安装、信任、禁用、变更不导入、跨入口初始化回滚、逆序清理、独立插件失败隔离、实际工具证据与问答恢复、同版本代码变化拒绝及恢复原字节、并发排空关闭、双 owner、撤销信任、入口越界、符号链接、宿主注册冲突、代码副本隔离及清理期间持锁、清理异常与 inline/plugin 来源绑定。GitHub 重复检查发现模拟 transport 在写出启动事件后、注册取消监听前可能已收到 abort，已修复夹具并分别覆盖正常监听和强制先取消再订阅，未放宽超时或生产关闭协议。
+
+最终 macOS **926 pass / 2 skip / 0 fail**；Linux Ubuntu 24.04.4 ARM64 / Bun 1.3.14、`TNB_REQUIRE_NATIVE_SANDBOX=1` 下 **921 pass / 7 skip / 0 fail**，两端均 **928 tests / 143 files**。类型检查、构建、编译产物 help、插件示例与同目录重开通过。独立内核 bundle 未引入插件加载器、CLI、TUI、Coding 或 SQLite。没有外部模型调用，未新增 Windows 实机、热升级、数小时 soak 或不受信插件隔离验证。证据在 `/Volumes/data/tnb-review-2026-11-04/adapter-plugins/`；保留初始夹具安装参数和 macOS `/var` 规范路径失败记录，修正后通过。
+
+## 21 Coding 领域插件与 Dim 源码参考
+
+日期：2026-11-04。基线 `bd8f96f`。公共持久执行器移至 `engine-core.ts`，移除对 Coding 的运行时依赖；旧 engine.ts 保留历史 factory 构造兼容入口。Coding 与 Research 共用 DomainRegistry、能力筛选、调用日志、上下文、等待、委派和验收提交。旧 artifacts.ts 只作兼容转发，通用产物存储使用 artifact-store.ts，避免借快照兼容导出隐式加载 Coding 代码。
+
+Coding adapter 接管配置规范化、工作区快照、工具分类、额外工作区准入、子任务范围和验收；可信 DomainRuntimePolicy 只提供业务策略，不接管状态写入。公共精确资源租约必先获得，插件 acquire 只能追加约束；保留原前后台和重叠路径互斥，以及同 Run 多读取者最后离开才释放的物理工作区租约。Shell 继续原权限检查与原生沙箱，无命令只读报告标记 report-delivered，有验收命令则为 verification-commands。
+
+默认 Unix 服务在 owner 锁内加载内置 tnb-coding；独立包 dist/plugins/tnb-coding 经原安装/信任入口也可接管同一名称，未信任/失败/无效包不得回退内置。禁用在重启后生效；runtime plugins 命令展示真实后台 generation。内置指纹保守覆盖 src、依赖清单与锁、Bun 版本和平台架构，编译嵌入。进行中任务切换内置/独立包或更换指纹需显式迁移，当前不自动迁移。
+
+旧无 domain 配置按宿主明确选定的 legacy adapter 恢复，不批量改写原记录；保留原 snapshot digest、binding、checkpoint 与验收语义。命令重试可精确匹配历史创建输入并返回原回执，同一 commandId 更改业务输入仍拒绝。异步插件准备期间若宿主关闭，落库前再次检查，禁止退出后才确认新业务。插件额外资源清理失败也释放公共租约，记录 runtime.lastError 并停止派发，不泄漏后台拒绝 Promise；已故障注入验证。前台普通会话 Coding 工具组合仍在 CLI，未声称全部界面/短会话已插件化。
+
+新增参考 Dim `64f877286f2b5b078d5697cda7bd0c392030388f`：defaults.rs 的 profile 组合、workspace_tools 的业务工具边界和协调器所有权、registrations.rs 的 owner 注册释放、assembly.rs 的 Loader 分组。未引入 rutis、多语言桥接或替换 TNB 持久日志。完整源码链接、架构与使用见 [Coding 插件架构](../../coding-plugin-architecture.md)。
+
+新增 **10 项**集成回归：真实文件写入和验收、伪造能力拒绝、通用资源与工作区锁组合、禁用和指纹恢复、旧候选与创建回执兼容、独立安装包真实读取/模型协议/重开、bundle 依赖边界、准备期间关闭、默认 daemon 原生沙箱验收、安装包 trust/revoke 无回退。已有委派、未知写入、预算、上下文、问答及多终端互斥继续全量覆盖。
+
+最终 macOS **936 pass / 2 skip / 0 fail**，Linux Ubuntu 24.04.4 ARM64 / Bun 1.3.14、TNB_REQUIRE_NATIVE_SANDBOX=1 下 **931 pass / 7 skip / 0 fail**；均 **938 tests / 144 files**。类型检查、构建、编译后内置和独立包运行、Research 插件示例与同目录重开通过。初始同时全量运行时出现 PTY 问答和上下文恢复超时，隔离重跑及两端串行全量均通过，未放宽超时，失败日志保留。初始化关闭竞态的首版测试错误地先等待异步 rejects 匹配器而未释放屏障，已修正测试完成顺序并保留记录。最后消除未使用注册辅助方法及类型 import 后，完成针对性验证与交付构建。
+
+证据在 `/Volumes/data/tnb-review-2026-11-04/coding-plugin/`。没有付费或外部模型调用；真实 transport 使用本机 loopback。未新增 Windows 全量功能、热升级、历史包自动保留、跨平台进行中任务恢复、不受信插件隔离、分布式 owner 或数小时 soak 验证。GitHub CI 单独核对。

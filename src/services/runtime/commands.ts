@@ -11,12 +11,16 @@ export type TaskDefinition = { key: string; objective: string; inputDigest: stri
 type Command = { commandId: string; source?: RoutingInput };
 type TaskCommand = Command & { taskId: string; expectedRevision: number };
 type RunCommand = Command & { runId: string; expectedRevision: number };
+type CreateRunInput = Command & { objective: string; tasks?: TaskDefinition[]; policy?: Partial<ExecutionPolicy>; deadline?: number; configuration?: unknown; source?: RoutingInput; successorOf?: string };
 
 /** Trusted in-process business commands; the owner supplies authenticated IPC and execution. */
 export class RuntimeCommands {
   constructor(readonly store: RuntimeStore, private readonly clock: () => number = Date.now) {}
 
-  createRun(input: Command & { objective: string; tasks?: TaskDefinition[]; policy?: Partial<ExecutionPolicy>; deadline?: number; configuration?: unknown; source?: RoutingInput; successorOf?: string }): { run: DurableRun; tasks: DurableTask[] } {
+  replayCreateRun(input: CreateRunInput): { run: DurableRun; tasks: DurableTask[] } | undefined {
+    return this.store.replayCommand(input.commandId, { kind: "run.create", input });
+  }
+  createRun(input: CreateRunInput): { run: DurableRun; tasks: DurableTask[] } {
     return this.#command(input, "run.create", (tx) => {
       text(input.objective, "run objective");
       if (input.deadline !== undefined) integer(input.deadline, "run deadline", tx.now + 1);

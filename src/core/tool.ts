@@ -1,6 +1,9 @@
 import type { MediaBlock } from "./message";
 
 export type ToolAccess = "read" | "write" | "execute" | "network" | "unknown";
+export type ToolCapability = { name: string; resources: string[]; mode: "read" | "write" };
+export type ToolEffects = { replay: "safe" | "never" };
+export type ToolExecutionContext = { toolUseId: string; operationId?: string; scope?: string };
 
 export type ToolOutput =
   | string
@@ -32,7 +35,9 @@ export type ToolDefinition<Input, Output extends ToolOutput = ToolOutput> = {
   validate(input: unknown): Input;
   /** Pin mutable execution dependencies before requesting authorization. */
   bindExecution?(identity?: ToolCallIdentity): AgentTool;
-  execute(input: Input, signal: AbortSignal, onProgress?: ToolProgressReporter): Promise<Output>;
+  execute(input: Input, signal: AbortSignal, onProgress?: ToolProgressReporter, context?: ToolExecutionContext): Promise<Output>;
+  capability?: ToolCapability;
+  effects?: ToolEffects;
   access?: ToolAccess;
   isReadOnly?(input: Input): boolean;
   isConcurrencySafe?(input: Input): boolean;
@@ -46,7 +51,9 @@ export type AgentTool<Output extends ToolOutput = ToolOutput> = {
   inputSchema: Record<string, unknown>;
   validate(input: unknown): unknown;
   bindExecution?(identity?: ToolCallIdentity): AgentTool;
-  execute(input: unknown, signal: AbortSignal, onProgress?: ToolProgressReporter): Promise<Output>;
+  execute(input: unknown, signal: AbortSignal, onProgress?: ToolProgressReporter, context?: ToolExecutionContext): Promise<Output>;
+  capability?: ToolCapability;
+  effects?: ToolEffects;
   access: ToolAccess;
   isReadOnly(input: unknown): boolean;
   isConcurrencySafe(input: unknown): boolean;
@@ -63,7 +70,9 @@ export function defineTool<Input, Output extends ToolOutput = string>(
     inputSchema: definition.inputSchema,
     validate: definition.validate,
     ...(definition.bindExecution ? { bindExecution: definition.bindExecution } : {}),
-    execute: (input, signal, onProgress) => definition.execute(input as Input, signal, onProgress),
+    execute: (input, signal, onProgress, context) => definition.execute(input as Input, signal, onProgress, context),
+    ...(definition.capability ? { capability: structuredClone(definition.capability) } : {}),
+    ...(definition.effects ? { effects: structuredClone(definition.effects) } : {}),
     access: definition.access ?? "unknown",
     isReadOnly: definition.isReadOnly
       ? (input) => definition.isReadOnly?.(input as Input) ?? false

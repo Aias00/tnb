@@ -1,12 +1,15 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { cp, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { serveDurableRuntime, runtimeRequest, runtimePaths } from "../../src/services/runtime/server";
 import { createRuntimeWorkerFactory } from "../../src/services/runtime/worker";
 import type { RuntimeConfiguration } from "../../src/services/runtime/engine";
-import { runRuntimeCommand } from "../../src/entrypoints/runtime";
+import { runRuntimeChatCommand, runRuntimeCommand } from "../../src/entrypoints/runtime";
 import { acquireWorkspace } from "../../src/services/runtime/workspace";
+import { installLocalPlugin } from "../../src/services/plugins/management";
+import { trustPlugin, revokePluginTrust, pluginTrustStorePath } from "../../src/services/plugins/trust";
 
 const roots: string[] = []; const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); await Promise.all(roots.splice(0).map((r) => rm(r, { recursive: true, force: true }))); });
@@ -21,7 +24,7 @@ async function fixture() {
   await writeFile(join(configDir, "models.json"), JSON.stringify({ providers: { fixture: { api: "openai-completions", baseUrl: `${model.url}v1`, models: [{ id: "fixture", maxTokens: 1000, pricing: { input: 1, output: 1 } }] } } }));
   const config: RuntimeConfiguration = { workspace, allowedWorkspaces: [workspace], provider: "fixture", model: "fixture", allowWrite: false, allowShell: false,
     checks: [], maxTurns: 10, maxRetries: 1, compactThreshold: 10000, maxCostUsd: 1 };
-  return { root, configDir, workspace, config, modelUrl: String(model.url), requests: () => requests };
+  return { root, configDir, workspace, config, model, modelUrl: String(model.url), requests: () => requests };
 }
 async function service(configDir: string) {
   const controller = new AbortController(); const ready = Promise.withResolvers<void>();
@@ -53,6 +56,60 @@ test("authenticated Unix service executes a loopback model and survives owner re
   expect((await terminal(f.configDir, submitted.run.runId)).run.status).toBe("succeeded"); expect(f.requests()).toBe(1);
   const secondOwner = new AbortController();
   await expect(serveDurableRuntime({ configDir: f.configDir, env: process.env, signal: secondOwner.signal })).rejects.toThrow("already being held");
+});
+
+test("the default service exposes its coding plugin, verifies a real write in the native sandbox and honors disable on restart", async () => {
+  const f = await fixture(); let calls = 0;
+  f.model.reload({ async fetch() {
+    if (++calls > 1) return sse("Created and checked result.ts");
+    const events = [{ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "write-result", type: "function",
+      function: { name: "write", arguments: JSON.stringify({ path: "result.ts", content: "export const value = 42;\n" }) } }] }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }], usage }];
+    return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+  } });
+  const first = await service(f.configDir);
+  let output = "";
+  expect(await runRuntimeCommand({ argv: ["runtime", "plugins", "--config-dir", f.configDir], cwd: f.workspace, env: process.env,
+    stdout: { write: text => { output += text; } }, stderr: { write: text => { throw new Error(text); } } })).toBe(0);
+  expect(JSON.parse(output)[0]).toMatchObject({ name: "tnb-coding", status: "active", root: "builtin:tnb-coding" });
+  const chat = await runRuntimeChatCommand({ args: ["plugins"], cwd: f.workspace, workspace: f.workspace, configDir: f.configDir,
+    env: process.env, provider: "fixture", model: "fixture", sessionId: "plugin-status" });
+  expect(JSON.parse(chat)[0]).toMatchObject({ name: "tnb-coding", status: "active" });
+  const configuration = { ...f.config, allowWrite: true, checks: ["test -f result.ts"] };
+  const submitted = await runtimeRequest(f.configDir, "/command", { action: "submit", commandId: "plugin-write", objective: "Write and verify result.ts", mode: "single", configuration }) as { run: { runId: string } };
+  expect((await terminal(f.configDir, submitted.run.runId)).run.status).toBe("succeeded");
+  expect(await readFile(join(f.workspace, "result.ts"), "utf8")).toContain("value = 42");
+  const result = await runtimeRequest(f.configDir, `/result?runId=${submitted.run.runId}`) as Array<{ result: { acceptance: string; checks: Array<{ command: string }> } }>;
+  expect(result[0]!.result).toMatchObject({ acceptance: "verification-commands", checks: [{ command: "test -f result.ts" }] });
+  first.controller.abort(); await first.done;
+  await writeFile(join(f.configDir, "settings.json"), JSON.stringify({ enabledPlugins: { "tnb-coding": false } }));
+  await service(f.configDir);
+  expect((await runtimeRequest(f.configDir, "/plugins") as Array<{ status: string }>)[0]!.status).toBe("inactive");
+  await expect(runtimeRequest(f.configDir, "/command", { action: "submit", commandId: "disabled-coding", objective: "No fallback", configuration: f.config })).rejects.toThrow("unavailable");
+  expect(calls).toBe(2);
+});
+
+test("the daemon uses an installed coding package and never falls back to built-in code across trust decisions", async () => {
+  const f = await fixture(), source = join(f.root, "coding-package"); await mkdir(source);
+  const bundle = await Bun.build({ entrypoints: [fileURLToPath(new URL("../../src/adapters/coding/plugin.ts", import.meta.url))], target: "bun", outdir: source, naming: "index.mjs" });
+  expect(bundle.success).toBe(true);
+  await cp(new URL("../../src/adapters/coding/plugin.json", import.meta.url), join(source, "plugin.json"));
+  const installed = await installLocalPlugin({ source, targetRoot: join(f.configDir, "plugins"), sourceType: "user" });
+  let owner = await service(f.configDir);
+  expect(await runtimeRequest(f.configDir, "/plugins")).toMatchObject([{ name: "tnb-coding", status: "blocked", root: installed.root }]);
+  await expect(runtimeRequest(f.configDir, "/command", { action: "submit", commandId: "blocked", objective: "Read", configuration: f.config })).rejects.toThrow("unavailable");
+  owner.controller.abort(); await owner.done;
+  await trustPlugin(pluginTrustStorePath(f.configDir), installed.root);
+  owner = await service(f.configDir);
+  expect(await runtimeRequest(f.configDir, "/plugins")).toMatchObject([{ name: "tnb-coding", status: "active", root: installed.root }]);
+  const submitted = await runtimeRequest(f.configDir, "/command", { action: "submit", commandId: "installed", objective: "Read", configuration: f.config }) as { run: { runId: string } };
+  expect((await terminal(f.configDir, submitted.run.runId)).run.status).toBe("succeeded"); expect(f.requests()).toBe(1);
+  owner.controller.abort(); await owner.done;
+  await revokePluginTrust(pluginTrustStorePath(f.configDir), installed.root);
+  await service(f.configDir);
+  expect(await runtimeRequest(f.configDir, "/plugins")).toMatchObject([{ name: "tnb-coding", status: "blocked" }]);
+  await expect(runtimeRequest(f.configDir, "/command", { action: "submit", commandId: "revoked", objective: "Read", configuration: f.config })).rejects.toThrow("unavailable");
+  expect(f.requests()).toBe(1);
 });
 
 test("HTTP control command receipts survive duplicate pause, resume and cancellation", async () => {

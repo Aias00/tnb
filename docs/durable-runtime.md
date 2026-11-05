@@ -2,6 +2,8 @@
 
 `tnb runtime` 是独立本机服务：接纳任务后，关闭提交终端不会取消工作。它复用 tnb 的 AgentLoop、Provider、工具、权限检查和原生沙箱，并增加持久输入路由、调度、工具日志、分层恢复、产物验收和 Run 预算。当前交付范围是单 Agent 编码，以及按需的一层只读子 Agent 协作；旧 Run 保留原委派策略。验证平台为 macOS 和 Linux ARM64 / Bun；本文描述实际代码能力，完整演进目标见[设计](superpowers/specs/2026-11-03-durable-task-runtime-design.md)。
 
+执行内核另提供 `tnb/agent`，通用持久宿主为 `tnb/agent/runtime`。非编码任务通过版本化场景适配器使用资源、能力和业务验收；CLI 继续默认 Coding。接口、示例和限制见[通用 Agent 运行时](general-agent-runtime.md)。
+
 ## 使用
 
 已有 Provider 配置保存在 `~/.tnb/models.json`；仍可用 `TNB_HOME` 或 `--config-dir` 指定配置目录。配置和 runtime 控制目录必须位于工作区之外，数据库必须位于本机文件系统。
