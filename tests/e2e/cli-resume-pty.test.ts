@@ -35,15 +35,13 @@ test.each(["picker", "direct"] as const)("tnb resume restores a conversation thr
     }
   };
   try {
-    let inputReadyAfter = 0;
     if (mode === "picker") {
       await seen("Resume session"); await seen("\u001b[?2004h");
-      inputReadyAfter = text().lastIndexOf("\u001b[?2004h") + "\u001b[?2004h".length;
       child.stdin.write("\r"); await child.stdin.flush();
     }
     await seen("PAST_ANSWER_TOKEN"); await seen("PAST_PROMPT_TOKEN");
     // Initial transcript paint precedes input mounting. Wait for this TUI's raw-mode acknowledgement.
-    await seen("\u001b[?2004h", inputReadyAfter);
+    await seen("\u001b[?2004h");
     child.stdin.write("\u0003"); await child.stdin.flush(); await seen("Press Ctrl+C again to exit");
     child.stdin.write("\u0003"); await child.stdin.flush(); child.stdin.end();
     await Promise.race([child.exited, Bun.sleep(8000).then(() => { throw new Error("Resume CLI did not exit"); })]);
