@@ -14,6 +14,8 @@ import type { BuiltinGenerationAuthority } from "./builtin-generations";
 import type { ChannelGenerationReference } from "./channel-bindings";
 import { digestJson } from "../services/runtime/json";
 import { isPluginFingerprintBlocked } from "../services/plugins/policy";
+import { bindPluginMigrations } from "./plugin-state";
+import { parsePluginDataDeclaration } from "./plugin-data";
 
 /** Trusted in-process code. This API does not confer sandbox isolation. */
 export type AdapterPluginAPI = {
@@ -282,6 +284,7 @@ function guardAdapter(adapter: AgentDomainAdapter, plugin: AdapterPluginIdentity
 type EntryDeclaration = { kind: "adapter"; id: string; version: string } | ExtensionDeclaration;
 async function initializeEntry(factory: HostPluginFactory, expected: EntryDeclaration[], identity: Readonly<AdapterPluginIdentity>,
   callbacks: Array<() => void | Promise<void>>, stateDirectory?: string, configuration?: unknown): Promise<{ adapters: PluginAdapterRegistration[]; extensions: ExtensionRegistration[] }> {
+  for (const declaration of expected) if (declaration.kind !== "adapter") parsePluginDataDeclaration(declaration, declaration.kind);
   const pending: AgentDomainAdapter[] = [], extensions: ExtensionRegistration[] = [];
   const registered = new Set<string>();
   let accepting = true;
@@ -297,8 +300,9 @@ async function initializeEntry(factory: HostPluginFactory, expected: EntryDeclar
   const registerExtension = (kind: ExtensionDeclaration["kind"], definition: PluginApplication | PluginChannel) => {
     const declaration = claim(kind, definition) as ExtensionDeclaration;
     if (kind === "channel" ? typeof (definition as PluginChannel).connect !== "function" : typeof (definition as PluginApplication).start !== "function") throw new Error("Invalid plugin extension lifecycle");
-    const bound = kind === "channel" ? { id: definition.id, version: definition.version, connect: (definition as PluginChannel).connect.bind(definition) }
-      : { id: definition.id, version: definition.version, start: (definition as PluginApplication).start.bind(definition) };
+    const migrations = bindPluginMigrations(declaration.state, definition.migrations);
+    const bound = kind === "channel" ? { id: definition.id, version: definition.version, migrations, connect: (definition as PluginChannel).connect.bind(definition) }
+      : { id: definition.id, version: definition.version, migrations, start: (definition as PluginApplication).start.bind(definition) };
     extensions.push({ declaration: structuredClone(declaration), definition: Object.freeze(bound), plugin: identity });
   };
   const api: HostPluginAPI = Object.freeze({ identity, stateDirectory, configuration,

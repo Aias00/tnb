@@ -2,6 +2,9 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { PluginServiceRegistry } from "./services";
+import { contributionConfigurationKey, parsePluginDataDeclaration, PluginDataError } from "./plugin-data";
+import { validatePluginConfiguration } from "./plugin-schema";
+import { bindPluginMigrations, preparePluginState } from "./plugin-state";
 import { digestJson, encodeJson, text } from "../services/runtime/json";
 import type { PluginAdapterRegistration } from "./domain";
 import type { ChannelGenerationReference } from "./channel-bindings";
@@ -17,6 +20,8 @@ export class ExtensionHost {
   readonly #order: string[] = [];
   readonly #inFlight = new Set<Promise<unknown>>();
   readonly #connections = new Map<ChannelConnection, string>();
+  readonly #configuration = new Map<string, import("./domain").JsonValue>();
+  readonly #stateReady = new Set<string>();
   #options?: ExtensionHostOptions;
   #services?: PluginServiceRegistry;
   #closed = false;
@@ -27,7 +32,14 @@ export class ExtensionHost {
   readonly channels: ChannelRegistry = Object.freeze({ descriptor: (input: ChannelDescriptor) => this.channelDescriptor(input), connect: (input: ChannelDescriptor, config: Parameters<ChannelRegistry["connect"]>[1], signal?: AbortSignal) => this.track(this.connect(input, config, signal)) });
   constructor(registrations: readonly ExtensionRegistration[], readonly adapters: readonly Pick<PluginAdapterRegistration, "adapter">[], readonly root?: string, readonly channelReferences: readonly ChannelGenerationReference[] = []) {
     if (registrations.length > 512) throw new Error("Host extension capacity exceeded");
-    for (const registration of registrations) {
+    for (const input of registrations) {
+      const declaration = structuredClone(input.declaration), definition = input.definition;
+      parsePluginDataDeclaration(declaration, declaration.kind);
+      const migrations = bindPluginMigrations(declaration.state, definition.migrations);
+      const registration: ExtensionRegistration = { ...input, plugin: Object.freeze({ ...input.plugin }), declaration, definition: Object.freeze({
+        id: definition.id, version: definition.version, migrations,
+        ...(declaration.kind === "channel" ? { connect: (definition as PluginChannel).connect.bind(definition) } : { start: (definition as PluginApplication).start.bind(definition) }),
+      }) as PluginApplication | PluginChannel };
       if (registration.recoveryOnly && (registration.declaration.kind !== "channel" || registration.declaration.requires.length)) throw new Error("Retained channels must be self-contained and have no contribution dependencies");
       const id = registration.recoveryOnly ? generationKey(registration.declaration, registration.plugin) : key(registration.declaration);
       if (this.#registrations.has(id)) throw new Error("Duplicate host contribution");
@@ -50,7 +62,7 @@ export class ExtensionHost {
       this.#removeAbortListener = () => options.signal!.removeEventListener("abort", abort);
       if (options.signal.aborted) { abort(); throw new Error("Plugin startup cancelled"); }
     }
-    this.#options = { store: options.store, services: new Map(options.services), grants: structuredClone(options.grants ?? {}) };
+    this.#options = { store: options.store, services: new Map(options.services), grants: structuredClone(options.grants ?? {}), configuration: structuredClone(options.configuration ?? {}) };
     this.#services = new PluginServiceRegistry(options.serviceProviders, this.#options.services);
     const visiting = new Set<string>(), visited = new Set<string>(), ordered: string[] = [];
     const visit = (id: string) => {
@@ -81,6 +93,16 @@ export class ExtensionHost {
       const registration = this.#registrations.get(id)!, state = this.#states.get(id)!;
       if (state.status === "failed") continue;
       try {
+        const contract = registration.declaration.configuration;
+        const supplied = this.#options.configuration?.[registration.plugin.name]?.[contributionConfigurationKey(registration.declaration)];
+        if (contract || supplied !== undefined) {
+          state.configuration = { status: "invalid", ...(contract ? { version: contract.version } : {}) };
+          try {
+            if (!contract || !supplied || Object.keys(supplied).some(key => !["version", "value"].includes(key)) || supplied.version !== contract.version) throw new Error("Configuration version mismatch");
+            const value = validatePluginConfiguration(contract.schema, supplied.value);
+            this.#configuration.set(id, value); state.configuration = { status: "ready", version: contract.version, digest: digestJson({ version: contract.version, value }) };
+          } catch { throw new PluginDataError("PLUGIN_CONFIG_INVALID", "configuration is missing, has an unsupported version or does not match the declared schema"); }
+        }
         if (registration.declaration.requires.some(ref => ref.kind !== "adapter" && this.#states.get(key(ref))?.status !== "active")) throw new Error("Plugin dependency did not activate");
         const grants = this.#options.grants?.[registration.plugin.name] ?? [];
         const unavailable = registration.declaration.services.find(name => !grants.includes(name) || !this.#services!.has(name));
@@ -198,6 +220,11 @@ export class ExtensionHost {
     const stateDirectory = this.root ? join(this.root, "plugin-state", stateKey) : undefined;
     if (stateDirectory) await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
     const store = this.#options!.store;
+    if (!this.#stateReady.has(id)) {
+      preparePluginState(store, namespace, registration.plugin, registration.declaration.state, registration.definition.migrations ?? [], lifetime.controller.signal,
+        result => { this.#states.get(id)!.state = result; });
+      this.#stateReady.add(id);
+    }
     const assertLive = () => { if (this.#closed || !lifetime.accepting || lifetime.controller.signal.aborted) throw new Error("Plugin contribution lifetime ended"); };
     const assertState = () => { if (lifetime.finished) throw new Error("Plugin state lifetime ended"); };
     const service = this.bindServices(id, id, lifetime.controller.signal, assertLive);
@@ -206,13 +233,23 @@ export class ExtensionHost {
       list: <T>(afterId = "", limit = 256) => { assertState(); return store.applicationRecords<T>(namespace, afterId, limit); },
       command: <T>(commandId: string, input: unknown, apply: Parameters<PluginStateStore["command"]>[2]): T => {
         assertState(); text(commandId, "plugin command ID", 128);
-        return store.command(digestJson({ namespace, commandId }), { namespace, input }, Date.now(), tx => apply({
-          get: <V>(recordId: string) => tx.applicationRecord<V>(namespace, recordId),
-          save: <V>(recordId: string, value: V, previousRevision: number) => { assertState(); return tx.saveApplicationRecord({ namespace, id: recordId, value }, previousRevision); },
-        }) as T);
+        if (apply.constructor.name === "AsyncFunction") throw new Error("Plugin state command must be synchronous");
+        return store.command(digestJson({ namespace, commandId }), { namespace, input }, Date.now(), tx => {
+          let live = true;
+          const assertTx = () => { assertState(); if (!live) throw new Error("Plugin state transaction lifetime ended"); };
+          try {
+            const result = apply(Object.freeze({
+              get: <V>(recordId: string) => { assertTx(); return tx.applicationRecord<V>(namespace, recordId); },
+              save: <V>(recordId: string, value: V, previousRevision: number) => { assertTx(); return tx.saveApplicationRecord({ namespace, id: recordId, value }, previousRevision); },
+            }));
+            if (result && typeof (result as { then?: unknown }).then === "function") { void Promise.resolve(result).catch(() => {}); throw new Error("Plugin state command must be synchronous"); }
+            return result as T;
+          } finally { live = false; }
+        });
       },
     });
     return Object.freeze({ identity: registration.plugin, signal: lifetime.controller.signal, stateDirectory, state,
+      ...(this.#configuration.has(id) ? { configuration: structuredClone(this.#configuration.get(id)!) } : {}),
       service,
       request: (ref: ContributionReference, request: Request) => {
         assertLive();

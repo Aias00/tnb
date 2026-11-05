@@ -6,7 +6,9 @@
 
 后续已落实外部插件工具的 HTTP loopback 直连约束、拒绝重定向、调用期限、读取字节限额、并发/常驻进程数上限、取消及直接子进程退出等待，见[运行合同](../../guides/plugin-tool-runtime.md)和[实现审阅](../reviews/2026-11-05-plugin-runtime.md)。这部分落实 AUTH-05 和 LIFE-01 至 LIFE-05；任意进程内扩展、后代进程树隔离、最小环境、MCP/Channel 的统一预算及配置/状态迁移仍未交付。
 
-类型化 ServiceRef、宿主工厂依赖预检、host/contribution 作用域和受管理句柄已落实，默认 Web/协作/渠道使用同一合同；嵌套任务调用及渠道构造清理也纳入等待，见[服务规格](2026-11-05-plugin-services.md)、[使用指南](../../guides/plugin-services.md)和[审阅](../reviews/2026-11-05-plugin-services.md)。本轮部分覆盖 SVC-01 至 SVC-04，Run/call 作用域、配置/状态迁移及任意进程内强撤销仍未交付。
+类型化 ServiceRef、宿主工厂依赖预检、host/contribution 作用域和受管理句柄已落实，默认 Web/协作/渠道使用同一合同；嵌套任务调用及渠道构造清理也纳入等待，见[服务规格](2026-11-05-plugin-services.md)、[使用指南](../../guides/plugin-services.md)和[审阅](../reviews/2026-11-05-plugin-services.md)。该阶段部分覆盖 SVC-01 至 SVC-04，Run/call 作用域及任意进程内强撤销仍未交付。
+
+贡献的版本化配置、有界 Schema、私有记录版本与事务迁移已实现，参见[数据规格](2026-11-05-plugin-data-contracts.md)、[指南](../../guides/plugin-data-contracts.md)和[审阅](../reviews/2026-11-05-plugin-data-contracts.md)。这是 STATE-01/02 和 REC-04 的部分路径；配置自动迁移、文件/网络原子迁移、大数据批次及完整备份恢复诊断仍未交付。
 
 本文使用“必须”表示准入要求，“应”表示通常需要满足且例外须说明的要求，“可以”表示可选能力。规范覆盖包、贡献、宿主服务、模型工具、状态及恢复，不将安装信任等同于恶意代码隔离。
 

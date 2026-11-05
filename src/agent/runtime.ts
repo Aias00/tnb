@@ -11,7 +11,7 @@ import { builtinGenerationAuthority, builtinChannelGenerationAuthority } from ".
 import { channelGenerationReferences } from "./channel-bindings";
 
 /** Local Bun host. Acquire the owner lock before opening SQLite, including on recovery. */
-export async function openAgentRuntime(options: { directory: string; adapters?: readonly AgentDomainAdapter[]; plugins?: AgentPluginOptions; legacyAdapterId?: string; signal?: AbortSignal; services?: ExtensionHostOptions["services"]; serviceProviders?: ExtensionHostOptions["serviceProviders"]; serviceGrants?: ExtensionHostOptions["grants"] }) {
+export async function openAgentRuntime(options: { directory: string; adapters?: readonly AgentDomainAdapter[]; plugins?: AgentPluginOptions; legacyAdapterId?: string; signal?: AbortSignal; services?: ExtensionHostOptions["services"]; serviceProviders?: ExtensionHostOptions["serviceProviders"]; serviceGrants?: ExtensionHostOptions["grants"]; pluginConfiguration?: ExtensionHostOptions["configuration"] }) {
   options.signal?.throwIfAborted();
   await mkdir(options.directory, { recursive: true, mode: 0o700 });
   const unlock = await lock(options.directory, { realpath: true, stale: 5000, update: 1000, retries: 0 });
@@ -28,7 +28,7 @@ export async function openAgentRuntime(options: { directory: string; adapters?: 
     const runtime = running = new DurableRuntime(store, options.directory, domains);
     // The host retains ownership through plugin disposal and database close.
     await runtime.start(async () => {});
-    await plugins?.extensions.start({ store, signal: options.signal, services: options.services, serviceProviders: options.serviceProviders, grants: options.serviceGrants });
+    await plugins?.extensions.start({ store, signal: options.signal, services: options.services, serviceProviders: options.serviceProviders, grants: options.serviceGrants, configuration: options.pluginConfiguration });
     options.signal?.throwIfAborted();
     let closing: Promise<void> | undefined;
     const abort = () => { void close().catch(() => undefined); };
@@ -77,3 +77,7 @@ export type { ServiceRef, ServiceProvider, ServiceFactoryContext, ServiceConsume
 export { CHANNEL_SERVICE, CHANNEL_SERVICE_REF } from "./channel-service";
 export { RUNTIME_READ_SERVICE, RUNTIME_READ_SERVICE_REF } from "./runtime-read-service";
 export type { RuntimeReadService } from "./runtime-read-service";
+export { contributionConfigurationKey, PluginDataError } from "./plugin-data";
+export type { PluginConfigurationContract, PluginStateContract, VersionedPluginConfiguration, PluginConfiguration } from "./plugin-data";
+export type { PluginJsonSchema } from "./plugin-schema";
+export type { PluginStateMigration, PluginMigrationTransaction } from "./extensions";

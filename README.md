@@ -632,6 +632,8 @@ self-update manifest alongside the binary and `SHA256SUMS`.
 
 宿主服务支持类型化引用、工厂依赖和按贡献管理的生命周期，默认 Web/协作/渠道已使用同一协议，见[服务接入指南](docs/guides/plugin-services.md)。运行 `bun examples/typed-plugin-service.ts` 可验证一个无需模型的完整服务样例。
 
+贡献可声明版本化配置和私有记录迁移，宿主在启动前校验，失败不会自动读取不兼容状态。见[数据合同](docs/guides/plugin-data-contracts.md)，本地示例：`bun examples/plugin-data-contract.ts`。
+
 持久任务可通过 `--skill NAME`、`--mcp-tool NAME` 显式选择额外能力，详见 [长任务 skills 与 MCP](docs/guides/durable-capabilities.md)。
 
 网页工作台：`tnb web` 在当前目录打开同一持久任务的网页入口，支持实时问题提醒、任务控制和结果查看，见 [使用说明](docs/guides/web-workbench.md)。

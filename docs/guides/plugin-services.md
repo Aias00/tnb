@@ -118,4 +118,4 @@ const provider = provideService(REF, scope => createScopedService(scope.signal))
 
 若仅返回一个既有共享对象，作者必须选择符合其真实生命周期的 scope，并处理其嵌套资源；provideService 不会凭空隔离任意闭包。
 
-服务 API 的错误区分不可用、合同不匹配、依赖错误、作用域结束和工厂无效。现有贡献 inventory 仍用 error 字符串展示，包含这些错误码；这不表示全部插件诊断已迁移成统一结构化协议。配置 Schema、持久状态迁移、Run/call 作用域、强制热撤销和受限进程执行仍是后续规范，见[插件规范](../superpowers/specs/2026-11-05-plugin-specification.md)。
+服务 API 的错误区分不可用、合同不匹配、依赖错误、作用域结束和工厂无效。现有贡献 inventory 仍用 error 字符串展示，包含这些错误码；这不表示全部插件诊断已迁移成统一结构化协议。贡献配置 Schema 和私有记录版本迁移见[数据合同](plugin-data-contracts.md)；Run/call 作用域、文件/网络迁移、强制热撤销和受限进程执行仍是后续规范，见[插件规范](../superpowers/specs/2026-11-05-plugin-specification.md)。

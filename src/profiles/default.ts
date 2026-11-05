@@ -42,7 +42,7 @@ export async function loadDefaultProfile(options: { configDir: string; root: str
     }, [], join(root, "plugin-snapshots"));
   } finally { if (!options.runtime) referenceStore.close(); }
   return { plugins, async start(runtime: DurableRuntime, signal?: AbortSignal) {
-    await plugins.extensions.start({ store: runtime.store, signal, serviceProviders: [
+    await plugins.extensions.start({ store: runtime.store, signal, configuration: settings.pluginConfiguration, serviceProviders: [
       provideService(COLLABORATION_SERVICE_REF, scope => {
         const factory = createCollaborationService(runtime, config, plugins.extensions.channels, scope.signal, scope.track);
         return { open(signal) { const service = factory.open(AbortSignal.any([signal, scope.signal])); scope.onDispose(service.close); return service; } };

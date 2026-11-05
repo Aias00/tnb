@@ -970,6 +970,7 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
           fingerprint: plugin.fingerprint ?? null,
           lifecycle: plugin.lifecycle,
           contributionSummary: plugin.contributionSummary,
+          extensions: plugin.extensionContributions ?? [],
           hooksPath: plugin.hooksPath ?? null,
           mcpPath: plugin.mcpPath ?? null,
           documentation: plugin.documentation ?? null,

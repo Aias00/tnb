@@ -11,6 +11,7 @@ import {
   type HooksConfig,
 } from "../hooks/runner";
 import type { SandboxSettings } from "../sandbox/macos";
+import { parsePluginConfiguration, type PluginConfiguration } from "../../agent/plugin-data";
 
 export type TnbSettings = {
   provider?: string;
@@ -20,6 +21,7 @@ export type TnbSettings = {
   autoMemoryDirectory?: string;
   enabledPlugins?: Record<string, boolean>;
   pluginServices?: Record<string, string[]>;
+  pluginConfiguration?: PluginConfiguration;
   blockedPluginFingerprints?: string[];
   general?: { vimMode?: boolean; editor?: string };
   ui?: { theme?: "magenta" | "cyan" | "blue" | "green" };
@@ -57,6 +59,10 @@ export async function loadSettings(options: {
   for (const path of projectPaths) {
     const settings = await readSettings(path);
     if (!settings) continue;
+    if (settings.pluginConfiguration !== undefined) {
+      warnings.push(`Ignored pluginConfiguration from ${path}; background plugin configuration may only be configured in ${userPath}`);
+      delete settings.pluginConfiguration;
+    }
     if (settings.autoMemoryDirectory !== undefined) {
       warnings.push(`Ignored autoMemoryDirectory from ${path}; this path may only be configured in ${userPath}`);
       delete settings.autoMemoryDirectory;
@@ -148,6 +154,7 @@ function validateSettings(value: unknown, path: string): TnbSettings {
     if (Object.keys(services).some(name => !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(name)) || Object.values(services).some(value => !Array.isArray(value) || value.length > 32 || new Set(value).size !== value.length || value.some(name => typeof name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9.:/_-]{0,127}$/.test(name)))) throw new Error(`Invalid plugin service grants: ${path}`);
     result.pluginServices = services as Record<string, string[]>;
   }
+  if (root.pluginConfiguration !== undefined) result.pluginConfiguration = parsePluginConfiguration(root.pluginConfiguration);
   if (root.blockedPluginFingerprints !== undefined) {
     if (!Array.isArray(root.blockedPluginFingerprints) || root.blockedPluginFingerprints.length > 4096
       || root.blockedPluginFingerprints.some(value => typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value))) throw new Error(`blockedPluginFingerprints must contain SHA256 fingerprints: ${path}`);
@@ -278,6 +285,7 @@ function mergeSettings(
       ? { enabledPlugins: { ...earlier.enabledPlugins, ...later.enabledPlugins } }
       : {}),
     ...(earlier.pluginServices || later.pluginServices ? { pluginServices: { ...earlier.pluginServices, ...later.pluginServices } } : {}),
+    ...(earlier.pluginConfiguration || later.pluginConfiguration ? { pluginConfiguration: { ...earlier.pluginConfiguration, ...later.pluginConfiguration } } : {}),
     ...(earlier.blockedPluginFingerprints || later.blockedPluginFingerprints ? { blockedPluginFingerprints: [...new Set([...(earlier.blockedPluginFingerprints ?? []), ...(later.blockedPluginFingerprints ?? [])])] } : {}),
     ...(earlier.general || later.general ? { general: { ...earlier.general, ...later.general } } : {}),
     ...(earlier.ui || later.ui ? { ui: { ...earlier.ui, ...later.ui } } : {}),

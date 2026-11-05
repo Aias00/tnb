@@ -11,6 +11,7 @@ import { loadMcpConfig, type McpConfig } from "../mcp/config";
 import { computePluginTreeSha256, pluginTrustState, type PluginTrustState } from "./trust";
 import { isPluginActive, resolvePluginPolicy, type PluginPolicy } from "./policy";
 import { pluginHttpTarget } from "./network";
+import { parsePluginDataDeclaration } from "../../agent/plugin-data";
 
 const BUILT_IN_PLUGIN_TOOLS = new Map<string, {
   toolName: string;
@@ -361,7 +362,7 @@ function optionalExtensionContributions(value: unknown, kind: ExtensionKind, pat
   if (!Array.isArray(value) || !value.length || value.length > 32) throw new Error(`Plugin contributes.${kind}s must contain 1..32 entries: ${path}`);
   const seen = new Set<string>();
   return value.map(item => {
-    if (!isRecord(item) || Object.keys(item).some(key => !["id", "version", "entry", "services", "requires"].includes(key))) throw new Error(`Invalid ${kind} contribution: ${path}`);
+    if (!isRecord(item) || Object.keys(item).some(key => !["id", "version", "entry", "services", "requires", "configuration", "state"].includes(key))) throw new Error(`Invalid ${kind} contribution: ${path}`);
     const id = requiredIdentifier(item.id, `${kind}.id`, path), version = requiredString(item.version, `${kind}.version`, path);
     if (version.length > 128 || seen.has(`${id}@${version}`)) throw new Error(`Duplicate ${kind} contribution: ${path}`);
     seen.add(`${id}@${version}`);
@@ -375,7 +376,7 @@ function optionalExtensionContributions(value: unknown, kind: ExtensionKind, pat
       return { kind: raw.kind as ContributionReference["kind"], id: requiredIdentifier(raw.id, "dependency.id", path), version: requiredString(raw.version, "dependency.version", path) };
     });
     if (new Set(requires.map(ref => JSON.stringify(ref))).size !== requires.length) throw new Error("Duplicate plugin dependency");
-    return { kind, id, version, entry, services, requires };
+    return { kind, id, version, entry, services, requires, ...parsePluginDataDeclaration(item, kind) };
   });
 }
 
