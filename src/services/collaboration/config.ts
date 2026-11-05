@@ -16,7 +16,7 @@ function names(value: unknown, label: string): string[] {
   return value.map(item => text(item, label, 128));
 }
 export function sourceIdentity(source: Source): string {
-  return digestJson({ id: source.id, type: source.type, github: source.github, webhook: source.webhook, timer: source.timer });
+  return digestJson({ id: source.id, type: source.type, github: source.github, webhook: source.webhook, timer: source.timer, channel: source.channel, options: source.options });
 }
 export async function parseCollaborationConfig(value: unknown): Promise<CollaborationConfig> {
   encodeJson(value, 64 * 1024);
@@ -24,10 +24,10 @@ export async function parseCollaborationConfig(value: unknown): Promise<Collabor
   if (typeof root.enabled !== "boolean" || !Array.isArray(root.sources) || root.sources.length > 32) throw new Error("Invalid collaboration profile");
   const ids = new Set<string>(); const sources: Source[] = [];
   for (const raw of root.sources) {
-    const source = object(raw); keys(source, ["id", "type", "actors", "controllers", "configuration", "mode", "pollIntervalMs", "github", "webhook", "timer"]);
+    const source = object(raw); keys(source, ["id", "type", "actors", "controllers", "configuration", "mode", "pollIntervalMs", "github", "webhook", "timer", "channel", "options"]);
     if (typeof source.id !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(source.id) || ids.has(source.id)) throw new Error("Invalid or duplicate Source ID");
     ids.add(source.id);
-    if (!["github", "webhook", "timer"].includes(source.type)) throw new Error("Unknown collaboration Source type");
+    if (!["github", "webhook", "timer", "plugin"].includes(source.type)) throw new Error("Unknown collaboration Source type");
     const actors = names(source.actors, "Source actors"), controllers = names(source.controllers, "Source controllers");
     const config = object(source.configuration);
     if (Object.keys(config).some(key => !allowedConfiguration.has(key)) || !isAbsolute(config.workspace ?? "")) throw new Error("Source requires a fixed absolute Coding workspace");
@@ -67,6 +67,18 @@ export async function parseCollaborationConfig(value: unknown): Promise<Collabor
       entry.timer = { everyMs: integer(timer.everyMs, "Timer interval", 60000, 365 * 86400000), objective: text(timer.objective, "Timer objective", 4000), thread: text(timer.thread, "Timer thread", 128) };
       if (!actors.includes("timer")) throw new Error("Timer Source must explicitly authorize the timer actor");
     }
+    if (entry.type === "plugin") {
+      const channel = object(source.channel); keys(channel, ["id", "version", "plugin"]);
+      if (typeof channel.id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/.test(channel.id)) throw new Error("Invalid plugin channel ID");
+      text(channel.version, "channel version", 128);
+      if (channel.plugin !== undefined) {
+        const identity = object(channel.plugin); keys(identity, ["name", "version", "fingerprint"]);
+        text(identity.name, "channel plugin name", 64); text(identity.version, "channel plugin version", 128);
+        if (typeof identity.fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(identity.fingerprint)) throw new Error("Invalid channel plugin provenance");
+      }
+      entry.channel = structuredClone(channel) as Source["channel"];
+      encodeJson(source.options ?? {}, 32 * 1024); entry.options = source.options ?? {};
+    } else if (source.channel !== undefined || source.options !== undefined) throw new Error("Custom channel configuration requires type plugin");
     sources.push(entry);
   }
   let listen: CollaborationConfig["listen"];

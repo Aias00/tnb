@@ -26,7 +26,7 @@ async function fixture(transport: ModelTransport = { async *stream() { yield* re
   const runtime = new DurableRuntime(store, state, factory); runtimes.push(runtime); if (start) await runtime.start();
   const config = await parseCollaborationConfig({ enabled: true, listen: { hostname: "127.0.0.1", port: 19999 }, sources: [{ id: "chat", type: "webhook", actors: ["alice", "bob"], controllers: ["admin"],
     configuration: { workspace, allowWrite: false, allowShell: false, checks: [] }, mode: "single", webhook: { secretEnv: "BRIDGE_KEY", outboundUrl: "http://127.0.0.1:19998/reply" } }] });
-  const delivered: Notification[] = [], ports = new Map<string, SourcePort>([["chat", { async send(notification) { delivered.push(notification); return `receipt:${notification.id}`; } }]]);
+  const delivered: Notification[] = [], ports = new Map<string, SourcePort>([["chat", { async send(notification) { delivered.push(notification as Notification); return `receipt:${notification.id}`; } }]]);
   const engine = new CollaborationEngine(runtime, config, ports);
   const incoming = (id: string, text = "/tnb run Inspect the repository", actor = "alice", thread = "thread-1"): IncomingEvent => ({ externalId: id, text, actor, thread });
   const ticket = (id: string) => store.applicationRecord<Ticket>(NS.tickets, ticketId(eventId("chat", id)))!.value;

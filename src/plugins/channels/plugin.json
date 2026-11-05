@@ -1,0 +1,8 @@
+{
+  "name": "tnb-channels", "version": "0.1.0", "manifestVersion": 2, "apiVersion": "tnb.host-plugin/v1",
+  "contributes": { "channels": [
+    { "id": "github", "version": "1", "entry": "index.mjs" },
+    { "id": "webhook", "version": "1", "entry": "index.mjs" },
+    { "id": "timer", "version": "1", "entry": "index.mjs" }
+  ] }
+}

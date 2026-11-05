@@ -4,7 +4,7 @@
 
 ## 注册合同
 
-扩展现有 manifestVersion 2 / tnb.plugin/v1，保留 contributes.adapters，新增 applications、interfaces、channels。每项仍声明精确 id/version/entry，entry 必须是包内 .mjs。同一模块只导入并执行一次，按其所有声明授予对应注册接口；必须恰好注册声明的贡献，未声明、重复、越界、setup 完成后注册一律拒绝。整个包所有入口成功后才提交注册。未知 executable contribution 字段拒绝，避免静默降级。
+保留现有 manifestVersion 2 / tnb.plugin/v1 的 contributes.adapters；新增 applications、interfaces、channels 使用 tnb.host-plugin/v1，使旧宿主明确拒绝不支持的应用 API，避免静默忽略。新 API 也支持同包声明 adapters。每项仍声明精确 id/version/entry，entry 必须是包内 .mjs。同一模块只导入并执行一次，按其所有声明授予对应注册接口；必须恰好注册声明的贡献，未声明、重复、越界、setup 完成后注册一律拒绝。整个包所有入口成功后才提交注册。未知 executable contribution 字段拒绝，避免静默降级。
 
 应用与交互定义包含 start(context)，返回请求处理/状态接口，通过 onDispose 清理资源。交互插件可以提供视图或客户端协议，不强迫实现 Coding Adapter。渠道定义负责 connect(configuration, context)，返回 poll/send/find/observe 等协议。渠道消息合同独立于协作工单，GitHub PR 观察作为具名资源观察能力，由协作应用验证结果。持久状态与 Outbox 继续属于应用，网络适配器不创建第二套任务。
 

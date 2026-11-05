@@ -4,16 +4,14 @@ import { join, resolve } from "node:path";
 import { digestJson } from "./json";
 import { DurableRuntime, type RuntimeConfiguration } from "./engine-core";
 import { RuntimeStore } from "./store";
-import { createCodingPlugin } from "../../adapters/coding/plugin";
-import { loadAdapterPlugins } from "../../agent/plugins";
+import { loadDefaultProfile } from "../../profiles/default";
+import type { ContributionReference } from "../../agent/extensions";
 import { DomainRegistry } from "../../agent/domain";
-import { pluginTrustStorePath } from "../plugins/trust";
-import { loadSettings } from "../settings/load";
 import { lock } from "../../utils/lockfile";
 import { questionAttentionResponse } from "./attention-stream";
 import type { RoutingInput, RoutingDecision } from "./routing";
 import { presentRunDetail, presentRuns } from "./presentation";
-import { CollaborationHost } from "../collaboration/host";
+const COLLABORATION_EXTENSION: ContributionReference = { kind: "application", id: "collaboration", version: "1" };
 
 export async function runtimePaths(configDir: string): Promise<{ root: string; socket: string; token: string }> {
   const root = resolve(configDir, "runtime"); await mkdir(root, { recursive: true, mode: 0o700 });
@@ -30,7 +28,7 @@ export const RUNTIME_CAPABILITIES = Object.freeze({ protocol: 2, defaultMode: "a
   durableWaits: true, durableDelegation: true, deadlineScheduling: true, questionNotifications: true, lifecycleNotifications: true, adjustableLimits: true,
   taskRouting: true, safeFollowups: true, delegationStrategyVersion: 2, defaultDelegationDepth: 1, autoParallelBranches: 2,
   structuredChildReports: true, machineModelCoordination: true, overlappingWorkspaceLocks: true,
-  domainAdapters: true, codingPlugin: true, pluginInventory: true, collaborationProfile: true });
+  domainAdapters: true, codingPlugin: true, pluginInventory: true, collaborationProfile: true, hostPluginExtensions: true });
 export async function serveDurableRuntime(options: ServerOptions): Promise<void> {
   const paths = await runtimePaths(options.configDir);
   const release = await lock(paths.root, { realpath: true, stale: 5000, update: 1000, retries: 0 });
@@ -38,10 +36,11 @@ export async function serveDurableRuntime(options: ServerOptions): Promise<void>
 }
 async function serveLockedRuntime(options: ServerOptions): Promise<void> {
   const paths = await runtimePaths(options.configDir);
-  const { store, runtime, plugins } = options.runtime ? { store: options.runtime.store, runtime: options.runtime, plugins: undefined }
-    : await composeRuntime(options, paths.root);
+  const profile = await loadDefaultProfile({ ...options, root: paths.root, coding: !options.runtime });
+  const plugins = profile.plugins;
+  const { store, runtime } = options.runtime ? { store: options.runtime.store, runtime: options.runtime }
+    : await (async () => { try { return composeRuntime(paths.root, plugins); } catch (error) { await plugins.close(); throw error; } })();
   let server: ReturnType<typeof Bun.serve> | undefined;
-  let collaboration: CollaborationHost | undefined;
   let closing = false;
   let ready = false;
   const stopped = Promise.withResolvers<void>();
@@ -69,10 +68,16 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
         try {
           const url = new URL(request.url);
           if (url.pathname === "/collaboration") {
-            if (!collaboration) return request.method === "GET" ? Response.json({ enabled: false }) : Response.json({ error: "Collaboration is not enabled" }, { status: 400 });
-            return Response.json(await (request.method === "GET" ? collaboration.resource(request) : serialCommand(() => collaboration!.resource(request))));
+            if (!plugins.extensions.list().some(item => item.kind === "application" && item.id === "collaboration" && item.version === "1" && item.status === "active")) return request.method === "GET" ? Response.json({ enabled: false }) : Response.json({ error: "Collaboration application is unavailable" }, { status: 400 });
+            return await (request.method === "GET" ? plugins.extensions.handle(COLLABORATION_EXTENSION, request) : serialCommand(() => plugins.extensions.handle(COLLABORATION_EXTENSION, request)));
           }
-            if (url.pathname === "/plugins") return Response.json(plugins?.list() ?? []);
+          if (url.pathname === "/extensions") return Response.json(plugins.extensions.list());
+          const extension = /^\/extensions\/(application|interface)\/([^/]+)\/([^/]+)(?:\/.*)?$/.exec(url.pathname);
+          if (extension) {
+            const ref: ContributionReference = { kind: extension[1] as "application" | "interface", id: decodeURIComponent(extension[2]!), version: decodeURIComponent(extension[3]!) };
+            return await (request.method === "GET" ? plugins.extensions.handle(ref, request) : serialCommand(() => plugins.extensions.handle(ref, request)));
+          }
+          if (url.pathname === "/plugins") return Response.json(plugins?.list() ?? []);
           if (request.method === "GET") {
             if (url.pathname === "/presentation") {
               const workspace = await realpath(url.searchParams.get("workspace") ?? ""); const runId = url.searchParams.get("runId");
@@ -191,13 +196,13 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
       },
     });
     await chmod(paths.socket, 0o600);
-    collaboration = await CollaborationHost.open(runtime, options.configDir, options.env);
+    await profile.start(runtime);
     ready = true;
     options.ready?.(paths.socket);
     if (!options.signal.aborted) await Promise.race([stopped.promise, new Promise<void>((done) => options.signal.addEventListener("abort", () => done(), { once: true }))]);
   } finally {
     closing = true;
-    try { try { await collaboration?.close(); await commandTail; } finally { if (started) await runtime.close(); } }
+    try { try { try { await plugins.extensions.stop(); } finally { await commandTail; } } finally { if (started) await runtime.close(); } }
     finally {
       try { await plugins?.close(); }
       finally {
@@ -209,21 +214,9 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
 }
 
 /** Called only while the server owns the state-directory lock. */
-async function composeRuntime(options: ServerOptions, root: string) {
-  const settings = await loadSettings({ configDir: options.configDir, cwd: options.configDir });
-  let installed = false;
-  try { await lstat(join(options.configDir, "plugins", "tnb-coding")); installed = true; }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  const plugins = await loadAdapterPlugins({ roots: [{ directory: join(options.configDir, "plugins"), source: "user" }],
-    trustStorePath: pluginTrustStorePath(options.configDir), enabled: settings.enabledPlugins,
-    builtins: installed ? [] : [await createCodingPlugin({ configDir: options.configDir, runtimeRoot: root, env: options.env })],
-    configuration: { "tnb-coding": { configDir: options.configDir, env: options.env } },
-  }, [], join(root, "plugin-snapshots"));
-  let store: RuntimeStore | undefined;
-  try {
-    store = new RuntimeStore(join(root, "state.sqlite"));
-    return { plugins, store, runtime: new DurableRuntime(store, root, new DomainRegistry([], plugins.registrations, "coding")) };
-  } catch (error) { try { await plugins.close(); } finally { store?.close(); } throw error; }
+function composeRuntime(root: string, plugins: Awaited<ReturnType<typeof loadDefaultProfile>>["plugins"]) {
+  const store = new RuntimeStore(join(root, "state.sqlite"));
+  return { store, runtime: new DurableRuntime(store, root, new DomainRegistry([], plugins.registrations, "coding")) };
 }
 
 export class RuntimeRequestError extends Error {

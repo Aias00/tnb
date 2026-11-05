@@ -1,15 +1,16 @@
+import type { ChannelDescriptor, ChannelEvent, ChannelMessage } from "../../agent/extensions";
 import type { RuntimeConfiguration } from "../runtime/engine-core";
 import type { RunStatus } from "../runtime/types";
 
 export type Source = {
-  id: string; type: "github" | "webhook" | "timer"; actors: string[]; controllers: string[];
+  id: string; type: "github" | "webhook" | "timer" | "plugin"; channel?: ChannelDescriptor; options?: import("../../agent/domain").JsonValue; actors: string[]; controllers: string[];
   configuration: RuntimeConfiguration; mode: "single" | "auto" | "multi"; pollIntervalMs: number;
   github?: { repository: string; tokenEnv: string };
   webhook?: { secretEnv: string; outboundUrl: string };
   timer?: { everyMs: number; objective: string; thread: string };
 };
 export type CollaborationConfig = { enabled: boolean; sources: Source[]; listen?: { hostname: "127.0.0.1" | "::1"; port: number } };
-export type IncomingEvent = { externalId: string; actor: string; thread: string; text: string };
+export type IncomingEvent = ChannelEvent;
 export type Action =
   | { kind: "run"; text: string }
   | { kind: "followup"; ticketId?: string; text: string }
@@ -41,8 +42,9 @@ export type Notification = {
 export type SourceCursor = { value: string; lastPollAt: number };
 /** Network reads may retry; writes return a verifiable external receipt or remain unknown. */
 export interface SourcePort {
+  receive?(request: Request, signal: AbortSignal): Promise<IncomingEvent[]>;
   poll?(cursor: string | undefined, signal: AbortSignal): Promise<{ events: IncomingEvent[]; cursor: string }>;
-  send(notification: Notification, signal: AbortSignal): Promise<string>;
-  find?(notification: Notification, signal: AbortSignal): Promise<string | undefined>;
+  send(notification: ChannelMessage, signal: AbortSignal): Promise<string>;
+  find?(notification: ChannelMessage, signal: AbortSignal): Promise<string | undefined>;
   inspectPR?(number: number, signal: AbortSignal): Promise<PullRequestFacts>;
 }

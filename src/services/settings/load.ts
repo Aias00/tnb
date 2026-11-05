@@ -19,6 +19,7 @@ export type TnbSettings = {
   autoMemoryEnabled?: boolean;
   autoMemoryDirectory?: string;
   enabledPlugins?: Record<string, boolean>;
+  pluginServices?: Record<string, string[]>;
   general?: { vimMode?: boolean; editor?: string };
   ui?: { theme?: "magenta" | "cyan" | "blue" | "green" };
   permissions?: PermissionRules & {
@@ -140,6 +141,11 @@ function validateSettings(value: unknown, path: string): TnbSettings {
       throw new Error(`enabledPlugins values must be boolean: ${path}`);
     }
     result.enabledPlugins = plugins as Record<string, boolean>;
+  }
+  if (root.pluginServices !== undefined) {
+    const services = requireObject(root.pluginServices, `pluginServices must be an object: ${path}`);
+    if (Object.keys(services).some(name => !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(name)) || Object.values(services).some(value => !Array.isArray(value) || value.length > 32 || new Set(value).size !== value.length || value.some(name => typeof name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9.:/_-]{0,127}$/.test(name)))) throw new Error(`Invalid plugin service grants: ${path}`);
+    result.pluginServices = services as Record<string, string[]>;
   }
   if (root.general !== undefined) {
     const general = requireObject(root.general, `general must be an object: ${path}`);
@@ -265,6 +271,7 @@ function mergeSettings(
     ...(earlier.enabledPlugins || later.enabledPlugins
       ? { enabledPlugins: { ...earlier.enabledPlugins, ...later.enabledPlugins } }
       : {}),
+    ...(earlier.pluginServices || later.pluginServices ? { pluginServices: { ...earlier.pluginServices, ...later.pluginServices } } : {}),
     ...(earlier.general || later.general ? { general: { ...earlier.general, ...later.general } } : {}),
     ...(earlier.ui || later.ui ? { ui: { ...earlier.ui, ...later.ui } } : {}),
     ...(permissions ? { permissions } : {}),

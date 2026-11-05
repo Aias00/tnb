@@ -1,3 +1,5 @@
+import { ChannelIngressError } from "../../agent/extensions";
+import type { ChannelMessage } from "../../agent/extensions";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { integer, text } from "../runtime/json";
 import type { IncomingEvent, Notification, PullRequestFacts, Source, SourcePort } from "./types";
@@ -25,7 +27,13 @@ export async function responseJson(response: Response, maxBytes = 2 * 1024 * 102
 const networkSignal = (signal: AbortSignal) => AbortSignal.any([signal, AbortSignal.timeout(10000)]);
 export class WebhookSource implements SourcePort {
   constructor(readonly source: Source, readonly env: Record<string, string | undefined>) { credential(env, source.webhook!.secretEnv); }
-  async send(notification: Notification, signal: AbortSignal): Promise<string> {
+  async receive(request: Request, signal: AbortSignal): Promise<IncomingEvent[]> {
+    signal.throwIfAborted(); const body = await request.text();
+    if (Buffer.byteLength(body) > 32 * 1024) throw new ChannelIngressError("Payload too large", 413);
+    if (!authenticate(credential(this.env, this.source.webhook!.secretEnv), request.headers.get("x-tnb-timestamp"), body, request.headers.get("x-tnb-signature"))) throw new ChannelIngressError("Invalid webhook signature or timestamp", 403);
+    return [JSON.parse(body) as IncomingEvent];
+  }
+  async send(notification: ChannelMessage, signal: AbortSignal): Promise<string> {
     const body = JSON.stringify({ notificationId: notification.id, thread: notification.thread, ticketId: notification.ticketId, text: notification.text });
     const timestamp = String(Date.now()), secret = credential(this.env, this.source.webhook!.secretEnv);
     const response = await fetch(this.source.webhook!.outboundUrl, { method: "POST", redirect: "error", signal: networkSignal(signal), body,
@@ -41,7 +49,7 @@ export class TimerSource extends WebhookSource {
     return { events: cursor === window ? [] : [{ externalId: `window:${window}`, actor: "timer", thread: timer.thread, text: `/tnb run ${timer.objective}` }], cursor: window };
   }
 }
-export const notificationBody = (notification: Notification) => `${notification.text}\n\n<!-- tnb-notification:${notification.id} -->`;
+export const notificationBody = (notification: ChannelMessage) => `${notification.text}\n\n<!-- tnb-notification:${notification.id} -->`;
 
 /** API base is constructor injection for local fixtures only, never an incoming/configured URL. */
 export class GitHubSource implements SourcePort {
@@ -79,13 +87,13 @@ export class GitHubSource implements SourcePort {
     }
     return { events, cursor: JSON.stringify({ since: new Date(now).toISOString(), floor: saved.floor }) };
   }
-  async send(notification: Notification, signal: AbortSignal): Promise<string> {
+  async send(notification: ChannelMessage, signal: AbortSignal): Promise<string> {
     integer(Number(notification.thread), "GitHub thread", 1);
     const result = await this.request(`${this.repo()}/issues/${notification.thread}/comments`, signal, { body: notificationBody(notification) });
     if (!Number.isSafeInteger(result.id) || result.id < 1 || result.body !== notificationBody(notification)) throw new Error("Invalid GitHub comment receipt");
     return `github-comment:${result.id}`;
   }
-  async find(notification: Notification, signal: AbortSignal): Promise<string | undefined> {
+  async find(notification: ChannelMessage, signal: AbortSignal): Promise<string | undefined> {
     this.#login ??= text((await this.request("/user", signal)).login, "GitHub login", 128);
     const comments = await this.pages(`${this.repo()}/issues/${notification.thread}/comments`, signal);
     const found = comments.find(comment => comment.body === notificationBody(notification) && comment.user?.login === this.#login && Number.isSafeInteger(comment.id));
@@ -111,5 +119,8 @@ export class GitHubSource implements SourcePort {
   }
 }
 export function sourcePorts(sources: Source[], env: Record<string, string | undefined>): Map<string, SourcePort> {
-  return new Map(sources.map(source => [source.id, source.type === "github" ? new GitHubSource(source, env) : source.type === "timer" ? new TimerSource(source, env) : new WebhookSource(source, env)]));
+  return new Map(sources.map(source => {
+    if (source.type === "plugin") throw new Error("Custom Sources require the host channel registry");
+    return [source.id, source.type === "github" ? new GitHubSource(source, env) : source.type === "timer" ? new TimerSource(source, env) : new WebhookSource(source, env)];
+  }));
 }

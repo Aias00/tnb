@@ -4,31 +4,37 @@ import { lock } from "../utils/lockfile";
 import { DurableRuntime } from "../services/runtime/engine-core";
 import { RuntimeStore } from "../services/runtime/store";
 import { DomainRegistry, type AgentDomainAdapter } from "./domain";
+import type { ExtensionHostOptions, ContributionReference } from "./extensions";
 import { loadAdapterPlugins, type AgentPluginOptions } from "./plugins";
 
 /** Local Bun host. Acquire the owner lock before opening SQLite, including on recovery. */
-export async function openAgentRuntime(options: { directory: string; adapters?: readonly AgentDomainAdapter[]; plugins?: AgentPluginOptions; legacyAdapterId?: string }) {
+export async function openAgentRuntime(options: { directory: string; adapters?: readonly AgentDomainAdapter[]; plugins?: AgentPluginOptions; legacyAdapterId?: string; services?: ExtensionHostOptions["services"]; serviceGrants?: ExtensionHostOptions["grants"] }) {
   await mkdir(options.directory, { recursive: true, mode: 0o700 });
   const unlock = await lock(options.directory, { realpath: true, stale: 5000, update: 1000, retries: 0 });
   let released = false;
   const release = async () => { if (!released) { released = true; await unlock(); } };
   let store: RuntimeStore | undefined;
+  let running: DurableRuntime | undefined;
   let plugins: Awaited<ReturnType<typeof loadAdapterPlugins>> | undefined;
   try {
     plugins = options.plugins ? await loadAdapterPlugins(options.plugins, options.adapters, join(options.directory, "plugin-snapshots")) : undefined;
     const domains = new DomainRegistry(options.adapters, plugins?.registrations, options.legacyAdapterId);
     store = new RuntimeStore(join(options.directory, "state.sqlite"));
-    const runtime = new DurableRuntime(store, options.directory, domains);
+    const runtime = running = new DurableRuntime(store, options.directory, domains);
     // The host retains ownership through plugin disposal and database close.
     await runtime.start(async () => {});
+    await plugins?.extensions.start({ store, services: options.services, grants: options.serviceGrants });
     let closing: Promise<void> | undefined;
-    return { runtime, store, submit: runtime.submitDomain.bind(runtime), plugins: { list: () => plugins?.list() ?? [] },
-      close() { return closing ??= (async () => { try { await runtime.close(); } finally {
+    return { runtime, store, submit: runtime.submitDomain.bind(runtime), plugins: { list: () => plugins?.list() ?? [], extensions: () => plugins?.extensions.list() ?? [],
+        request: (ref: ContributionReference, request: Request) => { if (!plugins) throw new Error("No host plugins are loaded"); return plugins.extensions.handle(ref, request); }, channels: plugins?.extensions.channels },
+      close() { return closing ??= (async () => { try { try { await plugins?.extensions.stop(); } finally { await runtime.close(); } } finally {
         try { await plugins?.close(); } finally { try { store!.close(); } finally { await release(); } }
       } })(); },
     };
   } catch (error) {
-    try { await plugins?.close(); } finally { try { store?.close(); } finally { await release(); } }
+    try { try { await plugins?.extensions.stop(); } finally { await running?.close(); } } finally {
+      try { await plugins?.close(); } finally { try { store?.close(); } finally { await release(); } }
+    }
     throw error;
   }
 }
@@ -38,3 +44,7 @@ export type { RuntimeEvent, DurableRun, DurableTask } from "../services/runtime/
 export { DomainRegistry } from "./domain";
 export type { AgentDomainAdapter, DomainDescriptor, DomainContext, DomainAcceptance, DomainOperation, JsonValue, ResourceClaim, CapabilityGrant, AdapterPluginIdentity, DomainRuntimePolicy } from "./domain";
 export type { AgentPluginOptions, AdapterPluginAPI, AdapterPluginFactory, AdapterPluginState, BuiltinAdapterPlugin } from "./plugins";
+
+export { loadHostPlugins } from "./plugins";
+export type { HostPluginAPI, HostPluginFactory, BuiltinHostPlugin, HostPluginOptions, HostPluginState } from "./plugins";
+export type { PluginApplication, PluginInterface, PluginChannel, ExtensionContext, ActiveExtension, ChannelPort, ChannelDescriptor, ChannelRegistry, PluginStateStore, ContributionReference, ExtensionState } from "./extensions";

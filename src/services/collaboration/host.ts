@@ -1,7 +1,7 @@
 import type { DurableRuntime } from "../runtime/engine-core";
 import { loadCollaborationConfig } from "./config";
 import { CollaborationEngine, NS } from "./engine";
-import { authenticate, credential, sourcePorts } from "./sources";
+import { sourcePorts } from "./sources";
 import type { CollaborationConfig, IncomingEvent, IntakeEvent, Notification, SourcePort, Ticket } from "./types";
 
 /** Optional application over the existing owner/store, never another runtime owner. */
@@ -93,13 +93,13 @@ export class CollaborationHost {
       const match = /^\/sources\/([A-Za-z0-9_-]+)\/events$/.exec(new URL(request.url).pathname);
       if (request.method !== "POST" || !match) return Response.json({ error: "Not found" }, { status: 404 });
       const source = this.engine.source(match[1]!);
-      if (!["webhook", "timer"].includes(source.type)) return Response.json({ error: "Not a webhook-capable Source" }, { status: 403 });
-      const body = await request.text();
-      if (Buffer.byteLength(body) > 32 * 1024) return Response.json({ error: "Payload too large" }, { status: 413 });
-      if (!authenticate(credential(this.env, source.webhook!.secretEnv), request.headers.get("x-tnb-timestamp"), body, request.headers.get("x-tnb-signature"))) return Response.json({ error: "Invalid webhook signature or timestamp" }, { status: 403 });
-      const [event] = await this.engine.ingest(source.id, [JSON.parse(body) as IncomingEvent]);
-      return Response.json({ eventId: event!.id, state: event!.state }, { status: 202 });
-    } catch (error) { return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: 400 }); }
+      const port = this.engine.ports.get(source.id);
+      if (!port?.receive) return Response.json({ error: "Source channel does not accept incoming requests" }, { status: 403 });
+      const batch = await port.receive(request, this.#controller.signal);
+      if (this.#closed) return Response.json({ error: "Collaboration is stopping" }, { status: 503 });
+      const events = await this.engine.ingest(source.id, batch), event = events[0];
+      return Response.json({ eventId: event?.id, state: event?.state, ...(events.length > 1 ? { events: events.map(item => ({ id: item.id, state: item.state })) } : {}) }, { status: 202 });
+    } catch (error) { const status = (error as { status?: number })?.status; return Response.json({ error: error instanceof Error ? error.message : String(error) }, { status: status && [400, 401, 403, 404, 413, 429].includes(status) ? status : 400 }); }
   }
   status(): unknown {
     return { enabled: true, sources: this.config.sources.map(source => ({ id: source.id, type: source.type, error: this.errors.get(source.id), cursor: this.engine.cursor(source.id)?.value })),

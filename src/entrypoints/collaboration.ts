@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { loadCollaborationConfig } from "../services/collaboration/config";
+import { loadSettings } from "../services/settings/load";
 import { runtimeRequest } from "../services/runtime/server";
 import { runRuntimeCommand } from "./runtime";
 
@@ -29,6 +30,7 @@ export async function runCollaborationCommand(options: Parameters<typeof runRunt
     if (["validate", "start", "serve", "restart"].includes(action)) {
       const config = await loadCollaborationConfig(configDir);
       if (!config.enabled) throw new Error("Enable collaboration.json before starting collaboration mode");
+      if (action !== "validate" && (await loadSettings({ configDir, cwd: configDir })).enabledPlugins?.["tnb-collaboration"] === false) throw new Error("Collaboration plugin is disabled; enable tnb-collaboration and restart the runtime");
       if (action === "validate") { options.stdout.write(`${JSON.stringify({ valid: true, sources: config.sources.map(source => ({ id: source.id, type: source.type })) }, null, 2)}\n`); return 0; }
     }
     if (["start", "serve", "restart", "stop"].includes(action)) return runRuntimeCommand({ ...options, argv: ["runtime", ...args] });
