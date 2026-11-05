@@ -66,7 +66,7 @@ test("a failed plugin remains visible while an independent plugin activates", as
   await trustPlugin(f.trust, f.installedRoot); await trustPlugin(f.trust, healthy.installedRoot);
   const host = await openAgentRuntime({ directory: join(f.root, "runtime"), plugins: { ...f.options, roots: [...f.options.roots, ...healthy.options.roots] } });
   try {
-    expect(host.plugins.list().map(plugin => [plugin.name, plugin.status])).toEqual([["fixture-plugin", "failed"], ["healthy-plugin", "active"]]);
+    expect(host.plugins.list().map(plugin => [plugin.name, plugin.status]), JSON.stringify(host.plugins.list())).toEqual([["fixture-plugin", "failed"], ["healthy-plugin", "active"]]);
     expect(host.runtime.domains.prepare({ ...descriptor(), id: "healthy" }).plugin?.name).toBe("healthy-plugin");
   } finally { await host.close(); }
 });

@@ -57,7 +57,11 @@ async function syncTree(directory: string): Promise<void> {
   for (const entry of await readdir(directory, { withFileTypes: true })) {
     const path = join(directory, entry.name);
     if (entry.isDirectory()) await syncTree(path);
-    else if (entry.isFile()) { const handle = await open(path, "r"); try { await handle.sync(); } finally { await handle.close(); } }
+    else if (entry.isFile()) {
+      // Windows FlushFileBuffers requires a writable handle; POSIX permits read-only fsync.
+      const handle = await open(path, process.platform === "win32" ? "r+" : "r");
+      try { await handle.sync(); } finally { await handle.close(); }
+    }
   }
   await syncDirectory(directory);
 }
