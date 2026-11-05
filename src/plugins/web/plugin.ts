@@ -1,12 +1,12 @@
 import packageJson from "../../../package.json";
 import type { BuiltinHostPlugin, HostPluginFactory } from "../../agent/plugins";
-import { TASK_SERVICE, type TaskService } from "../../agent/task-service";
+import { TASK_SERVICE, TASK_SERVICE_REF } from "../../agent/task-service";
 import { hostCodeFingerprint } from "../../agent/plugin-fingerprint";
 import { createWebWorkbench } from "./server";
 
 export const WEB_EXTENSION = { kind: "interface" as const, id: "web", version: "1" };
 export const webSetup: HostPluginFactory = api => api.registerInterface({ id: "web", version: "1", start(context) {
-  const workbench = createWebWorkbench({ tasks: context.service<TaskService>(TASK_SERVICE), signal: context.signal });
+  const workbench = createWebWorkbench({ tasks: context.service(TASK_SERVICE_REF), signal: context.signal });
   context.onDispose(workbench.close);
   return { status: workbench.status, async handle(request) {
     if (request.method === "GET") return Response.json(workbench.status());

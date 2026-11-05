@@ -12,7 +12,9 @@ import { packPlugin } from "../../src/agent/packed-plugin";
 import type { ChannelDescriptor } from "../../src/agent/extensions";
 import { pluginGenerationKey } from "../../src/agent/plugin-generations";
 import { createCollaborationPlugin, COLLABORATION_EXTENSION, CHANNEL_SERVICE } from "../../src/plugins/collaboration/plugin";
-import { COLLABORATION_SERVICE } from "../../src/agent/collaboration-service";
+import { COLLABORATION_SERVICE, COLLABORATION_SERVICE_REF } from "../../src/agent/collaboration-service";
+import { CHANNEL_SERVICE_REF } from "../../src/agent/channel-service";
+import { provideService } from "../../src/agent/services";
 import { createCollaborationService } from "../../src/services/collaboration/runtime-service";
 import { DurableRuntime } from "../../src/services/runtime/engine-core";
 import type { CollaborationConfig } from "../../src/services/collaboration/types";
@@ -133,7 +135,7 @@ test("a failed Source is reported as unavailable while healthy Sources and the c
   const configuration: CollaborationConfig = { enabled: true, sources: [false, true].map(fail => ({ id: fail ? "blocked" : "healthy", type: "plugin", channel: { id: "health", version: "1" }, options: { fail }, actors: ["alice"], controllers: ["alice"], mode: "single", pollIntervalMs: 1000,
     configuration: { workspace: "agent:fixture", allowedWorkspaces: ["agent:fixture"], allowWrite: false, allowShell: false, checks: [], maxTurns: 10, maxRetries: 1, compactThreshold: 10000 } })) };
   const runtime = new DurableRuntime(f.store, join(f.root, "runtime"));
-  await host.extensions.start({ store: f.store, services: new Map<string, unknown>([[CHANNEL_SERVICE, host.extensions.channels], [COLLABORATION_SERVICE, createCollaborationService(runtime, configuration, host.extensions.channels)]]),
+  await host.extensions.start({ store: f.store, serviceProviders: [provideService(CHANNEL_SERVICE_REF, () => host.extensions.channels), provideService(COLLABORATION_SERVICE_REF, scope => createCollaborationService(runtime, configuration, host.extensions.channels, scope.signal))],
     grants: { "tnb-collaboration": [CHANNEL_SERVICE, COLLABORATION_SERVICE] } });
   const response = await host.extensions.handle(COLLABORATION_EXTENSION, new Request("http://localhost/status"));
   const status = await response.json() as { ready: boolean; sources: Array<{ id: string; available: boolean; error?: string }> };

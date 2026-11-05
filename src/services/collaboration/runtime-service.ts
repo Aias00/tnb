@@ -24,7 +24,7 @@ function creation(id: string, admission: Admission) {
     policy: { mode, maxActiveAgents: mode === "single" ? 1 : mode === "multi" ? 4 : 2, maxDelegationDepth: mode === "single" ? 0 : 1 } };
 }
 /** The only host-owned bridge: no Runtime/Store/transaction object crosses the plugin boundary. */
-export function createCollaborationService(runtime: DurableRuntime, configuration: CollaborationConfig, channels?: ChannelRegistry, ownerSignal?: AbortSignal): CollaborationServiceFactory {
+export function createCollaborationService(runtime: DurableRuntime, configuration: CollaborationConfig, channels?: ChannelRegistry, ownerSignal?: AbortSignal, track?: <T>(operation: () => Promise<T>) => Promise<T>): CollaborationServiceFactory {
   const store = runtime.store;
   migrateCollaborationChannels(store);
   const hostLive = () => ownerSignal?.throwIfAborted();
@@ -152,7 +152,7 @@ export function createCollaborationService(runtime: DurableRuntime, configuratio
         });
       },
     });
-    const tasks: CollaborationService["tasks"] = Object.freeze({
+    const tasks: CollaborationService["tasks"] = {
       async admit(sourceId, incoming) {
         taskLive(); const source = currentSource(sourceId);
         if (!incoming || Object.keys(incoming).some(key => !["externalId", "actor", "thread", "text"].includes(key))) throw new Error("Invalid incoming event fields");
@@ -216,7 +216,13 @@ export function createCollaborationService(runtime: DurableRuntime, configuratio
         }
         return summaries;
       },
-    });
+    };
+    // Nested async handles stay owned even when a plugin does not await their promises.
+    if (track) for (const name of ["admit", "create", "apply", "summaries"] as const) {
+      const method = tasks[name].bind(tasks);
+      (tasks as any)[name] = (...args: any[]) => track(() => (method as (...args: any[]) => Promise<unknown>)(...args));
+    }
+    Object.freeze(tasks);
     return Object.freeze({ configuration: () => { taskLive(); return structuredClone(configuration); },
       channel: (sourceId: string) => { taskLive(); if (!channels) throw new Error("Channel registry is unavailable"); return resolveCollaborationChannel(store, configuration, channels, sourceId); }, state, tasks, close: () => { closed = true; } });
   } };

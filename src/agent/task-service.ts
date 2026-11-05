@@ -1,5 +1,6 @@
 import type { RunPresentation, RunDetail } from "../services/runtime/presentation";
 import type { RuntimeEvent } from "../services/runtime/types";
+import { createServiceRef } from "./services";
 
 /** A user-authorized workspace view. No raw runtime, store, host settings or credentials. */
 export type WorkspaceTaskService = {
@@ -13,3 +14,4 @@ export type WorkspaceTaskService = {
 };
 export type TaskService = { open(workspace: string): Promise<WorkspaceTaskService> };
 export const TASK_SERVICE = "tnb.tasks/v1";
+export const TASK_SERVICE_REF = createServiceRef<TaskService>({ id: "tnb.tasks", version: 1, scope: "contribution", methods: { open: true } });

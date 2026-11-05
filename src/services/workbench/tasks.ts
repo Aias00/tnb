@@ -20,10 +20,14 @@ const fields: Record<string, string[]> = {
   ack: ["runId", "noticeId"], reconcile: ["runId", "taskId", "operationId", "result"],
 };
 /** Scope admission is host-side; browser input cannot nominate another workspace or identity. */
-export function createTaskService(options: { runtime: DurableRuntime; configDir: string; env: Record<string, string | undefined>; coding: boolean }): TaskService {
+export function createTaskService(options: { runtime: DurableRuntime; configDir: string; env: Record<string, string | undefined>; coding: boolean; signal?: AbortSignal; track?<T>(operation: () => Promise<T>): Promise<T> }): TaskService {
   const { runtime } = options;
+  const assertLive = () => options.signal?.throwIfAborted();
+  const track = <T>(operation: () => Promise<T>): Promise<T> => options.track ? options.track(operation) : operation();
   return { async open(path) {
+    assertLive();
     text(path, "workspace", 4096); const workspace = await realpath(path);
+    assertLive();
     const sessionId = `web:${digestJson(workspace).slice(0, 32)}`;
     const assertRun = (runId: unknown) => {
       text(runId as string, "Run ID", 128);
@@ -31,19 +35,23 @@ export function createTaskService(options: { runtime: DurableRuntime; configDir:
     };
     return {
       workspace,
-      async info() {
+      info: () => track(async () => {
+        assertLive();
         const catalog = await loadProviderCatalog(options);
+        assertLive();
         const models = Object.values(catalog.providers).flatMap(provider => provider.models.map(model => ({ provider: provider.id, providerName: provider.name, id: model.id, name: model.name })));
         const first = models.find(model => model.provider === options.env.TNB_PROVIDER && (!options.env.TNB_MODEL || model.id === options.env.TNB_MODEL)) ?? models[0];
         return { workspace, coding: options.coding, models, defaults: { provider: first?.provider ?? "", model: first?.id ?? "" } };
-      },
-      list: () => presentRuns(runtime, workspace),
-      async detail(runId) { assertRun(runId); return presentRunDetail(runtime, runId); },
-      events(runId, after) { assertRun(runId); integer(after, "event cursor", 0); return runtime.store.events(runId, after, 100); },
-      attention: (signal, onClose) => questionAttentionResponse(runtime, workspace, signal, onClose),
-      async command(value, signal) {
+      }),
+      list: () => { assertLive(); return presentRuns(runtime, workspace); },
+      detail: runId => track(async () => { assertLive(); assertRun(runId); return presentRunDetail(runtime, runId); }),
+      events(runId, after) { assertLive(); assertRun(runId); integer(after, "event cursor", 0); return runtime.store.events(runId, after, 100); },
+      attention: (signal, onClose) => { assertLive(); return questionAttentionResponse(runtime, workspace, AbortSignal.any([signal, ...(options.signal ? [options.signal] : [])]), onClose); },
+      command: (value, signal) => track(async () => {
+        signal = AbortSignal.any([...(options.signal ? [options.signal] : []), ...(signal ? [signal] : [])]);
         signal?.throwIfAborted();
         if (await realpath(workspace) !== workspace) throw new Error("Workspace identity changed; launch a new view");
+        signal.throwIfAborted();
         if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid task command");
         const input = value as Record<string, unknown>, action = input.action;
         if (typeof action !== "string" || !Object.hasOwn(fields, action) || Object.keys(input).some(key => !["action", "commandId", ...fields[action]!].includes(key))) throw new Error("Unsupported task action or authority field");
@@ -59,6 +67,7 @@ export function createTaskService(options: { runtime: DurableRuntime; configDir:
           validateCapabilitySelection(input);
           if (input.provider !== undefined && typeof input.provider !== "string" || input.model !== undefined && typeof input.model !== "string") throw new Error("Invalid model selection");
           const catalog = await loadProviderCatalog(options);
+          signal.throwIfAborted();
           const selection = resolveProviderSelection(catalog, input.provider as string ?? options.env.TNB_PROVIDER ?? "anthropic", input.model as string | undefined ?? options.env.TNB_MODEL);
           const configuration = { workspace, allowedWorkspaces: [workspace], provider: selection.provider.id, model: selection.model.id,
             allowWrite: input.allowWrite ?? false, allowShell: input.allowShell ?? false, checks: input.checks ?? [],
@@ -85,7 +94,7 @@ export function createTaskService(options: { runtime: DurableRuntime; configDir:
         if (action === "limits" && input.deadline !== undefined) Object.assign(body, { deadline: parseDeadline(input.deadline as string) });
         if (action === "reconcile") text(input.result as string, "confirmed external evidence", 16000);
         return runtimeRequest(options.configDir, "/command", body, signal);
-      },
+      }),
     };
   } };
 }

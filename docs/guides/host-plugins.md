@@ -89,7 +89,7 @@ Coding 持久 Worker 记录选中 Skill/MCP 的包来源，在授权以及 Skill
 
 - identity、独立状态目录、生命周期 signal；状态目录使用宿主生成的路径，不拼接插件任意路径。
 - state.get/list/command：同一 SQLite 中按包名+贡献种类+id+接口版本隔离；变更沿用 command receipt 与 revision CAS。重启不重做已提交命令，冲突输入拒绝；包字节更新不自动删除同接口版本状态。需要数据迁移时由插件显式处理，接口不兼容时提升贡献 version。
-- service(name)：名称必须同时在贡献 manifest 声明、宿主 grants 授予、服务表存在；默认不注入 env、SQLite、控制 token。默认 profile 提供 tnb.runtime.read/v1 和受限的 tnb.tasks/v1 工作目录任务服务；tnb.collaboration/v1 为协作应用提供限定来源、任务归属和状态命名空间的接口，tnb.channels/v1 是渠道注册表；默认宿主已移除 tnb.runtime.internal/v1。其他包使用这些服务前必须由宿主显式授权，详见 [协作服务权限](collaboration-services.md)。
+- service(ref/name)：名称必须同时在贡献 manifest 声明、宿主 grants 授予且存在可用提供者。ServiceRef 进一步核对合同版本、公开方法和 host/contribution 作用域，缓存的受管理根句柄不能越过消费者生命周期；默认不注入 env、SQLite、控制 token。默认 profile 已使用类型化服务工厂提供 tnb.runtime.read/v1、受限的 tnb.tasks/v1、tnb.collaboration/v1 和 tnb.channels/v1；旧 raw services Map 仅保留明确的兼容语义。接入、嵌套资源和清理合同见[类型化服务](plugin-services.md)，业务授权见[协作服务权限](collaboration-services.md)。
 - request(reference, Request)：只能调用自己声明的精确依赖，宿主再次校验目标 active 状态；自动移除 authorization、proxy-authorization、cookie。
 - onDispose：清理回调，启动失败和关闭均逆序执行。部分资源创建后立即登记清理；每个插件负责自己的 timer/listener。清理可保存自己的状态，但不能重新注册贡献或取得新服务。
 

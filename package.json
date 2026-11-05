@@ -53,7 +53,8 @@
     "./sdk": "./src/entrypoints/sdk.ts",
     "./runtime": "./src/services/runtime/index.ts",
     "./agent/plugins": "./src/agent/plugins.ts",
-    "./agent/extensions": "./src/agent/extensions.ts"
+    "./agent/extensions": "./src/agent/extensions.ts",
+    "./agent/services": "./src/agent/services.ts"
   },
   "license": "Apache-2.0",
   "private": true,

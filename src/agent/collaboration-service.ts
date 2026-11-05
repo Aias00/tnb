@@ -4,6 +4,7 @@ import type { WaitView } from "../services/runtime/waits";
 import type { ApplicationRecord, ApplicationQuery } from "../services/runtime/store";
 import type { CollaborationConfig, IncomingEvent, Source } from "../services/collaboration/types";
 import type { ChannelDescriptor } from "./extensions";
+import { createServiceRef } from "./services";
 
 export const COLLABORATION_SERVICE = "tnb.collaboration/v1";
 export type CollaborationStateTransaction = {
@@ -18,6 +19,7 @@ export type CollaborationState = {
   replayCommand<T>(id: string, input: unknown): T | undefined;
 };
 export type CollaborationServiceFactory = { open(signal: AbortSignal): CollaborationService };
+export const COLLABORATION_SERVICE_REF = createServiceRef<CollaborationServiceFactory>({ id: "tnb.collaboration", version: 1, scope: "contribution", methods: { open: true } });
 export type CollaborationService = {
   close(): void;
   configuration(): CollaborationConfig;

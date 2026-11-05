@@ -1,5 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
+import { randomUUID } from "node:crypto";
+import { PluginServiceRegistry } from "./services";
 import { digestJson, encodeJson, text } from "../services/runtime/json";
 import type { PluginAdapterRegistration } from "./domain";
 import type { ChannelGenerationReference } from "./channel-bindings";
@@ -16,12 +18,13 @@ export class ExtensionHost {
   readonly #inFlight = new Set<Promise<unknown>>();
   readonly #connections = new Map<ChannelConnection, string>();
   #options?: ExtensionHostOptions;
+  #services?: PluginServiceRegistry;
   #closed = false;
   #started = false;
   #closing?: Promise<void>;
   #starting?: Promise<void>;
   #removeAbortListener?: () => void;
-  readonly channels: ChannelRegistry = Object.freeze({ descriptor: (input: ChannelDescriptor) => this.channelDescriptor(input), connect: (input: ChannelDescriptor, config: Parameters<ChannelRegistry["connect"]>[1]) => this.connect(input, config) });
+  readonly channels: ChannelRegistry = Object.freeze({ descriptor: (input: ChannelDescriptor) => this.channelDescriptor(input), connect: (input: ChannelDescriptor, config: Parameters<ChannelRegistry["connect"]>[1], signal?: AbortSignal) => this.track(this.connect(input, config, signal)) });
   constructor(registrations: readonly ExtensionRegistration[], readonly adapters: readonly Pick<PluginAdapterRegistration, "adapter">[], readonly root?: string, readonly channelReferences: readonly ChannelGenerationReference[] = []) {
     if (registrations.length > 512) throw new Error("Host extension capacity exceeded");
     for (const registration of registrations) {
@@ -48,6 +51,7 @@ export class ExtensionHost {
       if (options.signal.aborted) { abort(); throw new Error("Plugin startup cancelled"); }
     }
     this.#options = { store: options.store, services: new Map(options.services), grants: structuredClone(options.grants ?? {}) };
+    this.#services = new PluginServiceRegistry(options.serviceProviders, this.#options.services);
     const visiting = new Set<string>(), visited = new Set<string>(), ordered: string[] = [];
     const visit = (id: string) => {
       if (visited.has(id)) return;
@@ -79,8 +83,9 @@ export class ExtensionHost {
       try {
         if (registration.declaration.requires.some(ref => ref.kind !== "adapter" && this.#states.get(key(ref))?.status !== "active")) throw new Error("Plugin dependency did not activate");
         const grants = this.#options.grants?.[registration.plugin.name] ?? [];
-        const unavailable = registration.declaration.services.find(name => !grants.includes(name) || !this.#options!.services?.has(name));
+        const unavailable = registration.declaration.services.find(name => !grants.includes(name) || !this.#services!.has(name));
         if (unavailable) throw new Error(`Plugin service is not granted or unavailable: ${unavailable}`);
+        for (const name of registration.declaration.services) this.#services.assertAvailable(name);
         state.status = "starting";
         const context = await this.context(id);
         this.#order.push(id);
@@ -128,31 +133,35 @@ export class ExtensionHost {
     if (this.#closed || !registration || this.#states.get(id)?.status !== "active") throw new Error("Channel plugin generation is unavailable; do not replace persisted provenance");
     return { id, registration };
   }
-  private async connect(input: ChannelDescriptor, configuration: Parameters<ChannelRegistry["connect"]>[1]): Promise<ChannelConnection> {
+  private async connect(input: ChannelDescriptor, configuration: Parameters<ChannelRegistry["connect"]>[1], signal?: AbortSignal): Promise<ChannelConnection> {
+    signal?.throwIfAborted();
     const descriptor = this.channelDescriptor(input), { id } = this.selectChannel(descriptor);
     encodeJson(configuration, 128 * 1024);
     const context = await this.context(id), controller = new AbortController();
+    const connectionId = `${id}:connection:${randomUUID()}`, combined = AbortSignal.any([context.signal, controller.signal, ...(signal ? [signal] : [])]);
+    const service = this.bindServices(id, connectionId, combined, () => { if (combined.aborted || this.#closed) throw new Error("Channel connection lifetime ended"); });
     let port: ChannelPort | undefined;
     const callbacks: Array<() => void | Promise<void>> = []; let accepting = true;
     const disposeConnection = async () => {
       accepting = false; controller.abort(); const errors: unknown[] = [];
       try { await port?.close?.(); } catch (error) { errors.push(error); }
       for (const callback of callbacks.splice(0).reverse()) { try { await callback(); } catch (error) { errors.push(error); } }
+      try { await this.#services?.closeConsumer(connectionId); } catch (error) { errors.push(error); }
       if (errors.length) throw new AggregateError(errors, "Channel connection cleanup failed");
     };
-    const opening = Promise.resolve().then(() => { context.signal.throwIfAborted(); return (this.#registrations.get(id)!.definition as PluginChannel).connect(structuredClone(configuration), Object.freeze({ ...context, signal: AbortSignal.any([context.signal, controller.signal]), onDispose(callback: () => void | Promise<void>) {
-      if (!accepting || controller.signal.aborted || context.signal.aborted || typeof callback !== "function") throw new Error("Channel connection registration is closed"); callbacks.push(callback);
+    const opening = Promise.resolve().then(() => { combined.throwIfAborted(); return (this.#registrations.get(id)!.definition as PluginChannel).connect(structuredClone(configuration), Object.freeze({ ...context, signal: combined, service, onDispose(callback: () => void | Promise<void>) {
+      if (!accepting || combined.aborted || typeof callback !== "function") throw new Error("Channel connection registration is closed"); callbacks.push(callback);
     } })); });
-    try { port = await this.track(Promise.resolve(opening)); } catch (error) { try { await disposeConnection(); } catch (cleanup) { throw new AggregateError([error, cleanup], "Channel startup and cleanup failed"); } throw error; }
+    try { port = await opening; } catch (error) { try { await disposeConnection(); } catch (cleanup) { throw new AggregateError([error, cleanup], "Channel startup and cleanup failed"); } throw error; }
     if (!port || typeof port.send !== "function" || ["receive", "poll", "find", "observe", "close"].some(name => (port as any)[name] !== undefined && typeof (port as any)[name] !== "function")) {
       await disposeConnection(); throw new Error("Invalid plugin channel port");
     }
-    if (this.#closed || context.signal.aborted) { await disposeConnection(); throw new Error("Plugin host closed while opening channel"); }
+    if (this.#closed || combined.aborted) { await disposeConnection(); throw new Error("Plugin host or consumer closed while opening channel"); }
     let closed = false, closing: Promise<void> | undefined;
     const pending = new Set<Promise<unknown>>();
     const invoke = <T>(apply: (signal: AbortSignal) => Promise<T>, signal: AbortSignal): Promise<T> => {
       if (closed || this.#closed) return Promise.reject(new Error("Plugin channel is closed"));
-      const active = this.track(Promise.resolve().then(() => { const combined = AbortSignal.any([signal, context.signal, controller.signal]); combined.throwIfAborted(); return apply(combined); }));
+      const active = this.track(Promise.resolve().then(() => { const callSignal = AbortSignal.any([signal, combined]); callSignal.throwIfAborted(); return apply(callSignal); }));
       pending.add(active); void active.then(() => pending.delete(active), () => pending.delete(active)); return active;
     };
     const wrapped: ChannelPort = {
@@ -191,6 +200,7 @@ export class ExtensionHost {
     const store = this.#options!.store;
     const assertLive = () => { if (this.#closed || !lifetime.accepting || lifetime.controller.signal.aborted) throw new Error("Plugin contribution lifetime ended"); };
     const assertState = () => { if (lifetime.finished) throw new Error("Plugin state lifetime ended"); };
+    const service = this.bindServices(id, id, lifetime.controller.signal, assertLive);
     const state: PluginStateStore = Object.freeze({
       get: <T>(recordId: string) => { assertState(); return store.applicationRecord<T>(namespace, recordId); },
       list: <T>(afterId = "", limit = 256) => { assertState(); return store.applicationRecords<T>(namespace, afterId, limit); },
@@ -203,11 +213,7 @@ export class ExtensionHost {
       },
     });
     return Object.freeze({ identity: registration.plugin, signal: lifetime.controller.signal, stateDirectory, state,
-      service: <T>(name: string): T => {
-        assertLive();
-        if (!registration.declaration.services.includes(name) || !this.#options!.grants?.[registration.plugin.name]?.includes(name) || !this.#options!.services?.has(name)) throw new Error(`Plugin service access denied: ${name}`);
-        return this.#options!.services!.get(name) as T;
-      },
+      service,
       request: (ref: ContributionReference, request: Request) => {
         assertLive();
         if (!registration.declaration.requires.some(dependency => key(dependency) === key(ref))) throw new Error("Plugin request target was not declared as a dependency");
@@ -219,10 +225,21 @@ export class ExtensionHost {
   private track<T>(promise: Promise<T>): Promise<T> {
     this.#inFlight.add(promise); void promise.then(() => this.#inFlight.delete(promise), () => this.#inFlight.delete(promise)); return promise;
   }
+  private bindServices(id: string, consumerId: string, signal: AbortSignal, assertLive: () => void): ExtensionContext["service"] {
+    const registration = this.#registrations.get(id)!;
+    const resolve = this.#services!.bind(consumerId, { plugin: registration.plugin, contribution: {
+      kind: registration.declaration.kind, id: registration.declaration.id, version: registration.declaration.version,
+    } }, signal, name => {
+      assertLive();
+      if (!registration.declaration.services.includes(name) || !this.#options!.grants?.[registration.plugin.name]?.includes(name)) throw new Error(`Plugin service access denied: ${name}`);
+    });
+    return resolve as ExtensionContext["service"];
+  }
   private async dispose(id: string, deferStateClose = false): Promise<void> {
     const context = this.#contexts.get(id); if (!context || !context.accepting) return;
     context.accepting = false; context.controller.abort(); const errors: unknown[] = [];
     for (const callback of context.callbacks.splice(0).reverse()) { try { await callback(); } catch (error) { errors.push(error); } }
+    try { await this.#services?.closeConsumer(id); } catch (error) { errors.push(error); }
     if (!deferStateClose) context.finished = true;
     if (errors.length) throw new AggregateError(errors, "Plugin contribution cleanup failed");
   }
@@ -233,6 +250,7 @@ export class ExtensionHost {
   }
   private async stopContributions(): Promise<void> {
     this.#closed = true; this.#removeAbortListener?.();
+    this.#services?.stopAdmission();
     for (const context of this.#contexts.values()) context.controller.abort();
     // Startup callbacks observe cancellation and finish before their resources are disposed.
     await this.#starting?.catch(() => undefined);
@@ -245,6 +263,7 @@ export class ExtensionHost {
     }
     await Promise.allSettled([...this.#inFlight]);
     for (const connection of [...this.#connections.keys()]) { try { await connection.close(); } catch (error) { errors.push(error); } }
+    try { await this.#services?.close(); } catch (error) { errors.push(error); }
     for (const context of this.#contexts.values()) context.finished = true;
     for (const state of this.#states.values()) if (state.status === "registered") state.status = "stopped";
     if (errors.length) throw new AggregateError(errors, "Plugin extension shutdown failed");

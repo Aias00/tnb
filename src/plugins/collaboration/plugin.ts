@@ -1,21 +1,22 @@
 import packageJson from "../../../package.json";
 import type { BuiltinHostPlugin, HostPluginFactory } from "../../agent/plugins";
-import type { ChannelConnection, ChannelRegistry } from "../../agent/extensions";
-import { COLLABORATION_SERVICE, type CollaborationServiceFactory } from "../../agent/collaboration-service";
+import type { ChannelConnection } from "../../agent/extensions";
+import { COLLABORATION_SERVICE, COLLABORATION_SERVICE_REF } from "../../agent/collaboration-service";
+import { CHANNEL_SERVICE, CHANNEL_SERVICE_REF } from "../../agent/channel-service";
 import type { SourcePort, PullRequestFacts, Source } from "../../services/collaboration/types";
 import { CollaborationHost } from "../../services/collaboration/host";
 import { hostCodeFingerprint } from "../../agent/plugin-fingerprint";
 import { encodeJson } from "../../services/runtime/json";
 
 export const COLLABORATION_EXTENSION = { kind: "application" as const, id: "collaboration", version: "1" };
-export const CHANNEL_SERVICE = "tnb.channels/v1";
+export { CHANNEL_SERVICE } from "../../agent/channel-service";
 export function collaborationSetup(): HostPluginFactory {
   return api => api.registerApplication({ id: "collaboration", version: "1", async start(context) {
-    const service = context.service<CollaborationServiceFactory>(COLLABORATION_SERVICE).open(context.signal);
+    const service = context.service(COLLABORATION_SERVICE_REF).open(context.signal);
     context.onDispose(service.close);
     const configuration = service.configuration();
     if (!configuration.enabled) return { handle: request => request.method === "GET" ? Response.json({ enabled: false }) : Response.json({ error: "Collaboration is not enabled" }, { status: 400 }), status: () => ({ enabled: false }) };
-    const channels = context.service<ChannelRegistry>(CHANNEL_SERVICE);
+    const channels = context.service(CHANNEL_SERVICE_REF);
     const ports = new Map<string, SourcePort>(), connections: ChannelConnection[] = [];
     const available: Source[] = [], unavailable = new Map<string, string>();
     // Register before opening any channel, so a partial startup always closes earlier connections.
