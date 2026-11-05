@@ -1,34 +1,18 @@
 import { randomUUID } from "node:crypto";
-import type { DurableRuntime, RuntimeConfiguration } from "../runtime/engine-core";
-import type { ApplicationQuery, ApplicationRecord, RuntimeTransaction } from "../runtime/store";
-import { digestJson, integer, text } from "../runtime/json";
-import type { RoutingInput } from "../runtime/routing";
+import type { CollaborationService, CollaborationStateTransaction } from "../../agent/collaboration-service";
+import type { ApplicationQuery, ApplicationRecord } from "../runtime/store";
+import { digestJson, text } from "../runtime/json";
 import { sourceIdentity } from "./config";
 import type { Action, CollaborationConfig, IncomingEvent, IntakeEvent, Notification, Source, SourceCursor, SourcePort, Ticket } from "./types";
 
-export const NS = { events: "collaboration.events", tickets: "collaboration.tickets", outbox: "collaboration.outbox", cursors: "collaboration.cursors" } as const;
-export function eventId(sourceId: string, externalId: string): string { return digestJson({ sourceId, externalId }); }
-export function ticketId(event: string): string { return `t_${event.slice(0, 32)}`; }
-export function parseAction(raw: string): Action | undefined {
-  const input = raw.trim();
-  if (!input.startsWith("/tnb")) return input ? { kind: "followup", text: input } : undefined;
-  let match = /^\/tnb run\s+([\s\S]+)$/.exec(input);
-  if (match) return { kind: "run", text: text(match[1]!, "objective", 4000) };
-  match = /^\/tnb followup\s+(t_[a-f0-9]{32})\s+([\s\S]+)$/.exec(input);
-  if (match) return { kind: "followup", ticketId: match[1], text: match[2]! };
-  match = /^\/tnb answer\s+(t_[a-f0-9]{32})\s+([a-f0-9]{64})\s+(\d+)\s+([\s\S]+)$/.exec(input);
-  if (match) return { kind: "answer", ticketId: match[1]!, waitId: match[2]!, version: integer(Number(match[3]), "question version", 1), text: match[4]! };
-  match = /^\/tnb (pause|resume|cancel)\s+(t_[a-f0-9]{32})$/.exec(input);
-  if (match) return { kind: match[1] as "pause" | "resume" | "cancel", ticketId: match[2]! };
-  match = /^\/tnb bind\s+(t_[a-f0-9]{32})\s+(\d+)$/.exec(input);
-  if (match) return { kind: "bind", ticketId: match[1]!, number: integer(Number(match[2]), "PR number", 1) };
-  throw new Error("Unknown /tnb command; use run, followup, answer, pause, resume, cancel or bind");
-}
+import { NS, eventId, ticketId, parseAction } from "./protocol";
+export { NS, eventId, ticketId, parseAction } from "./protocol";
+
 export class CollaborationEngine {
   readonly store;
   readonly errors = new Map<string, string>();
   #prOffset = 0;
-  constructor(readonly runtime: DurableRuntime, readonly config: CollaborationConfig, readonly ports: Map<string, SourcePort>, readonly clock: () => number = Date.now) { this.store = runtime.store; }
+  constructor(readonly service: CollaborationService, readonly config: CollaborationConfig, readonly ports: Map<string, SourcePort>, readonly clock: () => number = Date.now) { this.store = service.state; }
   source(id: string): Source {
     const source = this.config.sources.find(source => source.id === id);
     if (!this.config.enabled || !source) throw new Error("Collaboration Source is not enabled");
@@ -76,14 +60,10 @@ export class CollaborationEngine {
         if (!action) entry.state = "ignored";
         else if (!(action.kind === "run" ? source.actors : [...source.actors, ...source.controllers]).includes(incoming.actor)) {
           entry.state = "rejected"; entry.error = "Actor is not authorized by this Source";
-        } else if (action.kind === "run") {
-          const configuration = structuredClone(source.configuration);
-          configuration.strategyVersion = 2; configuration.maxModelRequests ??= 256;
-          configuration.domain = this.runtime.domains.prepare(this.runtime.domains.descriptor(configuration));
-          const adapter = this.runtime.domains.resolve(configuration.domain);
-          await adapter.runtime?.normalize?.(configuration, this.runtime.root);
-          entry.configuration = configuration; entry.mode = source.mode;
-        } else if (action.kind === "followup" && !action.ticketId) {
+        } else {
+          Object.assign(entry, await this.service.tasks.admit(sourceId, incoming));
+        }
+        if (entry.state === "pending" && action?.kind === "followup" && !action.ticketId) {
           const candidates = this.records<Ticket>(NS.tickets, { sourceId: source.id, thread: incoming.thread }).map(row => row.value).filter(ticket => this.inScope(ticket, entry) && this.mayContribute(source, ticket, incoming.actor));
           if (candidates.length === 1) action.ticketId = candidates[0]!.id;
           else if (!candidates.length) entry.state = "ignored";
@@ -128,7 +108,7 @@ export class CollaborationEngine {
     }
   }
   async execute(id: string, signal: AbortSignal): Promise<void> {
-    let event = this.store.applicationRecord<IntakeEvent>(NS.events, id)!.value;
+    const event = this.store.applicationRecord<IntakeEvent>(NS.events, id)!.value;
     if (event.state !== "pending" || !event.action) return;
     const action = event.action, commandId = `collab:${id}`;
     let ticket: Ticket;
@@ -136,15 +116,7 @@ export class CollaborationEngine {
       // The admitted configuration is pinned before createRun. Replay before resolving plugins,
       // so a committed Run can be linked even when that plugin generation is now unavailable.
       if (!event.configuration || !event.mode) throw new Error("Admission contract is missing");
-      const configuration = event.configuration, mode = event.mode;
-      const input = { commandId, objective: action.text, configuration, tasks: undefined, deadline: undefined, source: this.routingSource(event, configuration), successorOf: undefined,
-        policy: { mode, maxActiveAgents: mode === "single" ? 1 : mode === "multi" ? 4 : 2, maxDelegationDepth: mode === "single" ? 0 : 1 } };
-      let created = this.runtime.commands.replayCreateRun(input);
-      if (!created) {
-        const source = this.source(event.sourceId);
-        if (sourceIdentity(source) !== event.identity || !source.actors.includes(event.incoming.actor)) throw new Error("Admission authority or Source transport identity changed");
-        created = await this.runtime.submit({ commandId, objective: action.text, configuration, mode, source: input.source });
-      }
+      const created = await this.service.tasks.create(id);
       ticket = { id: ticketId(id), sourceId: event.sourceId, identity: event.identity, thread: event.incoming.thread, actor: event.incoming.actor,
         objective: action.text, eventId: id, runId: created.run.runId, createdAt: event.receivedAt, state: "watching", status: created.run.status, delivery: "executing" };
       this.store.command(`collab-link:${id}`, { kind: "collaboration.link", id, runId: ticket.runId }, this.clock(), tx => {
@@ -158,26 +130,17 @@ export class CollaborationEngine {
     const selected = action.ticketId && this.store.applicationRecord<Ticket>(NS.tickets, action.ticketId)?.value;
     if (!selected || !this.inScope(selected, event)) throw new Error("Ticket is not in the original Source/thread");
     ticket = selected;
-    const configuration = this.runtime.configuration(ticket.runId), routing = this.routingSource(event, configuration);
-    // Link an already committed operation before checking today's admission list. This is
-    // recovery of an observed action, not fresh authority to execute a revoked command.
-    let committed: unknown;
-    if (action.kind === "followup") {
-      const receipt = this.store.replayCommand<{ status: string }>(commandId, { kind: "input.route", commandId, runId: ticket.runId, source: { ...routing, rawText: action.text } });
-      committed = receipt?.status === "accepted";
-    } else if (action.kind === "answer") committed = this.store.replayCommand(commandId, { kind: "wait.answer", input: { commandId, runId: ticket.runId, waitId: action.waitId, expectedVersion: action.version, answer: action.text, source: routing } });
-    else if (action.kind === "bind") committed = this.store.replayCommand(commandId, { kind: "collaboration.bind", ticketId: ticket.id, number: action.number });
-    else if (event.prepared) committed = this.store.replayCommand(commandId, { kind: `run.${action.kind}`, input: { commandId, runId: ticket.runId, expectedRevision: event.prepared.revision, source: routing } });
-    if (committed) { this.updateEvent(id, current => ({ ...current, state: "processed", ticketId: ticket.id })); return; }
+    if (action.kind !== "bind") {
+      await this.service.tasks.apply(id, ticket.id);
+      this.updateEvent(id, current => ({ ...current, state: "processed", ticketId: ticket.id })); return;
+    }
+    if (this.store.replayCommand(commandId, { kind: "collaboration.bind", ticketId: ticket.id, number: action.number })) {
+      this.updateEvent(id, current => ({ ...current, state: "processed", ticketId: ticket.id })); return;
+    }
     const source = this.source(event.sourceId);
     if (sourceIdentity(source) !== event.identity) throw new Error("Source transport identity changed; original event remains blocked");
-    const controlled = ["pause", "resume", "cancel", "bind"].includes(action.kind);
-    if (controlled ? !source.controllers.includes(event.incoming.actor) : !this.mayContribute(source, ticket, event.incoming.actor)) throw new Error("Actor cannot control this ticket");
-    if (action.kind === "followup") {
-      const decision = this.runtime.router.followup({ commandId, runId: ticket.runId, source: { ...routing, rawText: action.text } });
-      if (decision.status !== "accepted") throw new Error(`Followup requires local resolution: ${decision.reason}`);
-    } else if (action.kind === "answer") this.runtime.waits.answer({ commandId, runId: ticket.runId, waitId: action.waitId, expectedVersion: action.version, answer: action.text, source: routing });
-    else if (action.kind === "bind") {
+    if (!source.controllers.includes(event.incoming.actor)) throw new Error("Actor cannot control this ticket");
+    if (action.kind === "bind") {
       const port = this.ports.get(source.id);
       if (source.type !== "github" || !port?.inspectPR) throw new Error("PR binding requires a GitHub Source");
       const bindingInput = { kind: "collaboration.bind", ticketId: ticket.id, number: action.number };
@@ -190,23 +153,8 @@ export class CollaborationEngine {
           this.enqueue(tx, `pr:${ticket.id}:${digestJson(pr)}`, ticket, `${ticket.id} 已绑定 PR #${pr.number}\nhead: ${pr.head}\n${pr.url}`); return true;
         });
       }
-    } else {
-      if (!event.prepared) {
-        const run = this.store.getRun(ticket.runId)!;
-        event = this.updateEvent(id, current => ({ ...current, prepared: { runId: run.runId, revision: run.revision } }));
-      }
-      const input = { commandId, runId: ticket.runId, expectedRevision: event.prepared!.revision, source: routing };
-      if (action.kind === "pause") this.runtime.commands.pauseRun(input);
-      else if (action.kind === "cancel") this.runtime.commands.cancelRun(input);
-      else if (!this.store.replayCommand(commandId, { kind: "run.resume", input })) {
-        try { await this.runtime.resume(ticket.runId, commandId, input.expectedRevision, routing); }
-        catch (error) { if (!this.store.replayCommand(commandId, { kind: "run.resume", input })) throw error; }
-      }
     }
     this.updateEvent(id, current => ({ ...current, state: "processed", ticketId: ticket.id }));
-  }
-  routingSource(event: IntakeEvent, configuration: RuntimeConfiguration): RoutingInput {
-    return { source: "api", inputId: event.id, workspace: configuration.workspace, sessionId: `collab:${digestJson({ source: event.sourceId, thread: event.incoming.thread }).slice(0, 48)}`, rawText: event.incoming.text };
   }
   updateEvent(id: string, update: (value: IntakeEvent) => IntakeEvent, expectedRevision?: number): IntakeEvent {
     return this.store.command(randomUUID(), { kind: "collaboration.event", id }, this.clock(), tx => {
@@ -255,22 +203,16 @@ export class CollaborationEngine {
     if (inspectPR) await this.inspectPullRequests(signal);
     for (const record of this.records<Ticket>(NS.tickets, { state: "watching" })) {
       if (signal.aborted) return;
-      const ticket = record.value, run = this.store.getRun(ticket.runId)!, pr = ticket.pr;
+      const ticket = record.value, run = this.service.tasks.run(ticket.runId), pr = ticket.pr;
       const terminal = ["succeeded", "failed", "cancelled"].includes(run.status);
       const delivery: Ticket["delivery"] = pr?.merged ? "merged" : pr?.state === "closed" ? "closed" : !terminal ? "executing" : pr ? "awaiting-pr" : "completed";
-      const questions = this.runtime.waits.questions(run.runId);
+      const questions = this.service.tasks.questions(run.runId);
       const unchanged = ticket.status === run.status && ticket.delivery === delivery && digestJson(ticket.pr ?? null) === digestJson(pr ?? null);
       const questionMissing = questions.some(q => !this.store.applicationRecord(NS.outbox, digestJson({ key: `question:${ticket.id}:${q.waitId}:${q.version}` })));
       const statusKey = terminal ? `result:${ticket.id}:${run.status}` : run.status === "paused" ? `paused:${ticket.id}:${run.revision}` : undefined;
       if (unchanged && !questionMissing && (!statusKey || this.store.applicationRecord(NS.outbox, digestJson({ key: statusKey })))) continue;
       // Read only the root acceptance summary; full evidence remains in the runtime result endpoint.
-      const summaries: string[] = [];
-      if (terminal) for (const task of this.store.tasks(run.runId).filter(task => !task.parentTaskId)) {
-        if (task.resultRef) {
-          const result = await this.runtime.artifacts.get(task.resultRef) as { report?: unknown; acceptance?: unknown; checks?: unknown };
-          summaries.push(`${task.key}: ${task.status}; acceptance=${JSON.stringify(result.acceptance ?? "recorded")}; checks=${JSON.stringify(result.checks ?? []).slice(0, 2500)}\n${typeof result.report === "string" ? result.report.slice(0, 7000) : ""}\n完整证据：tnb runtime result ${run.runId} --task ${task.taskId}`);
-        } else summaries.push(`${task.key}: ${task.status}${task.error ? `; ${task.error.slice(0, 1000)}` : ""}`);
-      }
+      const summaries = terminal ? await this.service.tasks.summaries(run.runId) : [];
       this.store.command(randomUUID(), { kind: "collaboration.project", ticketId: ticket.id, revision: run.revision }, this.clock(), tx => {
         const current = tx.applicationRecord<Ticket>(NS.tickets, ticket.id)!;
         if (current.revision !== record.revision) return false; // A newer PR/binding fact arrived while reading acceptance artifacts.
@@ -288,7 +230,7 @@ export class CollaborationEngine {
       });
     }
   }
-  enqueue(tx: RuntimeTransaction, key: string, target: Pick<Notification, "sourceId" | "identity"> & { thread?: string; id?: string; incoming?: IncomingEvent }, body: string, question?: Notification["question"]): void {
+  enqueue(tx: CollaborationStateTransaction, key: string, target: Pick<Notification, "sourceId" | "identity"> & { thread?: string; id?: string; incoming?: IncomingEvent }, body: string, question?: Notification["question"]): void {
     const id = digestJson({ key });
     if (tx.applicationRecord(NS.outbox, id)) return;
     const thread = "incoming" in target && target.incoming ? target.incoming.thread : target.thread!;
@@ -320,7 +262,7 @@ export class CollaborationEngine {
       if (signal.aborted) return;
       const notification = row.value, source = this.config.sources.find(source => source.id === notification.sourceId), port = this.ports.get(notification.sourceId);
       if (!source || !port || sourceIdentity(source) !== notification.identity) return;
-      if (notification.question && !this.runtime.waits.questions(notification.question.runId).some(q => q.waitId === notification.question!.waitId && q.version === notification.question!.version)) {
+      if (notification.question && !this.service.tasks.questions(notification.question.runId).some(q => q.waitId === notification.question!.waitId && q.version === notification.question!.version)) {
         this.setNotification(row.id, "suppressed", undefined, "Question is no longer open at the notified version"); return;
       }
       this.setNotification(row.id, "dispatched");

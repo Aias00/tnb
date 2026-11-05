@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { DurableRuntime, type RuntimeWorkerFactory } from "../../src/services/runtime/engine";
 import { DurableRuntime as CoreRuntime } from "../../src/services/runtime/engine-core";
 import { RuntimeStore } from "../../src/services/runtime/store";
+import { createCollaborationService } from "../../src/services/collaboration/runtime-service";
 import { CollaborationHost } from "../../src/services/collaboration/host";
 import { CollaborationEngine, eventId, NS, ticketId } from "../../src/services/collaboration/engine";
 import { parseCollaborationConfig } from "../../src/services/collaboration/config";
@@ -27,7 +28,7 @@ async function fixture(transport: ModelTransport = { async *stream() { yield* re
   const config = await parseCollaborationConfig({ enabled: true, listen: { hostname: "127.0.0.1", port: 19999 }, sources: [{ id: "chat", type: "webhook", actors: ["alice", "bob"], controllers: ["admin"],
     configuration: { workspace, allowWrite: false, allowShell: false, checks: [] }, mode: "single", webhook: { secretEnv: "BRIDGE_KEY", outboundUrl: "http://127.0.0.1:19998/reply" } }] });
   const delivered: Notification[] = [], ports = new Map<string, SourcePort>([["chat", { async send(notification) { delivered.push(notification as Notification); return `receipt:${notification.id}`; } }]]);
-  const engine = new CollaborationEngine(runtime, config, ports);
+  const engine = new CollaborationEngine(createCollaborationService(runtime, config).open(signal()), config, ports);
   const incoming = (id: string, text = "/tnb run Inspect the repository", actor = "alice", thread = "thread-1"): IncomingEvent => ({ externalId: id, text, actor, thread });
   const ticket = (id: string) => store.applicationRecord<Ticket>(NS.tickets, ticketId(eventId("chat", id)))!.value;
   return { root, state, database, store, runtime, factory, config, ports, engine, delivered, incoming, ticket };
@@ -55,7 +56,7 @@ test("a committed Run replays after the ticket-link crash even if the original p
   expect(f.store.runs()).toHaveLength(1); expect(f.engine.records(NS.tickets)).toHaveLength(0);
   f.config.sources[0]!.actors = []; // revocation cannot orphan an already committed Run
   const recovered = new CoreRuntime(f.store, f.state); // intentionally no installed Coding adapter
-  const engine = new CollaborationEngine(recovered, f.config, f.ports);
+  const engine = new CollaborationEngine(createCollaborationService(recovered, f.config).open(signal()), f.config, f.ports);
   await engine.process(signal());
   expect(f.store.runs()).toHaveLength(1); expect(engine.records<Ticket>(NS.tickets)[0]?.value.runId).toBe(f.store.runs()[0]!.runId);
 });
@@ -108,7 +109,7 @@ test("uncertain sends survive restart, require evidence for retry, and projectio
   f.ports.set("chat", { async send() { sends++; return "verified-receipt"; } });
   await flush(f.engine); expect(sends).toBe(2); expect(f.store.applicationRecord<Notification>(NS.outbox, row.id)?.value.state).toBe("sent");
   f.engine.setNotification(row.id, "dispatched");
-  const restarted = new CollaborationEngine(f.runtime, f.config, f.ports); restarted.recoverOutbox();
+  const restarted = new CollaborationEngine(createCollaborationService(f.runtime, f.config).open(signal()), f.config, f.ports); restarted.recoverOutbox();
   expect(f.store.applicationRecord<Notification>(NS.outbox, row.id)?.value.state).toBe("unknown"); await flush(restarted); expect(sends).toBe(2);
   await f.engine.project(signal(), false); const before = f.store.snapshot().byteLength;
   for (let i = 0; i < 10; i++) await f.engine.project(signal(), false);
@@ -149,22 +150,25 @@ test("SIGKILL between createRun and ticket linkage reopens SQLite and links exac
   const f = await fixture(); await f.engine.ingest("chat", [f.incoming("killed")]); f.store.close();
   const imports = new URL("../../src/services/runtime/engine.ts", import.meta.url).pathname;
   const storeModule = new URL("../../src/services/runtime/store.ts", import.meta.url).pathname;
+  const serviceModule = new URL("../../src/services/collaboration/runtime-service.ts", import.meta.url).pathname;
   const collaborationModule = new URL("../../src/services/collaboration/engine.ts", import.meta.url).pathname;
   const child = Bun.spawn([process.execPath, "-e", `
     import { DurableRuntime } from ${JSON.stringify(imports)};
     import { RuntimeStore } from ${JSON.stringify(storeModule)};
     import { CollaborationEngine } from ${JSON.stringify(collaborationModule)};
+    import { createCollaborationService } from ${JSON.stringify(serviceModule)};
     const store = new RuntimeStore(process.env.FIXTURE_DB);
     const runtime = new DurableRuntime(store, process.env.FIXTURE_STATE, async () => { throw new Error('unused'); });
     const submit = runtime.submit.bind(runtime);
     runtime.submit = async input => { await submit(input); process.kill(process.pid, 'SIGKILL'); throw new Error('unreachable'); };
-    const engine = new CollaborationEngine(runtime, JSON.parse(process.env.FIXTURE_CONFIG), new Map());
+    const config = JSON.parse(process.env.FIXTURE_CONFIG);
+    const engine = new CollaborationEngine(createCollaborationService(runtime, config).open(new AbortController().signal), config, new Map());
     await engine.execute(process.env.FIXTURE_EVENT, new AbortController().signal);
   `], { env: { ...process.env, FIXTURE_DB: f.database, FIXTURE_STATE: f.state, FIXTURE_CONFIG: JSON.stringify(f.config), FIXTURE_EVENT: eventId("chat", "killed") }, stdout: "pipe", stderr: "pipe" });
   expect(await child.exited).not.toBe(0);
   const store = new RuntimeStore(f.database); stores.push(store); expect(store.runs()).toHaveLength(1);
   const originalId = store.runs()[0]!.runId;
-  const core = new CoreRuntime(store, f.state), engine = new CollaborationEngine(core, f.config, f.ports);
+  const core = new CoreRuntime(store, f.state), engine = new CollaborationEngine(createCollaborationService(core, f.config).open(signal()), f.config, f.ports);
   await engine.process(signal()); expect(store.runs()).toHaveLength(1); expect(engine.records<Ticket>(NS.tickets)[0]?.value.runId).toBe(originalId);
 });
 
@@ -180,7 +184,7 @@ test("a stalled Source does not block automatic questions and all network lanes 
     await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true }));
     aborted = true; throw new Error("aborted");
   } });
-  const host = new CollaborationHost(f.runtime, { ...f.config, listen: undefined }, {}, f.ports);
+  const host = new CollaborationHost(createCollaborationService(f.runtime, f.config).open(signal()), { ...f.config, listen: undefined }, f.ports);
   try {
     await host.start(); await polling.promise;
     await host.engine.ingest("chat", [f.incoming("while-polling")]);
@@ -225,7 +229,7 @@ test("a committed control is linked after recovery even when its actor has since
   await expect(f.engine.execute(eventId("chat", incoming.externalId), signal())).rejects.toThrow("committed control");
   expect(f.store.getRun(ticket.runId)?.status).toBe("paused");
   f.config.sources[0]!.controllers = [];
-  const recovered = new CollaborationEngine(f.runtime, f.config, f.ports); await recovered.process(signal());
+  const recovered = new CollaborationEngine(createCollaborationService(f.runtime, f.config).open(signal()), f.config, f.ports); await recovered.process(signal());
   expect(f.store.applicationRecord<IntakeEvent>(NS.events, eventId("chat", incoming.externalId))?.value.state).toBe("processed");
   expect(f.store.events(ticket.runId).filter(event => event.type === "run.paused")).toHaveLength(1);
 });

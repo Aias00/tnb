@@ -1,7 +1,5 @@
-import type { DurableRuntime } from "../runtime/engine-core";
-import { loadCollaborationConfig } from "./config";
+import type { CollaborationService } from "../../agent/collaboration-service";
 import { CollaborationEngine, NS } from "./engine";
-import { sourcePorts } from "./sources";
 import type { CollaborationConfig, IncomingEvent, IntakeEvent, Notification, SourcePort, Ticket } from "./types";
 
 /** Optional application over the existing owner/store, never another runtime owner. */
@@ -19,13 +17,13 @@ export class CollaborationHost {
   readonly #requests = new Set<Promise<Response>>();
   #lastPR = 0;
   #lastPoll = new Map<string, number>();
-  constructor(readonly runtime: DurableRuntime, readonly config: CollaborationConfig, readonly env: Record<string, string | undefined>, ports?: Map<string, SourcePort>) {
-    this.engine = new CollaborationEngine(runtime, config, ports ?? sourcePorts(config.sources, env));
+  constructor(readonly service: CollaborationService, readonly config: CollaborationConfig, ports: Map<string, SourcePort>) {
+    this.engine = new CollaborationEngine(service, config, ports);
   }
-  static async open(runtime: DurableRuntime, directory: string, env: Record<string, string | undefined>): Promise<CollaborationHost | undefined> {
-    const config = await loadCollaborationConfig(directory);
+  static async open(service: CollaborationService, ports: Map<string, SourcePort>): Promise<CollaborationHost | undefined> {
+    const config = service.configuration();
     if (!config.enabled) return undefined;
-    const host = new CollaborationHost(runtime, config, env);
+    const host = new CollaborationHost(service, config, ports);
     try { await host.start(); return host; } catch (error) { await host.close(); throw error; }
   }
   async start(): Promise<void> {
@@ -113,7 +111,7 @@ export class CollaborationHost {
     if (request.method === "GET") {
       if (kind === "status") return this.status();
       if (!["events", "tickets", "outbox"].includes(kind)) throw new Error("Unknown collaboration inventory");
-      return this.runtime.store.applicationRecords(NS[kind as "events" | "tickets" | "outbox"], url.searchParams.get("after") ?? "");
+      return this.service.state.applicationRecords(NS[kind as "events" | "tickets" | "outbox"], url.searchParams.get("after") ?? "");
     }
     if (request.method !== "POST") throw new Error("Unknown collaboration method");
     const input = await request.json() as { action: string; id: string; ticketId: string; revision: number; decision: "sent" | "retry"; evidence: string };

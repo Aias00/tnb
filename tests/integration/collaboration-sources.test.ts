@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseCollaborationConfig, loadCollaborationConfig, sourceIdentity } from "../../src/services/collaboration/config";
 import { authenticate, GitHubSource, notificationBody, signature, TimerSource, WebhookSource } from "../../src/services/collaboration/sources";
+import { createCollaborationService } from "../../src/services/collaboration/runtime-service";
 import { CollaborationHost } from "../../src/services/collaboration/host";
 import { NS } from "../../src/services/collaboration/engine";
 import type { Notification, Source, Ticket } from "../../src/services/collaboration/types";
@@ -127,7 +128,25 @@ test("closing aborts and drains a source scan before returning; failures cannot 
   const runtime = new DurableRuntime(store, join(f.root, "control", "runtime"), async () => { throw new Error("unused"); });
   const entered = Promise.withResolvers<void>(), stopped = Promise.withResolvers<void>(); let drained = false;
   const config = { ...f.config, listen: undefined };
-  const host = new CollaborationHost(runtime, config, env, new Map([["bridge", { async send() { return "none"; }, async poll(_cursor, signal) { entered.resolve(); await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true })); drained = true; stopped.resolve(); throw new Error("aborted"); } }]]));
+  const host = new CollaborationHost(createCollaborationService(runtime, config).open(new AbortController().signal), config, new Map([["bridge", { async send() { return "none"; }, async poll(_cursor, signal) { entered.resolve(); await new Promise<void>(resolve => signal.addEventListener("abort", () => resolve(), { once: true })); drained = true; stopped.resolve(); throw new Error("aborted"); } }]]));
   await host.start(); await entered.promise; await host.close(); await stopped.promise;
   expect(drained).toBe(true); expect(host.engine.cursor("bridge")).toBeUndefined();
+});
+
+test("an independently installed collaboration application runs with the scoped bridge and no Runtime/env injection", async () => {
+  const f = await fixture(), configDir = join(f.root, "installed-settings"), packageDir = join(f.root, "application-package");
+  await mkdir(configDir); await mkdir(packageDir);
+  const { cp } = await import("node:fs/promises"), { fileURLToPath } = await import("node:url");
+  const { installLocalPlugin } = await import("../../src/services/plugins/management"), { trustPlugin, pluginTrustStorePath } = await import("../../src/services/plugins/trust");
+  const built = await Bun.build({ entrypoints: [fileURLToPath(new URL("../../src/plugins/collaboration/plugin.ts", import.meta.url))], target: "bun", outdir: packageDir, naming: "index.mjs" }); expect(built.success).toBe(true);
+  await cp(new URL("../../src/plugins/collaboration/plugin.json", import.meta.url), join(packageDir, "plugin.json"));
+  const installed = await installLocalPlugin({ source: packageDir, targetRoot: join(configDir, "plugins"), sourceType: "user" }); await trustPlugin(pluginTrustStorePath(configDir), installed.root);
+  await writeFile(join(configDir, "collaboration.json"), JSON.stringify({ enabled: true, sources: [] }));
+  const state = join(configDir, "runtime"), store = new RuntimeStore(join(state, "state.sqlite")); stores.push(store);
+  const runtime = new DurableRuntime(store, state, async () => { throw new Error("No model is expected"); }), controller = new AbortController(), ready = Promise.withResolvers<void>();
+  const done = serveDurableRuntime({ configDir, runtime, env: {}, signal: controller.signal, ready: () => ready.resolve() }); cleanups.push(async () => { controller.abort(); await done; });
+  await Promise.race([ready.promise, done.then(() => { throw new Error("Owner exited before ready"); })]);
+  expect((await runtimeRequest(configDir, "/collaboration") as { enabled: boolean }).enabled).toBe(true);
+  expect((await runtimeRequest(configDir, "/plugins") as Array<{ name: string; root: string }>).find(item => item.name === "tnb-collaboration")?.root).toBe(installed.root);
+  expect(store.runs()).toHaveLength(0);
 });

@@ -125,3 +125,5 @@ tnb collaboration outbox-resolve NOTIFICATION_ID --revision N --decision retry -
 ## 当前交付与后续
 
 已交付的是显式接单和现有执行内核的完整协作链路。独立模型 Router、厂商原生卡片、自动创建/推送/合并 PR、启动服务注册、无人值守的外部写入重试和自动归档未包含。机器人回复的成功报告以 Run 的实际验收证据为依据，不把模型自然结束当成验证通过。
+
+协作应用现通过受限任务与状态服务接入宿主，旧高权限桥已移除，见 [协作服务权限](collaboration-services.md)。CLI、渠道命令和历史工单协议保持兼容。

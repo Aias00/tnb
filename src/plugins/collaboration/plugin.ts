@@ -1,21 +1,21 @@
 import packageJson from "../../../package.json";
 import type { BuiltinHostPlugin, HostPluginFactory } from "../../agent/plugins";
 import type { ChannelConnection, ChannelRegistry } from "../../agent/extensions";
-import type { DurableRuntime } from "../../services/runtime/engine-core";
+import { COLLABORATION_SERVICE, type CollaborationServiceFactory } from "../../agent/collaboration-service";
 import type { SourcePort, PullRequestFacts } from "../../services/collaboration/types";
 import { CollaborationHost } from "../../services/collaboration/host";
-import { loadCollaborationConfig } from "../../services/collaboration/config";
 import { hostCodeFingerprint } from "../../agent/plugin-fingerprint";
 import { digestJson, encodeJson } from "../../services/runtime/json";
 
 export const COLLABORATION_EXTENSION = { kind: "application" as const, id: "collaboration", version: "1" };
-export const INTERNAL_RUNTIME_SERVICE = "tnb.runtime.internal/v1";
 export const CHANNEL_SERVICE = "tnb.channels/v1";
-export function collaborationSetup(settings: { configDir: string; env: Record<string, string | undefined> }): HostPluginFactory {
+export function collaborationSetup(): HostPluginFactory {
   return api => api.registerApplication({ id: "collaboration", version: "1", async start(context) {
-    const configuration = await loadCollaborationConfig(settings.configDir);
+    const service = context.service<CollaborationServiceFactory>(COLLABORATION_SERVICE).open(context.signal);
+    context.onDispose(service.close);
+    const configuration = service.configuration();
     if (!configuration.enabled) return { handle: request => request.method === "GET" ? Response.json({ enabled: false }) : Response.json({ error: "Collaboration is not enabled" }, { status: 400 }), status: () => ({ enabled: false }) };
-    const runtime = context.service<DurableRuntime>(INTERNAL_RUNTIME_SERVICE), channels = context.service<ChannelRegistry>(CHANNEL_SERVICE);
+    const channels = context.service<ChannelRegistry>(CHANNEL_SERVICE);
     const ports = new Map<string, SourcePort>(), connections: ChannelConnection[] = [];
     // Register before opening any channel, so a partial startup always closes earlier connections.
     context.onDispose(async () => { const errors: unknown[] = []; for (const connection of connections.reverse()) { try { await connection.close(); } catch (error) { errors.push(error); } } if (errors.length) throw new AggregateError(errors, "Channel cleanup failed"); });
@@ -35,19 +35,14 @@ export function collaborationSetup(settings: { configDir: string; env: Record<st
         return facts;
       } } : {}) });
     }
-    const host = new CollaborationHost(runtime, configuration, settings.env, ports);
+    const host = new CollaborationHost(service, configuration, ports);
     context.onDispose(() => host.close());
     await host.start();
     return { handle: async request => Response.json(await host.resource(request)), status: () => JSON.parse(encodeJson(host.status())) };
   } });
 }
-export async function createCollaborationPlugin(settings: { configDir: string; env: Record<string, string | undefined> }): Promise<BuiltinHostPlugin> {
+export async function createCollaborationPlugin(): Promise<BuiltinHostPlugin> {
   return { identity: { name: "tnb-collaboration", version: packageJson.version, fingerprint: await hostCodeFingerprint() },
-    extensions: [{ ...COLLABORATION_EXTENSION, entry: "index.mjs", services: [INTERNAL_RUNTIME_SERVICE, CHANNEL_SERVICE], requires: [] }], setup: collaborationSetup(settings) };
+    extensions: [{ ...COLLABORATION_EXTENSION, entry: "index.mjs", services: [COLLABORATION_SERVICE, CHANNEL_SERVICE], requires: [] }], setup: collaborationSetup() };
 }
-const setup: HostPluginFactory = api => {
-  const settings = api.configuration as { configDir: string; env: Record<string, string | undefined> } | undefined;
-  if (!settings?.configDir || !settings.env) throw new Error("Collaboration plugin requires host settings");
-  return collaborationSetup(settings)(api);
-};
-export default setup;
+export default collaborationSetup();
