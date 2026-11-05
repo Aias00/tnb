@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { serveDurableRuntime, runtimeRequest, runtimePaths } from "../../src/services/runtime/server";
 import { createRuntimeWorkerFactory } from "../../src/services/runtime/worker";
 import type { RuntimeConfiguration } from "../../src/services/runtime/engine";
-import { runRuntimeCommand } from "../../src/entrypoints/runtime";
+import { runRuntimeChatCommand, runRuntimeCommand } from "../../src/entrypoints/runtime";
 import { acquireWorkspace } from "../../src/services/runtime/workspace";
 import { installLocalPlugin } from "../../src/services/plugins/management";
 import { trustPlugin, revokePluginTrust, pluginTrustStorePath } from "../../src/services/plugins/trust";
@@ -72,6 +72,9 @@ test("the default service exposes its coding plugin, verifies a real write in th
   expect(await runRuntimeCommand({ argv: ["runtime", "plugins", "--config-dir", f.configDir], cwd: f.workspace, env: process.env,
     stdout: { write: text => { output += text; } }, stderr: { write: text => { throw new Error(text); } } })).toBe(0);
   expect(JSON.parse(output)[0]).toMatchObject({ name: "tnb-coding", status: "active", root: "builtin:tnb-coding" });
+  const chat = await runRuntimeChatCommand({ args: ["plugins"], cwd: f.workspace, workspace: f.workspace, configDir: f.configDir,
+    env: process.env, provider: "fixture", model: "fixture", sessionId: "plugin-status" });
+  expect(JSON.parse(chat)[0]).toMatchObject({ name: "tnb-coding", status: "active" });
   const configuration = { ...f.config, allowWrite: true, checks: ["test -f result.ts"] };
   const submitted = await runtimeRequest(f.configDir, "/command", { action: "submit", commandId: "plugin-write", objective: "Write and verify result.ts", mode: "single", configuration }) as { run: { runId: string } };
   expect((await terminal(f.configDir, submitted.run.runId)).run.status).toBe("succeeded");

@@ -142,7 +142,7 @@ export type RuntimeChatOptions = { args: string[]; cwd: string; workspace: strin
   env: Record<string, string | undefined>; provider: string; model: string; sessionId: string; sourceText?: string };
 export async function runRuntimeChatCommand(options: RuntimeChatOptions): Promise<string> {
   const args = options.args.length ? [...options.args] : ["list"]; const action = args[0]!;
-  if (!["followup", "routing", "submit", "list", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel", "storage", "start", "restart", "stop"].includes(action)) throw new Error("/runtime supports submit, list, status, result, events, questions, answer, limits, pause, resume, cancel, storage, start, restart and stop.");
+  if (!["followup", "routing", "submit", "list", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel", "storage", "start", "restart", "stop", "plugins"].includes(action)) throw new Error("/runtime supports submit, list, status, result, events, questions, answer, limits, pause, resume, cancel, storage, start, restart, stop and plugins.");
   const valueFlags = new Set(["--before-input", "--text", "--input-id", "--resolve-input", "--successor", "--cwd", "--mode", "--check", "--allow-workspace", "--provider", "--model", "--max-budget-usd", "--max-turns", "--command-id", "--config-dir", "--after", "--task", "--question", "--answer", "--version", "--deadline", "--extend-hours", "--revision"]);
   const flags = new Set(["--pending", "--allow-write", "--allow-shell", "--no-start", "--help", "-h"]);
   if (action === "followup" && (!args[1] || args[1].startsWith("--"))) args.splice(1, 0, "");
