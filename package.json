@@ -50,7 +50,9 @@
     "./adapters/research": "./src/adapters/research/index.ts",
     ".": "./src/index.ts",
     "./sdk": "./src/entrypoints/sdk.ts",
-    "./runtime": "./src/services/runtime/index.ts"
+    "./runtime": "./src/services/runtime/index.ts",
+    "./agent/plugins": "./src/agent/plugins.ts",
+    "./agent/extensions": "./src/agent/extensions.ts"
   },
   "license": "Apache-2.0",
   "private": true,

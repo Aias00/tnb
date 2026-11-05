@@ -160,6 +160,7 @@ function pluginFingerprint(plugin: LoadedPlugin): string {
     contributionSummary: plugin.contributionSummary,
     toolContributions: plugin.toolContributions,
     adapterContributions: plugin.adapterContributions,
+    extensionContributions: plugin.extensionContributions,
     fingerprint: plugin.fingerprint,
   });
 }

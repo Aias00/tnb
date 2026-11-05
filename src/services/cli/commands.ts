@@ -1,5 +1,5 @@
 export const CLI_COMMANDS = [
-  "agents", "completion", "config", "continue", "doctor", "feedback", "goal-loop", "goal-loop-stop",
+  "agents", "collaboration", "completion", "config", "continue", "doctor", "feedback", "goal-loop", "goal-loop-stop",
   "help", "hooks", "ide", "jobs", "mcp", "models", "plugins", "provider", "providers",
   "remote-control", "resume", "rm", "rollback", "runtime", "security-scan", "sessions", "skills", "status", "update",
 ] as const;

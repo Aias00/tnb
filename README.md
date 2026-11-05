@@ -621,3 +621,11 @@ bun run install:local
 target as `tnb.previous`. Pass `--prefix <directory>` for an isolated install.
 Set `TNB_RELEASE_BASE_URL` during `release:current` to generate the remote
 self-update manifest alongside the binary and `SHA256SUMS`.
+
+### 常驻协作模式
+
+可选启用同一持久任务后台的 GitHub、签名 webhook/IM 桥和定时来源，通过 `/tnb run` 接单，自动回传问题与验收结果，并跟踪明确绑定的 PR。启动、权限、配置、恢复和当前边界见 [常驻协作指南](docs/guides/collaboration.md)，配置见 [示例](examples/collaboration/collaboration.json)。
+
+### 插件宿主
+
+场景、应用、交互与渠道使用统一插件包、信任和生命周期。协作应用及 GitHub/webhook/timer 已通过插件组合；安装、自定义渠道、依赖、服务授权与恢复边界见 [插件宿主指南](docs/guides/host-plugins.md)。

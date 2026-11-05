@@ -1,0 +1,4 @@
+{
+  "name": "tnb-collaboration", "version": "0.1.0", "manifestVersion": 2, "apiVersion": "tnb.host-plugin/v1",
+  "contributes": { "applications": [{ "id": "collaboration", "version": "1", "entry": "index.mjs", "services": ["tnb.runtime.internal/v1", "tnb.channels/v1"] }] }
+}

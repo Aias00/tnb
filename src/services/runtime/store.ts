@@ -14,6 +14,8 @@ type EffectRow = {
 };
 export type EffectInput = Pick<RuntimeEffect, "runId" | "kind" | "key" | "data"> & { taskId?: string; dueAt: number };
 export type StoreLimits = { maxEffects: number; maxEffectsPerRun: number; maxActiveRuns: number };
+export type ApplicationQuery = { state?: string; sourceId?: string; thread?: string; orderBySequence?: boolean };
+export type ApplicationRecord<T = unknown> = { namespace: string; id: string; runId?: string; revision: number; value: T };
 export type RouteQuery = { pendingOnly?: boolean; actionableOnly?: boolean; beforeInputId?: string; limit?: number };
 
 /** Internal persistence boundary. No worker, model, tool, IPC or automatic recovery is started here. */
@@ -82,6 +84,8 @@ export class RuntimeStore {
   route<T>(id: string): T | undefined { return this.#reader().route<T>(id); }
   routes<T>(workspace: string, query?: RouteQuery): T[] { return this.#reader().routes<T>(workspace, query); }
   records<T>(kind: string, runId: string, taskId?: string): RuntimeRecord<T>[] { return this.#reader().records<T>(kind, runId, taskId); }
+  applicationRecord<T>(namespace: string, id: string): ApplicationRecord<T> | undefined { return this.#reader().applicationRecord<T>(namespace, id); }
+  applicationRecords<T>(namespace: string, afterId = "", limit = 256, filter?: ApplicationQuery): ApplicationRecord<T>[] { return this.#reader().applicationRecords<T>(namespace, afterId, limit, filter); }
   operationHeaders(runId: string, taskId?: string): Array<{ id: string; taskId: string; state: string; effectOutcome?: string; name: string }> {
     this.#assertOpen();
     const rows = (this.#db.query(`SELECT record_id AS id, task_id AS taskId, json_extract(value,'$.state') AS state,
@@ -134,7 +138,7 @@ export class RuntimeStore {
   }
   artifactReferences(): Set<string> {
     this.#assertOpen(); const references = new Set<string>();
-    for (const query of ["SELECT data AS value FROM tasks", "SELECT data AS value FROM events", "SELECT value FROM runtime_records"]) {
+    for (const query of ["SELECT data AS value FROM tasks", "SELECT data AS value FROM events", "SELECT value FROM runtime_records", "SELECT value FROM application_records"]) {
       for (const row of this.#db.query(query).iterate() as Iterable<{ value: string }>) {
         for (const match of row.value.matchAll(/[a-f0-9]{64}/g)) references.add(match[0]);
       }
@@ -290,6 +294,38 @@ export class RuntimeTransaction {
     }
     return { ...record, revision };
   }
+  applicationRecord<T>(namespace: string, id: string): ApplicationRecord<T> | undefined {
+    const row = this.db.query("SELECT * FROM application_records WHERE namespace=? AND record_id=?").get(namespace, id) as ApplicationRow | null;
+    return row ? applicationFromRow<T>(row) : undefined;
+  }
+  applicationRecords<T>(namespace: string, afterId = "", limit = 256, filter: ApplicationQuery = {}): ApplicationRecord<T>[] {
+    integer(limit, "application page size", 1, 256);
+    const clauses = ["namespace=?", "record_id>?"];
+    const values: Array<string | number> = [namespace, afterId];
+    for (const key of ["state", "sourceId", "thread"] as const) if (filter[key] !== undefined) {
+      clauses.push(`json_extract(value,'$.${key}')=?`); values.push(filter[key]!);
+    }
+    if (filter.orderBySequence && afterId) throw new Error("Sequence ordering cannot use an ID cursor");
+    return (this.db.query(`SELECT * FROM application_records WHERE ${clauses.join(" AND ")}
+      ORDER BY ${filter.orderBySequence ? "json_extract(value,'$.sequence'),record_id" : "record_id"} LIMIT ?`)
+      .all(...values, limit) as ApplicationRow[]).map(applicationFromRow<T>);
+  }
+  saveApplicationRecord<T>(record: Omit<ApplicationRecord<T>, "revision">, previousRevision: number): ApplicationRecord<T> {
+    this.#mutable(); integer(previousRevision, "application revision");
+    text(record.namespace, "application namespace", 64); text(record.id, "application ID", 512);
+    const value = encodeJson(record.value, 128 * 1024), revision = previousRevision + 1;
+    if (previousRevision === 0) {
+      const count = (this.db.query("SELECT COUNT(*) AS n FROM application_records WHERE namespace=?").get(record.namespace) as { n: number }).n;
+      if (count >= 10000) throw new Error("Application history capacity reached; archive state before accepting more work");
+      this.db.query("INSERT INTO application_records(namespace,record_id,run_id,revision,value) VALUES(?,?,?,?,?)")
+        .run(record.namespace, record.id, record.runId ?? null, revision, value);
+    } else {
+      const result = this.db.query("UPDATE application_records SET run_id=?,revision=?,value=? WHERE namespace=? AND record_id=? AND revision=?")
+        .run(record.runId ?? null, revision, value, record.namespace, record.id, previousRevision);
+      if (result.changes !== 1) throw new Error("Application record revision conflict");
+    }
+    return { ...record, revision };
+  }
   saveAttempt(attempt: DurableAttempt): void {
     this.#mutable();
     const result = this.db.query("UPDATE attempts SET data = ? WHERE attempt_id = ? AND task_id = ? AND epoch = ? AND status = 'active'")
@@ -407,4 +443,9 @@ function effectFromRow(row: EffectRow): RuntimeEffect {
 type RecordRow = { kind: string; record_id: string; run_id: string; task_id: string | null; revision: number; value: string };
 function recordFromRow<T>(row: RecordRow): RuntimeRecord<T> {
   return { kind: row.kind, id: row.record_id, runId: row.run_id, ...(row.task_id ? { taskId: row.task_id } : {}), revision: row.revision, value: JSON.parse(row.value) };
+}
+
+type ApplicationRow = { namespace: string; record_id: string; run_id: string | null; revision: number; value: string };
+function applicationFromRow<T>(row: ApplicationRow): ApplicationRecord<T> {
+  return { namespace: row.namespace, id: row.record_id, ...(row.run_id ? { runId: row.run_id } : {}), revision: row.revision, value: JSON.parse(row.value) };
 }

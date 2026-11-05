@@ -2,6 +2,7 @@ import { readFile, readdir, realpath, stat } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { gte, lte, valid } from "semver";
 
+import type { ExtensionDeclaration, ContributionReference, ExtensionKind } from "../../agent/extensions";
 import type { ToolAccess } from "../../core/tool";
 import packageJson from "../../../package.json";
 import type { HooksConfig, HookEvent } from "../hooks/runner";
@@ -142,6 +143,7 @@ export type LoadedPlugin = {
   tools?: string[];
   toolContributions: PluginToolContribution[];
   adapterContributions?: PluginAdapterContribution[];
+  extensionContributions?: ExtensionDeclaration[];
   contributionSummary: {
     skills: boolean;
     agents: boolean;
@@ -151,6 +153,9 @@ export type LoadedPlugin = {
     builtInTools: string[];
     externalTools: string[];
     adapters?: string[];
+    applications?: string[];
+    interfaces?: string[];
+    channels?: string[];
   };
 };
 
@@ -222,6 +227,10 @@ export async function loadPlugins(
             externalTools: manifest.toolContributions
               .filter((tool): tool is ExternalPluginToolContribution => tool.type === "external")
               .map((tool) => tool.id),
+            ...Object.fromEntries((["application", "interface", "channel"] as const).flatMap(kind => {
+              const values = manifest.extensionContributions?.filter(item => item.kind === kind).map(item => `${item.id}@${item.version}`) ?? [];
+              return values.length ? [[`${kind}s`, values]] : [];
+            })),
             ...(manifest.adapterContributions?.length ? { adapters: manifest.adapterContributions.map(adapter => `${adapter.id}@${adapter.version}`) } : {}),
           },
         });
@@ -253,6 +262,7 @@ async function readManifest(root: string, fallbackName: string): Promise<{
   tools?: string[];
   toolContributions: PluginToolContribution[];
   adapterContributions?: PluginAdapterContribution[];
+  extensionContributions?: ExtensionDeclaration[];
 }> {
   const candidates = [join(root, ".tnb-plugin", "plugin.json"), join(root, "plugin.json")];
   let value: unknown;
@@ -273,6 +283,7 @@ async function readManifest(root: string, fallbackName: string): Promise<{
   const record = value as Record<string, unknown>;
   const name = typeof record.name === "string" ? record.name.trim() : "";
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(name)) throw new Error(`Invalid plugin name: ${name || "(missing)"}`);
+  if (["adapters", "applications", "interfaces", "channels"].some(key => record[key] !== undefined)) throw new Error("Executable contributions must be declared inside contributes");
   const contributes = optionalObject(record.contributes, "contributes", manifestPath ?? root);
   const version = optionalString(record.version, "version", manifestPath ?? root);
   const description = optionalString(record.description, "description", manifestPath ?? root);
@@ -300,10 +311,11 @@ async function readManifest(root: string, fallbackName: string): Promise<{
   const tools = toolContributions
     .filter((tool): tool is BuiltInPluginToolContribution => tool.type === "builtin")
     .map((tool) => tool.id);
+  if (contributes && Object.keys(contributes).some(key => !["adapters", "applications", "interfaces", "channels", "tools", "hooks", "mcpServers", "skills", "agents", "commands"].includes(key))) throw new Error("Unknown plugin contribution kind");
+  const extensionContributions = (["application", "interface", "channel"] as const).flatMap(kind => optionalExtensionContributions(contributes?.[`${kind}s`], kind, manifestPath ?? root, root));
   const adapterContributions = optionalAdapterContributions(contributes?.adapters, manifestPath ?? root, root);
-  if (adapterContributions.length && (manifestVersion !== 2 || apiVersion !== "tnb.plugin/v1" || !version)) {
-    throw new Error("Adapter plugins require manifestVersion 2, apiVersion tnb.plugin/v1 and a package version");
-  }
+  if ((adapterContributions.length || extensionContributions.length) && (manifestVersion !== 2 || !["tnb.plugin/v1", "tnb.host-plugin/v1"].includes(apiVersion ?? "") || !version)) throw new Error("Executable plugins require manifestVersion 2, a supported API and a package version");
+  if (extensionContributions.length && apiVersion !== "tnb.host-plugin/v1") throw new Error("Applications, interfaces and channels require apiVersion tnb.host-plugin/v1");
   return {
     name,
     manifestVersion,
@@ -313,12 +325,13 @@ async function readManifest(root: string, fallbackName: string): Promise<{
     ...(apiVersion ? { apiVersion } : {}),
     ...(compatibility ? { compatibility } : {}),
     ...(documentation ? { documentation } : {}),
-    lifecycle: adapterContributions.length ? { ...lifecycle, reload: "restart" } : lifecycle,
+    lifecycle: adapterContributions.length || extensionContributions.length ? { ...lifecycle, reload: "restart" } : lifecycle,
     ...(hooks ? { hooks } : {}),
     ...(mcpServers ? { mcpServers } : {}),
     ...(tools?.length ? { tools } : {}),
     toolContributions,
     ...(adapterContributions.length ? { adapterContributions } : {}),
+    ...(extensionContributions.length ? { extensionContributions } : {}),
   };
 }
 
@@ -339,6 +352,29 @@ function optionalAdapterContributions(value: unknown, path: string, root: string
   });
 }
 
+function optionalExtensionContributions(value: unknown, kind: ExtensionKind, path: string, root: string): ExtensionDeclaration[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || !value.length || value.length > 32) throw new Error(`Plugin contributes.${kind}s must contain 1..32 entries: ${path}`);
+  const seen = new Set<string>();
+  return value.map(item => {
+    if (!isRecord(item) || Object.keys(item).some(key => !["id", "version", "entry", "services", "requires"].includes(key))) throw new Error(`Invalid ${kind} contribution: ${path}`);
+    const id = requiredIdentifier(item.id, `${kind}.id`, path), version = requiredString(item.version, `${kind}.version`, path);
+    if (version.length > 128 || seen.has(`${id}@${version}`)) throw new Error(`Duplicate ${kind} contribution: ${path}`);
+    seen.add(`${id}@${version}`);
+    const entry = requiredString(item.entry, `${kind}.entry`, path); contributionPath(root, entry, `${kind}.entry`);
+    if (!entry.endsWith(".mjs")) throw new Error("Executable plugin entries must be bundled .mjs modules");
+    const services = optionalStringArray(item.services, `${kind}.services`, path) ?? [];
+    if (services.length > 32 || new Set(services).size !== services.length || services.some(name => !/^[a-zA-Z0-9][a-zA-Z0-9.:/_-]{0,127}$/.test(name))) throw new Error("Invalid or duplicate plugin service declaration");
+    if (item.requires !== undefined && (!Array.isArray(item.requires) || item.requires.length > 32)) throw new Error("Invalid plugin dependencies");
+    const requires: ContributionReference[] = ((item.requires as unknown[] | undefined) ?? []).map(raw => {
+      if (!isRecord(raw) || Object.keys(raw).some(key => !["kind", "id", "version"].includes(key)) || !["adapter", "application", "interface", "channel"].includes(String(raw.kind))) throw new Error("Invalid plugin dependency");
+      return { kind: raw.kind as ContributionReference["kind"], id: requiredIdentifier(raw.id, "dependency.id", path), version: requiredString(raw.version, "dependency.version", path) };
+    });
+    if (new Set(requires.map(ref => JSON.stringify(ref))).size !== requires.length) throw new Error("Duplicate plugin dependency");
+    return { kind, id, version, entry, services, requires };
+  });
+}
+
 function validatePluginCompatibility(input: {
   manifestVersion: number;
   version?: string;
@@ -347,7 +383,7 @@ function validatePluginCompatibility(input: {
 }, path: string): void {
   if (input.manifestVersion > 2) throw new Error(`Unsupported plugin manifestVersion ${input.manifestVersion}: ${path}`);
   if (input.version && !valid(input.version)) throw new Error(`Plugin version must be semantic version text: ${path}`);
-  if (input.apiVersion && input.apiVersion !== "tnb.plugin/v1") {
+  if (input.apiVersion && !["tnb.plugin/v1", "tnb.host-plugin/v1"].includes(input.apiVersion)) {
     throw new Error(`Unsupported plugin apiVersion ${input.apiVersion}: ${path}`);
   }
   const compatibility = input.compatibility;

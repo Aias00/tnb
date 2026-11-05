@@ -6034,6 +6034,9 @@ if (import.meta.main) {
     process.exitCode = 1;
   } else if (argv.includes("--version") || argv.includes("-V")) {
     process.stdout.write(`${packageJson.version}\n`);
+  } else if (argv[0] === "collaboration") {
+    const { runCollaborationCommand } = await import("./collaboration");
+    process.exitCode = await runCollaborationCommand({ argv, cwd: process.cwd(), env: process.env, stdout: process.stdout, stderr: process.stderr });
   } else if (argv[0] === "runtime") {
     const { runRuntimeCommand } = await import("./runtime");
     process.exitCode = await runRuntimeCommand({ argv, cwd: process.cwd(), env: process.env, stdout: process.stdout, stderr: process.stderr });

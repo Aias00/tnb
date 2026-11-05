@@ -1,0 +1,9 @@
+{
+  "name": "example-host", "version": "1.0.0", "manifestVersion": 2, "apiVersion": "tnb.host-plugin/v1",
+  "description": "Minimal application, interface and local channel using one host plugin package",
+  "contributes": {
+    "applications": [{ "id": "status-panel", "version": "1", "entry": "index.mjs", "services": ["tnb.runtime.read/v1"] }],
+    "interfaces": [{ "id": "status-view", "version": "1", "entry": "index.mjs", "requires": [{ "kind": "application", "id": "status-panel", "version": "1" }] }],
+    "channels": [{ "id": "local-notes", "version": "1", "entry": "index.mjs" }]
+  }
+}

@@ -1,0 +1,28 @@
+{
+  "enabled": true,
+  "sources": [
+    {
+      "id": "github-project",
+      "type": "github",
+      "actors": ["YOUR_GITHUB_LOGIN"],
+      "controllers": ["YOUR_GITHUB_LOGIN"],
+      "mode": "auto",
+      "pollIntervalMs": 15000,
+      "github": { "repository": "YOUR_OWNER/YOUR_REPO", "tokenEnv": "TNB_GITHUB_TOKEN" },
+      "configuration": {
+        "workspace": "/absolute/path/to/checkout",
+        "allowedWorkspaces": ["/absolute/path/to/checkout"],
+        "allowWrite": true,
+        "allowShell": false,
+        "checks": ["bun test"],
+        "provider": "YOUR_PROVIDER",
+        "model": "YOUR_MODEL",
+        "maxTurns": 200,
+        "maxRetries": 3,
+        "compactThreshold": 24000,
+        "maxModelRequests": 256,
+        "maxCostUsd": 5
+      }
+    }
+  ]
+}

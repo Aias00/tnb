@@ -34,6 +34,13 @@ const plugin = await Bun.build({ entrypoints: [join(root, "src/adapters/coding/p
 if (!plugin.success) throw new AggregateError(plugin.logs, "Coding plugin bundle failed");
 await copyFile(join(root, "src/adapters/coding/plugin.json"), join(pluginRoot, "plugin.json"));
 
+for (const name of ["channels", "collaboration"]) {
+  const target = join(outputDirectory, "plugins", `tnb-${name}`); await mkdir(target, { recursive: true });
+  const result = await Bun.build({ entrypoints: [join(root, "src/plugins", name, "plugin.ts")], target: "bun", outdir: target, naming: "index.mjs" });
+  if (!result.success) throw new AggregateError(result.logs, `${name} plugin bundle failed`);
+  await copyFile(join(root, "src/plugins", name, "plugin.json"), join(target, "plugin.json"));
+}
+
 const nativeExecutable = join(nativeLibrary, platform() === "win32" ? "tsc.exe" : "tsc");
 const companionExecutable = join(outputDirectory, compilerName);
 await copyFile(nativeExecutable, companionExecutable);
