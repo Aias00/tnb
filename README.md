@@ -629,3 +629,5 @@ self-update manifest alongside the binary and `SHA256SUMS`.
 ### 插件宿主
 
 场景、应用、交互与渠道使用统一插件包、信任和生命周期。协作应用及 GitHub/webhook/timer 已通过插件组合；安装、自定义渠道、依赖、服务授权与恢复边界见 [插件宿主指南](docs/guides/host-plugins.md)。
+
+持久任务可通过 `--skill NAME`、`--mcp-tool NAME` 显式选择额外能力，详见 [长任务 skills 与 MCP](docs/guides/durable-capabilities.md)。

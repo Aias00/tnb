@@ -3,8 +3,6 @@ import { dirname, join, relative } from "node:path";
 
 import { parseSkillMarkdown, type LoadedSkill } from "./loader";
 
-const BUNDLED_ROOT = resolveBundledRoot();
-
 let cachedBundledSkills: LoadedSkill[] | undefined;
 
 export function bundledSkills(): LoadedSkill[] {
@@ -13,6 +11,7 @@ export function bundledSkills(): LoadedSkill[] {
 }
 
 function loadBundledSkills(): LoadedSkill[] {
+  const BUNDLED_ROOT = resolveBundledRoot();
   const loaded = new Map<string, LoadedSkill>();
   for (const entry of readdirSync(BUNDLED_ROOT, { withFileTypes: true }).sort((left, right) => left.name.localeCompare(right.name))) {
     if (!entry.isDirectory()) continue;

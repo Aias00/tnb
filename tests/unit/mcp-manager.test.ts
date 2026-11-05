@@ -369,3 +369,22 @@ test("MCP manager validates and surfaces progress and cancellation notifications
   }]);
   await connections.close();
 });
+
+test("MCP manager cancellation closes a connection still initializing", async () => {
+  const [clientTransport, serverTransport] = createLinkedMcpTransportPair();
+  const started = Promise.withResolvers<void>();
+  let closed = 0;
+  const close = clientTransport.close.bind(clientTransport);
+  clientTransport.close = async () => { closed++; await close(); };
+  await serverTransport.start((message: JsonRpcMessage) => {
+    if ("method" in message && message.method === "initialize") started.resolve();
+    // Deliberately withhold initialize response.
+  });
+  const controller = new AbortController();
+  const opening = connectMcpServers({ mcpServers: {} }, { cwd: process.cwd(), inProcess: { fixture: clientTransport }, signal: controller.signal });
+  const captured = opening.then(() => undefined, error => error);
+  await started.promise; controller.abort();
+  expect(await captured).toBeInstanceOf(Error);
+  expect(closed).toBeGreaterThan(0);
+  await serverTransport.close();
+});

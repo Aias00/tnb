@@ -124,11 +124,13 @@ test("a bundled installed coding package uses the ordinary trust loader and real
   const bundle = await Bun.build({ entrypoints: [fileURLToPath(new URL("../../src/adapters/coding/plugin.ts", import.meta.url))], target: "bun", outdir: source, naming: "index.mjs" });
   expect(bundle.success).toBe(true);
   await cp(new URL("../../src/adapters/coding/plugin.json", import.meta.url), join(source, "plugin.json"));
+  await cp(new URL("../../src/services/skills/bundled", import.meta.url), join(source, "bundled"), { recursive: true });
   const installed = await installLocalPlugin({ source, targetRoot: plugins, sourceType: "user" }); await trustPlugin(join(f.configDir, "trust.json"), installed.root);
   let requests = 0;
   const model = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     const body = await request.json() as { tools: Array<{ function: { name: string } }>; messages: unknown[] };
     expect(body.tools.some(tool => ["write", "edit", "bash"].includes(tool.function.name))).toBe(false);
+    expect(body.tools.some(tool => tool.function.name === "skill")).toBe(true);
     const first = ++requests === 1;
     if (!first) expect(JSON.stringify(body.messages)).toContain("actual workspace evidence");
     const delta = first ? { tool_calls: [{ index: 0, id: "read-file", type: "function", function: { name: "read", arguments: JSON.stringify({ path: "source.txt" }) } }] } : { content: "Verified actual workspace evidence" };
@@ -136,10 +138,12 @@ test("a bundled installed coding package uses the ordinary trust loader and real
     return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
   } }); cleanup.push(() => model.stop(true));
   await writeFile(join(f.configDir, "models.json"), JSON.stringify({ providers: { fixture: { api: "openai-completions", baseUrl: `${model.url}v1`, models: [{ id: "fixture", maxTokens: 1024 }] } } }));
+  const skill = join(f.configDir, "skills", "inspect"); await mkdir(skill, { recursive: true });
+  await writeFile(join(skill, "SKILL.md"), "---\nname: inspect\ndescription: Inspect evidence\ncontext: inline\n---\nRead source.txt.\n");
   const options = { directory: f.state, legacyAdapterId: "coding", plugins: { roots: [{ directory: plugins, source: "user" as const }], trustStorePath: join(f.configDir, "trust.json"),
     configuration: { "tnb-coding": { configDir: f.configDir, env: f.env } } } };
   const host = await openAgentRuntime(options); cleanup.push(() => host.close());
-  const input = { commandId: "installed", namespace: "coding", objective: "Read source.txt", adapter: await codingTask({ ...config(f), provider: "fixture", model: "fixture" }), mode: "single" as const };
+  const input = { commandId: "installed", namespace: "coding", objective: "Read source.txt", adapter: await codingTask({ ...config(f), provider: "fixture", model: "fixture", skills: ["inspect"] }), mode: "single" as const };
   const { run } = await host.submit(input); await until(host, () => host.store.getRun(run.runId)?.status === "succeeded");
   expect(host.plugins.list()[0]!.root).toBe(installed.root); expect(requests).toBe(2); await host.close();
   const reopened = await openAgentRuntime(options); cleanup.push(() => reopened.close());

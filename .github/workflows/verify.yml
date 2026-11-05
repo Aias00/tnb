@@ -45,5 +45,5 @@ jobs:
       - if: runner.os == 'Linux'
         run: bun test
       - if: runner.os == 'Windows'
-        run: bun test tests/unit/sandbox-runtime.test.ts tests/unit/usage-budget.test.ts tests/unit/execution-binding.test.ts tests/integration/sandbox-native.test.ts
+        run: bun test tests/unit/sandbox-runtime.test.ts tests/unit/usage-budget.test.ts tests/unit/execution-binding.test.ts tests/unit/mcp-manager.test.ts tests/integration/sandbox-native.test.ts tests/integration/durable-capabilities.test.ts
       - run: bun run build

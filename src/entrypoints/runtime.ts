@@ -15,7 +15,7 @@ followup [run-id] --text "requirements" [--task ID] [--input-id ID]
   Select an unresolved input with --resolve-input ID --revision N and a run-id.
 routing [--cwd PATH] [--pending] [--before-input ID]  Show decisions, prioritizing pending clarification.
 submit <objective> [--cwd PATH] [--mode single|auto|multi] [--allow-write] [--allow-shell]
-  [--check COMMAND]... [--allow-workspace PATH]... [--provider ID] [--model ID]
+  [--check COMMAND]... [--allow-workspace PATH]... [--skill NAME]... [--mcp-tool NAME]... [--provider ID] [--model ID]
   [--max-budget-usd N] [--max-turns N] [--deadline ISO-DATE] [--command-id ID] [--no-start]
 status|result|events|pause|resume|cancel <run-id>  (result accepts --task TASK-ID)
 questions <run-id>  Show outstanding questions and their versions.
@@ -95,6 +95,9 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
     else if (action === "stop") result = await runtimeRequest(configDir, "/command", { action: "stop", commandId: randomUUID() });
     else if (["status", "events", "result", "questions"].includes(action)) result = await runtimeRequest(configDir, `/${action}?runId=${encodeURIComponent(args[1] ?? "")}&after=${value("--after") ?? "0"}&taskId=${encodeURIComponent(value("--task") ?? "")}`);
     else if (action === "submit") {
+      for (const flag of ["--skill", "--mcp-tool"]) {
+        for (let index = 0; index < args.length; index++) if (args[index] === flag && (!args[index + 1] || args[index + 1]!.startsWith("--"))) throw new Error(`${flag} requires a value`);
+      }
       const workspace = resolve(value("--cwd") ?? options.cwd);
       const maxCostUsd = value("--max-budget-usd") === undefined ? undefined : Number(value("--max-budget-usd"));
       if (maxCostUsd !== undefined && (!Number.isFinite(maxCostUsd) || maxCostUsd <= 0)) throw new Error("Budget must be positive");
@@ -102,6 +105,7 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
         deadline: value("--deadline") === undefined ? undefined : parseDeadline(value("--deadline")!),
         configuration: { workspace, allowedWorkspaces: [workspace, ...values("--allow-workspace").map((path) => resolve(path))],
           allowWrite: args.includes("--allow-write"), allowShell: args.includes("--allow-shell"), checks: values("--check"),
+          ...(values("--skill").length ? { skills: values("--skill") } : {}), ...(values("--mcp-tool").length ? { mcpTools: values("--mcp-tool") } : {}),
           provider: value("--provider"), model: value("--model"), maxCostUsd, maxTurns: Number(value("--max-turns") ?? 200), maxRetries: 3, compactThreshold: 24000 } };
       if (options.originSessionId) Object.assign(body.configuration, { originSessionId: options.originSessionId });
       Object.assign(body, { successorOf: value("--successor"), source: { inputId: body.commandId, workspace: await realpath(workspace),
@@ -143,7 +147,7 @@ export type RuntimeChatOptions = { args: string[]; cwd: string; workspace: strin
 export async function runRuntimeChatCommand(options: RuntimeChatOptions): Promise<string> {
   const args = options.args.length ? [...options.args] : ["list"]; const action = args[0]!;
   if (!["followup", "routing", "submit", "list", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel", "storage", "start", "restart", "stop", "plugins"].includes(action)) throw new Error("/runtime supports submit, list, status, result, events, questions, answer, limits, pause, resume, cancel, storage, start, restart, stop and plugins.");
-  const valueFlags = new Set(["--before-input", "--text", "--input-id", "--resolve-input", "--successor", "--cwd", "--mode", "--check", "--allow-workspace", "--provider", "--model", "--max-budget-usd", "--max-turns", "--command-id", "--config-dir", "--after", "--task", "--question", "--answer", "--version", "--deadline", "--extend-hours", "--revision"]);
+  const valueFlags = new Set(["--before-input", "--text", "--input-id", "--resolve-input", "--successor", "--cwd", "--mode", "--check", "--skill", "--mcp-tool", "--allow-workspace", "--provider", "--model", "--max-budget-usd", "--max-turns", "--command-id", "--config-dir", "--after", "--task", "--question", "--answer", "--version", "--deadline", "--extend-hours", "--revision"]);
   const flags = new Set(["--pending", "--allow-write", "--allow-shell", "--no-start", "--help", "-h"]);
   if (action === "followup" && (!args[1] || args[1].startsWith("--"))) args.splice(1, 0, "");
   const hasTarget = ["followup", "submit", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel"].includes(action);
@@ -169,7 +173,7 @@ export async function runRuntimeChatCommand(options: RuntimeChatOptions): Promis
 const LONG_TASK_HELP = `Long tasks · /longtask (aliases: /task, /long, /长任务)
 
 /longtask "objective" [--mode single|auto|multi] [--allow-write] [--allow-shell]
-  [--check "command"]... [--max-budget-usd N] [--max-turns N]
+  [--check "command"]... [--skill NAME]... [--mcp-tool NAME]... [--max-budget-usd N] [--max-turns N]
 /longtask followup [run-id] --text "additional requirements"
 /longtask routing [--pending] [--before-input ID]
 /longtask list

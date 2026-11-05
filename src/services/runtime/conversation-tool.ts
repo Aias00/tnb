@@ -6,6 +6,7 @@ import { digestJson, text } from "./json";
 import { runtimeRequest } from "./server";
 import { ensureRuntime, assertConversationOwner } from "./client";
 import { parseDeadline, extensionMilliseconds } from "./limits";
+import { validateCapabilitySelection } from "../../adapters/coding/capabilities";
 import { isControlCandidate, type RoutingDecision } from "./routing";
 
 export const DURABLE_CONVERSATION_INSTRUCTIONS = "When the user explicitly asks to execute a long-running task durably or in the background, use durable_task submit. Include a self-contained objective and the relevant conversation decisions in context, a stable key, explicit write/Shell grants and replay-safe checks. It creates a separate persistent Run using the current model, with its own disclosed budget; do not use it as an ordinary subagent or to escape this invocation's budget. For progress, results or control, use durable_task with the existing runId. For additional requirements use followup, not submit or answer. When followup returns clarify, ask the user to choose a candidate; resolveInputId and expectedRevision bind the original input. Do not guess a target by topic. Use routing to recover unresolved choices. Read questions to show pending decisions; use answer with the question ID and version only for the user's actual decision, never invent an answer. An answer cannot expand permissions or resume a paused Run. Use limits only for the user's explicit deadline or total-budget decision, after a fully drained pause and reading the current Run revision. Never increase limits autonomously; an update preserves all usage/reservations and stays paused until explicitly resumed. Submission is acceptance, not completion. While the durable task owns this workspace, use its controls and wait for it to release the workspace before local file operations. Never infer completion from submission or promise parallel code writes.";
@@ -15,6 +16,7 @@ type Request = {
   text?: string; resolveInputId?: string;
   key?: string; runId?: string; objective?: string; context?: string;
   mode?: "single" | "auto" | "multi"; allowWrite?: boolean; allowShell?: boolean;
+  skills?: string[]; mcpTools?: string[];
   checks?: string[]; maxCostUsd?: number; maxTurns?: number; after?: number;
   waitId?: string; expectedVersion?: number; answer?: string;
   deadline?: string; extendHours?: number; expectedRevision?: number;
@@ -35,12 +37,13 @@ export function createDurableTaskTool(context: ConversationRuntimeContext): Agen
     name: "durable_task", access: "execute", isReadOnly: (input) => reads.has(input.action),
     isConcurrencySafe: () => false, requiresApproval: (input) => !reads.has(input.action),
     permissionRuleContent: (input) => input.action,
-    description: "Submit and control a persistent long task when explicitly requested by the user. A submitted Run survives chat/terminal closure. Use the same key and identical submit inputs to retry a handoff; include previous decisions in context. Default auto starts one Agent and admits bounded read-only delegation. Writing requires allowWrite and explicit replay-safe checks; Shell additionally requires allowShell. This is a separate Run and budget, not a general child-agent tool. Read status/results without changing permissions. Scope is the current conversation workspace. For followup use the original user request, never create a duplicate Run. Ambiguous targets require user selection; routing lists persisted decisions. Requires approval for submission and control.",
+    description: "Submit and control a persistent long task when explicitly requested by the user. A submitted Run survives chat/terminal closure. Use the same key and identical submit inputs to retry a handoff; include previous decisions in context. Default auto starts one Agent and admits bounded read-only delegation. Writing requires allowWrite and explicit replay-safe checks; Shell additionally requires allowShell. This is a separate Run and budget, not a general child-agent tool. Read status/results without changing permissions. Scope is the current conversation workspace. For followup use the original user request, never create a duplicate Run. Ambiguous targets require user selection; routing lists persisted decisions. Select skills and MCP tools only with explicit user authorization; MCP also requires the host durable-mcp.json allowlist. Skills are instruction-only; nested execution metadata is rejected. Requires approval for submission and control.",
     inputSchema: { type: "object", additionalProperties: false, required: ["action"], properties: {
       text: { type: "string", maxLength: 16384 }, resolveInputId: { type: "string" },
       action: { type: "string", enum: actions }, key: { type: "string", description: "Stable handoff key, required for submit." },
       runId: { type: "string" }, objective: { type: "string", maxLength: 4096 }, context: { type: "string", maxLength: 16384 },
       mode: { type: "string", enum: ["single", "auto", "multi"] }, allowWrite: { type: "boolean" }, allowShell: { type: "boolean" },
+      skills: { type: "array", items: { type: "string" }, maxItems: 16 }, mcpTools: { type: "array", items: { type: "string" }, maxItems: 16 },
       checks: { type: "array", items: { type: "string" }, maxItems: 16 }, maxCostUsd: { type: "number", exclusiveMinimum: 0 },
       maxTurns: { type: "integer", minimum: 1, maximum: 2000 }, after: { type: "integer", minimum: 0 },
       waitId: { type: "string", description: "Question ID from questions." }, expectedVersion: { type: "integer", minimum: 1 },
@@ -52,7 +55,7 @@ export function createDurableTaskTool(context: ConversationRuntimeContext): Agen
     validate(value) {
       if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid durable task request");
       const input = value as Request;
-      if (!actions.includes(input.action) || Object.keys(input).some((key) => !["action", "text", "resolveInputId", "key", "runId", "objective", "context", "mode", "allowWrite", "allowShell", "checks", "maxCostUsd", "maxTurns", "after", "waitId", "expectedVersion", "answer", "deadline", "extendHours", "expectedRevision"].includes(key))) throw new Error("Unsupported durable task action or capability");
+      if (!actions.includes(input.action) || Object.keys(input).some((key) => !["action", "text", "resolveInputId", "key", "runId", "objective", "context", "mode", "allowWrite", "allowShell", "skills", "mcpTools", "checks", "maxCostUsd", "maxTurns", "after", "waitId", "expectedVersion", "answer", "deadline", "extendHours", "expectedRevision"].includes(key))) throw new Error("Unsupported durable task action or capability");
       if (input.action === "followup") {
         for (const key of Object.keys(input)) if (!["action", "key", "runId", "text", "resolveInputId", "expectedRevision"].includes(key)) throw new Error("Followup cannot expand authority");
         text(input.key!, "followup key", 128);
@@ -63,6 +66,7 @@ export function createDurableTaskTool(context: ConversationRuntimeContext): Agen
       if (input.action === "submit") {
         text(input.key!, "handoff key", 128); text(input.objective!, "durable objective");
         if (input.context !== undefined) text(input.context, "conversation context", 16384);
+        validateCapabilitySelection(input);
         if (input.mode !== undefined && !["single", "auto", "multi"].includes(input.mode)) throw new Error("Invalid execution mode");
         if ([input.allowWrite, input.allowShell].some((value) => value !== undefined && typeof value !== "boolean")) throw new Error("Invalid durable authority");
         if (input.checks !== undefined && (!Array.isArray(input.checks) || input.checks.length > 16)) throw new Error("Invalid checks");
@@ -119,6 +123,7 @@ export function createDurableTaskTool(context: ConversationRuntimeContext): Agen
           deadline: input.deadline === undefined ? undefined : parseDeadline(input.deadline),
           configuration: { workspace, allowedWorkspaces, provider: context.provider, model: context.model,
             allowWrite: input.allowWrite ?? false, allowShell: input.allowShell ?? false, checks: input.checks ?? [], maxCostUsd: input.maxCostUsd,
+            ...(input.skills !== undefined ? { skills: input.skills } : {}), ...(input.mcpTools !== undefined ? { mcpTools: input.mcpTools } : {}),
             maxTurns: input.maxTurns ?? 200, maxRetries: 3, compactThreshold: 24000,
             originSessionId: context.sessionId, conversationContext: input.context },
         });

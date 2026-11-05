@@ -31,6 +31,8 @@ import {
 
 export type McpConnections = {
   tools: AgentTool[];
+  /** Server-advertised tools, excluding client-generated resource helpers. */
+  readonly ordinaryTools: readonly AgentTool[];
   prompts: McpPromptCommand[];
   clients: Readonly<Record<string, McpClient>>;
   updatedResources: Readonly<Record<string, ReadonlySet<string>>>;
@@ -47,6 +49,8 @@ export async function connectMcpServers(
     requestTimeoutMs?: number;
     inProcess?: Record<string, McpTransport>;
     configDir?: string;
+    stdioEnv?: Record<string, string | undefined>;
+    signal?: AbortSignal;
     only?: string[];
     workspaceRoot?(): string | string[];
     sampling?(serverName: string): McpSamplingHandler;
@@ -57,7 +61,10 @@ export async function connectMcpServers(
     cancelled?(event: McpCancelledEvent): void | Promise<void>;
   },
 ): Promise<McpConnections> {
+  options.signal?.throwIfAborted();
   const clients: McpClient[] = [];
+  const abort = () => { void Promise.allSettled(clients.map(client => client.close())); };
+  options.signal?.addEventListener("abort", abort, { once: true });
   const clientsByName: Record<string, McpClient> = {};
   const tools: AgentTool[] = [];
   const prompts: McpPromptCommand[] = [];
@@ -140,6 +147,7 @@ export async function connectMcpServers(
       .filter(([name]) => !selected || selected.has(name))
       .map(([name, transport]) => ({ name, transport }));
     for (const connection of [...configured, ...injected]) {
+      options.signal?.throwIfAborted();
       const serverName = connection.name;
       if (serverNames.has(serverName)) throw new Error(`Duplicate MCP server name: ${serverName}`);
       serverNames.add(serverName);
@@ -148,7 +156,7 @@ export async function connectMcpServers(
         ? connection.transport
         : connection.server.type === "http" || connection.server.type === "sse"
           ? createRemoteTransport(serverName, connection.server, options.configDir)
-            : new StdioMcpTransport({ ...connection.server, cwd: options.cwd });
+            : new StdioMcpTransport({ ...connection.server, cwd: options.cwd, baseEnv: options.stdioEnv });
       const samplingHandler = options.sampling?.(serverName);
       const elicitationHandler = options.elicitation?.(serverName);
       let clientHandlersReady = false;
@@ -237,12 +245,15 @@ export async function connectMcpServers(
       });
       clientHandlersReady = true;
     }
+    options.signal?.throwIfAborted();
   } catch (error) {
+    options.signal?.removeEventListener("abort", abort);
     await Promise.allSettled(clients.map((client) => client.close()));
     throw error;
   }
   return {
     tools,
+    get ordinaryTools() { return serverOrder.flatMap(name => ordinaryToolSnapshots.get(name) ?? []); },
     prompts,
     clients: clientsByName,
     updatedResources,
@@ -252,6 +263,7 @@ export async function connectMcpServers(
       await Promise.all(clients.map((client) => client.notifyRootsChanged()));
     },
     async close() {
+      options.signal?.removeEventListener("abort", abort);
       await Promise.allSettled(clients.map((client) => client.close()));
     },
   };
