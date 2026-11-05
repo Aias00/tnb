@@ -5,9 +5,9 @@ import { createCodingAdapter } from "./adapter";
 import { createRuntimeWorkerFactory } from "./worker";
 import { codingPluginFingerprint } from "./identity";
 import type { AdapterPluginFactory, BuiltinAdapterPlugin } from "../../agent/plugins";
-import type { RuntimeWorkerFactory } from "../../services/runtime/engine-core";
+import type { CodingWorkerFactory } from "./capabilities";
 
-export type CodingPluginOptions = { configDir: string; runtimeRoot: string; env: Record<string, string | undefined>; workerFactory?: RuntimeWorkerFactory };
+export type CodingPluginOptions = { configDir: string; runtimeRoot: string; env: Record<string, string | undefined>; workerFactory?: CodingWorkerFactory };
 /** The shipped profile uses exactly the same registration transaction and lifecycle as installed domains. */
 export async function createCodingPlugin(options: CodingPluginOptions): Promise<BuiltinAdapterPlugin> {
   return { identity: { name: "tnb-coding", version: packageJson.version, fingerprint: await codingPluginFingerprint() }, adapters: [{ id: "coding", version: "1" }],

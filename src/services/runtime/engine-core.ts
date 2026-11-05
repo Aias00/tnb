@@ -37,6 +37,10 @@ export type RuntimeConfiguration = {
   originSessionId?: string; conversationContext?: string;
   strategyVersion?: 1 | 2;
   maxModelRequests?: number;
+  /** Coding adapter selections; executable capabilities and credentials stay on the host. */
+  skills?: string[];
+  mcpTools?: string[];
+  capabilityPins?: Record<string, string>;
   domain?: DomainDescriptor;
 };
 export type WorkerResources = Pick<AgentLoopOptions, "transport" | "model" | "tools" | "authorize"> & {

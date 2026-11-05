@@ -14,10 +14,12 @@ import { loadProjectInstructions } from "../../services/project-context";
 import { loadSettings } from "../../services/settings/load";
 import { digestJson } from "../../services/runtime/json";
 import type { RuntimeWorkerFactory } from "../../services/runtime/engine-core";
+import { createDurableCapabilityHost, type CodingWorkerFactory } from "./capabilities";
 
 /** Compose existing tnb tools/providers; credentials stay on the host, outside model and shell environments. */
-export function createRuntimeWorkerFactory(options: { configDir: string; runtimeRoot: string; env: Record<string, string | undefined> }): RuntimeWorkerFactory {
-  return async ({ task, configuration, signal }) => {
+export function createRuntimeWorkerFactory(options: { configDir: string; runtimeRoot: string; env: Record<string, string | undefined> }): CodingWorkerFactory {
+  const capabilities = createDurableCapabilityHost(options);
+  const factory: RuntimeWorkerFactory = async ({ task, configuration, signal }) => {
     const catalog = await loadProviderCatalog({ configDir: options.configDir, env: options.env });
     const selection = resolveProviderSelection(catalog, configuration.provider ?? options.env.TNB_PROVIDER ?? "anthropic", configuration.model ?? options.env.TNB_MODEL);
     const reads = createFileStateCacheWithSizeLimit(100);
@@ -68,17 +70,26 @@ export function createRuntimeWorkerFactory(options: { configDir: string; runtime
       rules: { deny: settings.permissions?.deny, ask: settings.permissions?.ask, allow: configuration.allowShell ? ["Bash(*)"] : [] } });
     const checkPermission = createPermissionChecker({ cwd: workspace, trustedFolders: [workspace], mode: "acceptEdits",
       rules: { deny: settings.permissions?.deny, ask: settings.permissions?.ask, allow: ["Bash(*)"] } });
+    const projectInstructions = await loadProjectInstructions(workspace, { stopAt: workspace });
+    let extra: Awaited<ReturnType<typeof capabilities.open>>;
+    try { extra = await capabilities.open(configuration, signal); }
+    catch (error) { await shell?.close(); throw error; }
+    const capabilityChecker = createPermissionChecker({ cwd: workspace, mode: "default",
+      rules: { deny: settings.permissions?.deny, ask: settings.permissions?.ask, allow: configuration.mcpTools } });
     return {
       // Each physical request has one persistent reservation. Retries belong to the durable scheduler.
-      transport: { stream: (request, requestSignal) => createConfiguredTransport(selection, undefined, false, { maxRetries: 0 }).stream(request, requestSignal) }, model: selection.model.id, tools,
+      transport: { stream: (request, requestSignal) => createConfiguredTransport(selection, undefined, false, { maxRetries: 0 }).stream(request, requestSignal) }, model: selection.model.id,
+      tools: [...extra.restrict([...tools, ...extra.tools.filter(tool => tool.capability?.name === "mcp.call")]), ...extra.tools.filter(tool => tool.capability?.name === "skill.read")],
       route: resolveBillingRoute(selection, selection.model.id), maxOutputTokens: Math.min(selection.model.maxTokens, 8192),
       contextWindowTokens: selection.model.contextWindow,
       binding: { provider: selection.provider.id, api: selection.provider.api, endpoint: selection.provider.baseUrl, model: selection.model,
-        headers: digestJson(selection.provider.headers), permissions: { deny: settings.permissions?.deny, ask: settings.permissions?.ask } },
-      projectInstructions: await loadProjectInstructions(workspace, { stopAt: workspace }),
+        headers: digestJson(selection.provider.headers), permissions: { deny: settings.permissions?.deny, ask: settings.permissions?.ask },
+        ...(Object.keys(extra.pins).length ? { capabilities: extra.pins, catalog: digestJson(extra.tools.map(tool => ({ name: tool.name, description: tool.description, schema: tool.inputSchema }))) } : {}) },
+      projectInstructions,
       authorize: async (tool, input, context) => {
         signal.throwIfAborted();
         if (["agent", "durable_wait", "durable_recall", "assess_delegation", "review_child_result", "complete_investigation"].includes(tool.name)) return { behavior: "allow" };
+        if (tool.capability?.name === "skill.read" || tool.capability?.name === "mcp.call") return capabilityChecker({ ...tool, risk: tool.access }, input, signal, context);
         return checker({ ...tool, risk: tool.access }, input, signal, context);
       },
       check: shell ? async (command, checkSignal) => {
@@ -87,7 +98,12 @@ export function createRuntimeWorkerFactory(options: { configDir: string; runtime
         if (decision.behavior !== "allow") throw new Error(decision.message);
         return shell.runForeground(command, 120_000, checkSignal);
       } : undefined,
-      close: () => shell?.close() ?? Promise.resolve(),
+      close: async () => {
+        const results = await Promise.allSettled([extra.close(), shell?.close()]);
+        const failures = results.filter(result => result.status === "rejected");
+        if (failures.length) throw new AggregateError(failures.map(result => result.reason), "Coding worker cleanup failed");
+      },
     };
   };
+  return Object.assign(factory, { prepareCapabilities: capabilities.prepare });
 }

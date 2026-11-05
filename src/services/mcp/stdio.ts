@@ -5,6 +5,8 @@ import type { McpStdioServerConfig } from "./config";
 
 export type StdioMcpTransportOptions = McpStdioServerConfig & {
   cwd: string;
+  /** Omit for interactive compatibility; background hosts can provide a minimal environment. */
+  baseEnv?: Record<string, string | undefined>;
   onStderr?(text: string): void;
 };
 
@@ -45,7 +47,7 @@ export class StdioMcpTransport implements McpTransport {
     if (!receive) throw new Error("MCP stdio transport is not started");
     const child = spawn(this.options.command, this.options.args ?? [], {
       cwd: this.options.cwd,
-      env: { ...process.env, ...this.options.env },
+      env: { ...(this.options.baseEnv ?? process.env), ...this.options.env },
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.child = child;
