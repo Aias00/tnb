@@ -21,7 +21,10 @@ const cleanup: Array<() => Promise<unknown>> = [];
 const ownerTest = test.skipIf(process.platform === "win32");
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
 async function fixture(settings: Record<string, unknown> = {}) {
-  const root = await mkdtemp(join(tmpdir(), "tnb-plugin-agent-")); cleanup.push(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
+  const root = await mkdtemp(join(tmpdir(), "tnb-plugin-agent-")); cleanup.push(async () => {
+    try { await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }
+    catch (error) { throw new Error(`Fixture cleanup failed; remaining paths: ${JSON.stringify(await readdir(root, { recursive: true }).catch(() => []))}`, { cause: error }); }
+  });
   const plugins = join(root, "plugins"), source = join(root, "source"), trace = join(root, "trace"), trust = join(root, "trust.json");
   await mkdir(source); await mkdir(plugins);
   const manifest = { name: "fixture-plugin", version: "1.0.0", manifestVersion: 2, apiVersion: "tnb.plugin/v1",
@@ -65,6 +68,9 @@ test("portable installed generations retain bytes, pin SQLite references, enforc
   store.deleteTerminalRun(run.runId);
   loaded = await loadAdapterPlugins({ ...f.options, generationReferences: pluginGenerationReferences(store) }, [], snapshotRoot); cleanup.push(() => loaded.close());
   expect(await readdir(historyRoot)).not.toContain(pluginGenerationKey(old));
+  await loaded.close(); store.close();
+  // Bun SQLite statement wrappers can retain native handles until collected on Windows.
+  if (process.platform === "win32") Bun.gc(true);
 });
 
 test("existing installation discovers adapters and forces restart lifecycle; untrusted/disabled code is never imported", async () => {
