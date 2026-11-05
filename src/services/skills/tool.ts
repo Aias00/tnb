@@ -61,6 +61,7 @@ export function createSkillTool(options: {
       });
     },
     access: "execute",
+    permissionRuleContent: ({ name }) => name.toLowerCase(),
   });
 }
 

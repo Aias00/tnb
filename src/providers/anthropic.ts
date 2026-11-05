@@ -10,6 +10,7 @@ export type AnthropicTransportOptions = {
   headers?: Record<string, string>;
   fetch?: FetchLike;
   maxOutputTokens?: number;
+  maxRetries?: number;
   promptCaching?: false | "5m" | "1h";
   requiredToolChoice?: "any" | "auto";
 };
@@ -20,7 +21,7 @@ export function createAnthropicTransport(options: AnthropicTransportOptions): Mo
     async *stream(request, signal) {
       yield* streamWithRetry(
         () => streamAnthropic(fetcher, options, request, signal),
-        { ...(signal ? { signal } : {}) },
+        { maxRetries: options.maxRetries, ...(signal ? { signal } : {}) },
       );
     },
   };

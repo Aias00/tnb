@@ -13,6 +13,13 @@ export function getWindowsSandboxAvailability(
   env: Record<string, string | undefined>,
   host: SandboxHost,
 ): SandboxAvailability {
+  if (config.command === "appcontainer" || config.profile === "strict") {
+    return {
+      platform: host.platform, supported: false, requestedCommand: config.command,
+      reason: "Windows sandbox does not implement AppContainer or strict filesystem isolation",
+      capabilities: { filesystem: "best-effort", networkModes: ["open"], process: "job-object" },
+    };
+  }
   if (config.command === "sandbox-exec" || config.command === "bwrap") {
     return {
       platform: host.platform,
@@ -94,25 +101,21 @@ export function createWindowsSandboxRuntime(options: {
         env: options.env,
         host: options.host,
       });
-      const encodedCommand = encodePowerShellCommand(buildPowerShellSandboxScript());
+      // Embed literal arguments in the encoded script. PowerShell -EncodedCommand
+      // does not provide a portable trailing-argv channel, and sentinels in user
+      // arguments must never be interpreted as wrapper metadata.
+      const literal = (value: string) => "'" + value.replaceAll("'", "''") + "'";
+      const invocation = [
+        `$tnbCwd = ${literal(cwd)}`,
+        `$tnbExe = ${literal(file)}`,
+        `$tnbExeArgs = @(${args.map(literal).join(", ")})`,
+        `$env:TNB_SANDBOX_PROFILE = ${literal(options.config.profile)}`,
+        `$env:TNB_SANDBOX_ALLOWED_PATHS = ${literal(JSON.stringify(paths.allowedPaths))}`,
+      ].join("\n");
       return {
         file: executable,
-        args: [
-          "-NoLogo",
-          "-NoProfile",
-          "-NonInteractive",
-          "-ExecutionPolicy",
-          "Bypass",
-          "-EncodedCommand",
-          encodedCommand,
-          cwd,
-          file,
-          ...args,
-          "--tnb-profile",
-          options.config.profile,
-          "--tnb-allowed-paths",
-          JSON.stringify(paths.allowedPaths),
-        ],
+        args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+          "-EncodedCommand", encodePowerShellCommand(`${invocation}\n${buildPowerShellSandboxScript()}`)],
       };
     },
   };
@@ -214,32 +217,8 @@ $job = [IntPtr]::Zero
 try { $job = [TnbSandboxJob]::AttachCurrentProcess() } catch {}
 $ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'
 
-$argumentCount = $args.Length
-if ($argumentCount -lt 2) { throw 'sandbox wrapper requires cwd and executable' }
-
-$metadataIndex = $argumentCount
-for ($index = 2; $index -lt $argumentCount; $index++) {
-  if ($args[$index] -eq '--tnb-profile') {
-    $metadataIndex = $index
-    break
-  }
-}
-
-$cwd = $args[0]
-$exe = $args[1]
-$exeArgs = @()
-if ($metadataIndex -gt 2) {
-  $exeArgs = $args[2..($metadataIndex - 1)]
-}
-if ($metadataIndex -lt $argumentCount) {
-  $env:TNB_SANDBOX_PROFILE = $args[$metadataIndex + 1]
-}
-if ($metadataIndex + 3 -lt $argumentCount) {
-  $env:TNB_SANDBOX_ALLOWED_PATHS = $args[$metadataIndex + 3]
-}
-
-Set-Location -LiteralPath $cwd
-& $exe @exeArgs
+Set-Location -LiteralPath $tnbCwd
+& $tnbExe @tnbExeArgs
 exit $LASTEXITCODE
 `.trim();
 }

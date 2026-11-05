@@ -1,4 +1,4 @@
-import type { ConversationMessage, ToolResultBlock, ToolUseBlock } from "../../core/message";
+import type { ConversationMessage } from "../../core/message";
 import {
   compactConversation,
   estimateConversationTokens,
@@ -6,6 +6,7 @@ import {
   type CompactConversationResult,
 } from "./compact";
 import type { SessionMemoryStore } from "./session-memory";
+import { assertBalancedToolHistory, findSafeHistoryBoundary } from "../../core/history";
 
 const PRUNED_RESULT = "[Earlier tool result pruned from active context]";
 
@@ -22,8 +23,11 @@ export async function compactConversationPipeline(options: CompactConversationOp
   keepRecentToolResults?: number;
   minimumToolResultChars?: number;
   force?: boolean;
+  historyRevision?: number;
 }): Promise<CompactPipelineResult> {
   const original = structuredClone(options.messages);
+  options.signal?.throwIfAborted();
+  assertBalancedToolHistory(original);
   const preTokens = estimateConversationTokens(original);
   const micro = pruneToolResults(original, {
     keepRecent: options.keepRecentToolResults ?? 5,
@@ -33,7 +37,7 @@ export async function compactConversationPipeline(options: CompactConversationOp
   let workingTokens = estimateConversationTokens(working);
 
   if (workingTokens < options.thresholdTokens && options.sessionMemory?.shouldRefresh(working, workingTokens)) {
-    options.sessionMemory.refreshInBackground(working, workingTokens, options.summarize);
+    options.sessionMemory.refreshInBackground(working, workingTokens, options.summarize, options.historyRevision, options.signal);
   }
 
   if (!options.force && (workingTokens < options.thresholdTokens || working.length < 3)) {
@@ -49,7 +53,7 @@ export async function compactConversationPipeline(options: CompactConversationOp
   }
 
   if (options.sessionMemory && !options.sessionMemory.canAttemptFullCompaction()) {
-    const collapsed = collapseOldRounds(working, options.thresholdTokens);
+    const collapsed = collapseOldRounds(working, options.thresholdTokens, options.keepRecentMessages, options.allowToolRoundBoundary);
     return {
       compacted: micro.pruned > 0 || collapsed.collapsed,
       messages: collapsed.messages,
@@ -66,7 +70,7 @@ export async function compactConversationPipeline(options: CompactConversationOp
     if (full.compacted) {
       const summary = full.messages[0]?.content[0];
       if (options.sessionMemory && summary?.type === "text") {
-        await options.sessionMemory.save(summary.text.replace(/^Conversation summary:\s*/i, ""), working, workingTokens);
+        await options.sessionMemory.save(summary.text.replace(/^Conversation summary:\s*/i, ""), working, workingTokens, options.historyRevision, options.signal);
       }
       await options.sessionMemory?.recordCompactionAttempt("full", true);
       return {
@@ -79,11 +83,12 @@ export async function compactConversationPipeline(options: CompactConversationOp
     }
   } catch (error) {
     options.signal?.throwIfAborted();
+    if (options.recoverFromSummaryError?.(error) === false) throw error;
     // Context collapse is the bounded recovery path used when the full summarizer
     // cannot produce a valid replacement. It preserves recent turns and complete
     // tool-use/result pairs, and never masks aborts or returns the original
     // over-budget history as if compaction succeeded.
-    const collapsed = collapseOldRounds(working, options.thresholdTokens);
+    const collapsed = collapseOldRounds(working, options.thresholdTokens, options.keepRecentMessages, options.allowToolRoundBoundary);
     await options.sessionMemory?.recordCompactionAttempt("full", false);
     if (!collapsed.collapsed) throw error;
     return {
@@ -97,7 +102,7 @@ export async function compactConversationPipeline(options: CompactConversationOp
     };
   }
 
-  const collapsed = collapseOldRounds(working, options.thresholdTokens);
+  const collapsed = collapseOldRounds(working, options.thresholdTokens, options.keepRecentMessages, options.allowToolRoundBoundary);
   working = collapsed.messages;
   workingTokens = estimateConversationTokens(working);
   return {
@@ -115,32 +120,29 @@ export function pruneToolResults(
   messages: ConversationMessage[],
   options: { keepRecent: number; minimumChars: number },
 ): { messages: ConversationMessage[]; pruned: number } {
-  const resultIds = messages.flatMap((message) =>
-    message.role === "user"
-      ? message.content.filter((block): block is ToolResultBlock => block.type === "tool-result").map((block) => block.toolUseId)
-      : []
-  );
-  const keepRecent = Math.max(0, options.keepRecent);
-  const retained = new Set(keepRecent === 0 ? [] : resultIds.slice(-keepRecent));
+  const resultCount = messages.reduce((count, message) => count + (message.role === "user"
+    ? message.content.filter((block) => block.type === "tool-result").length : 0), 0);
+  const firstRetained = resultCount - Math.max(0, options.keepRecent);
   const toolNames = new Map<string, string>();
-  for (const message of messages) {
-    if (message.role !== "assistant") continue;
-    for (const block of message.content.filter((item): item is ToolUseBlock => item.type === "tool-use")) {
-      toolNames.set(block.id, block.name);
-    }
-  }
   let pruned = 0;
+  let occurrence = 0;
   const output = structuredClone(messages);
   for (const message of output) {
-    if (message.role !== "user") continue;
+    if (message.role === "assistant") {
+      for (const block of message.content) if (block.type === "tool-use") toolNames.set(block.id, block.name);
+      continue;
+    }
     for (const block of message.content) {
-      if (
-        block.type !== "tool-result" || retained.has(block.toolUseId) ||
-        block.content.length < pruneThreshold(toolNames.get(block.toolUseId), options.minimumChars) || block.content === PRUNED_RESULT
-      ) continue;
+      if (block.type !== "tool-result") continue;
       const tool = toolNames.get(block.toolUseId) ?? "tool";
-      block.content = `${PRUNED_RESULT} ${tool}; ${block.content.length.toLocaleString()} characters.`;
-      pruned += 1;
+      toolNames.delete(block.toolUseId);
+      const retained = occurrence++ >= firstRetained;
+      if (retained || block.content.startsWith(PRUNED_RESULT) ||
+        block.content.length < pruneThreshold(tool, options.minimumChars)) continue;
+      const replacement = `${PRUNED_RESULT} ${tool}; ${block.content.length.toLocaleString()} characters.`;
+      if (replacement.length >= block.content.length) continue;
+      block.content = replacement;
+      pruned++;
     }
   }
   return { messages: output, pruned };
@@ -159,20 +161,26 @@ export function collapseOldRounds(
   messages: ConversationMessage[],
   thresholdTokens: number,
   keepRecentMessages = 8,
+  allowToolRounds = false,
 ): { messages: ConversationMessage[]; collapsed: boolean; removed: number } {
+  assertBalancedToolHistory(messages);
+  const preTokens = estimateConversationTokens(messages);
   if (messages.length <= keepRecentMessages + 2) return { messages: structuredClone(messages), collapsed: false, removed: 0 };
-  const keepFrom = findSafeUserBoundary(messages, messages.length - keepRecentMessages);
-  if (keepFrom <= 2) return { messages: structuredClone(messages), collapsed: false, removed: 0 };
+  const keepFrom = findSafeHistoryBoundary(messages, messages.length - keepRecentMessages, allowToolRounds);
+  if (keepFrom <= 2 || keepFrom === messages.length) return { messages: structuredClone(messages), collapsed: false, removed: 0 };
   const targetTokens = Math.max(1, Math.floor(thresholdTokens * 0.9));
   for (let removeThrough = 2; removeThrough <= keepFrom; removeThrough += 1) {
     const boundary = messages[removeThrough];
-    if (boundary?.role !== "user" || boundary.content.some((block) => block.type === "tool-result")) continue;
+    if (!boundary || (!allowToolRounds && (boundary.role !== "user" || boundary.content.some((block) => block.type === "tool-result")))) continue;
+    try { assertBalancedToolHistory(messages.slice(removeThrough)); } catch { continue; }
     const candidate = collapsedHistory(messages, removeThrough);
-    if (estimateConversationTokens(candidate) <= targetTokens) {
+    const candidateTokens = estimateConversationTokens(candidate);
+    if (candidateTokens <= targetTokens && candidateTokens < preTokens) {
       return { messages: candidate, collapsed: true, removed: removeThrough };
     }
   }
   const output = collapsedHistory(messages, keepFrom);
+  if (estimateConversationTokens(output) >= preTokens) return { messages: structuredClone(messages), collapsed: false, removed: 0 };
   return { messages: output, collapsed: true, removed: keepFrom };
 }
 
@@ -192,12 +200,4 @@ function collapsedHistory(messages: ConversationMessage[], removeThrough: number
     { role: "assistant", content: [{ type: "text", text: "I will continue from the retained context." }] },
     ...structuredClone(messages.slice(removeThrough)),
   ];
-}
-
-function findSafeUserBoundary(messages: ConversationMessage[], preferredIndex: number): number {
-  for (let index = Math.max(1, preferredIndex); index < messages.length; index += 1) {
-    const message = messages[index];
-    if (message?.role === "user" && message.content.every((block) => block.type !== "tool-result")) return index;
-  }
-  return messages.length;
 }

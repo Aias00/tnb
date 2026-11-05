@@ -12,9 +12,14 @@ records. Both flags require `--output-format stream-json`.
 ## Limits
 
 - `--max-turns <count>` stops before starting another model turn.
-- `--max-budget-usd <amount>` stops as soon as provider-reported usage crosses
-  the invocation limit. Every possible primary and fallback model must have
-  pricing configured so the limit cannot silently become ineffective.
+- `--max-budget-usd <amount>` stops new requests and cancels shared work when
+  reported spend reaches the invocation limit. Main turns, delegated agents,
+  Skills, summaries, Hook models and active-invocation MCP sampling share it.
+  Primary, fallback and child models require configured pricing. Already-sent
+  parallel requests can overshoot; cancellation can leave unreported charges.
+  Usage is persisted as received, even on failed runs. Managed background
+  agents retain their originating budget; a returned JSON result is a usage
+  snapshot and later charges appear in the session ledger.
 - `--allowed-tools` and `--disallowed-tools` accept repeated or comma-separated
   exact tool names. The internal structured-output tool is not user-filterable.
 - `--add-dir <directory>` is repeatable and adds a canonical, session-scoped

@@ -2,6 +2,8 @@ import { describe, expect, test } from "bun:test";
 
 import { createSkillTool, selectSkillTools } from "../../src/services/skills/tool";
 import { defineTool } from "../../src/core/tool";
+import { createPermissionChecker } from "../../src/core/permissions";
+import { runAgentLoop } from "../../src/core/agent-loop";
 
 const read = defineTool({
   name: "read",
@@ -22,6 +24,26 @@ const bash = defineTool({
 });
 
 describe("Skill tool", () => {
+  test("named Skill permissions allow the selected fork and enforce deny before broad approval", async () => {
+    for (const denied of [false, true]) {
+      let calls = 0, turns = 0;
+      const skill = createSkillTool({ skills: [{ name: "review", description: "Review", instructions: "Review", baseDir: "/skills/review", source: "user" }],
+        runSkill: async () => { calls++; return "reviewed"; } });
+      const check = createPermissionChecker({ mode: denied ? "bypassPermissions" : "default",
+        rules: { allow: [denied ? "skill" : "skill(review)"], deny: denied ? ["skill(review)"] : [] } });
+      const result = await runAgentLoop({ model: "fixture", prompt: "Review", tools: [skill],
+        authorize: (tool, input, context) => check({ ...tool, risk: tool.access }, input, undefined, context),
+        transport: { async *stream() {
+          if (!turns++) {
+            yield { type: "tool-start", index: 0, id: "review", name: "skill" };
+            yield { type: "tool-input", index: 0, json: '{"name":"REVIEW"}' };
+            yield { type: "response-end", reason: "tool-use" };
+          } else { yield { type: "text", index: 0, text: "done" }; yield { type: "response-end", reason: "end-turn" }; }
+        } } });
+      expect(calls).toBe(denied ? 0 : 1);
+      expect(result.messages[2]!.content[0]).toMatchObject({ type: "tool-result", isError: denied });
+    }
+  });
   test("limits a fork to explicitly allowed tools", () => {
     expect(selectSkillTools([read, bash], ["Read"])).toEqual([read]);
     expect(selectSkillTools([read, bash], undefined)).toEqual([read, bash]);

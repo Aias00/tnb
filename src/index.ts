@@ -11,6 +11,8 @@ export * from "./providers/openai";
 export * from "./providers/openai-responses";
 export * from "./providers/models";
 export * from "./providers/types";
+export * from "./services/usage/budget";
+export * from "./services/usage/cost";
 export * from "./services/compact/compact";
 export * from "./services/mcp/client";
 export * from "./services/mcp/config";

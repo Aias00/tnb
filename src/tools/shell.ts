@@ -62,20 +62,31 @@ export function createShellTools(
     createBashInputTool(manager),
     createBashResizeTool(manager),
     createBashKillTool(manager),
-  ];
+  ].map((tool) => tool.bindExecution ? tool : {
+    ...tool,
+    bindExecution() {
+      const revision = manager.targetRevision;
+      return { ...tool, async execute(input, signal, onProgress) {
+        if (manager.targetRevision !== revision) throw new Error("Shell targets changed; request fresh approval");
+        return tool.execute(input, signal, onProgress);
+      } };
+    },
+  });
 }
 
 function createManagedBashTool(
   manager: ShellSessionManager,
   env: Record<string, string | undefined>,
+  approvedCwd?: string,
 ): AgentTool {
   const defaultTimeout = bashTimeout(env.BASH_DEFAULT_TIMEOUT_MS, DEFAULT_BASH_TIMEOUT_MS);
   const maxTimeout = Math.max(
     defaultTimeout,
     bashTimeout(env.BASH_MAX_TIMEOUT_MS, MAX_BASH_TIMEOUT_MS),
   );
-  const shell = resolveShellInvocation(env);
+  const shell = resolveShellInvocation(manager.environment);
   return defineTool<ManagedBashInput>({
+    bindExecution: () => createManagedBashTool(manager, { ...env }, manager.captureCwd()),
     name: "bash",
     description: BASH_TOOL_PROMPT,
     inputSchema: objectSchema(
@@ -107,7 +118,7 @@ function createManagedBashTool(
     access: "execute",
     isReadOnly: ({ command }) => analyzeShellCommand(command, {
       family: shell.family,
-      cwd: manager.cwd,
+      cwd: approvedCwd ?? manager.cwd,
     }).isReadOnly,
     permissionRuleContent: ({ command }) => command,
     validate(input) {
@@ -135,14 +146,16 @@ function createManagedBashTool(
       if (input.pty) {
         return formatPty(await manager.startPty({
           command: input.command,
+          cwd: approvedCwd ?? manager.cwd,
+          signal,
           ...(input.cols === undefined ? {} : { cols: input.cols }),
           ...(input.rows === undefined ? {} : { rows: input.rows }),
           ...(input.waitMs === undefined ? {} : { waitMs: input.waitMs }),
           ...(input.idleMs === undefined ? {} : { idleMs: input.idleMs }),
         }));
       }
-      if (input.runInBackground) return formatTask(await manager.runBackground(input.command));
-      return manager.runForeground(input.command, input.timeout ?? defaultTimeout, signal, onProgress);
+      if (input.runInBackground) return formatTask(await manager.runBackground(input.command, { cwd: approvedCwd ?? manager.cwd, signal }));
+      return manager.runForeground(input.command, input.timeout ?? defaultTimeout, signal, onProgress, approvedCwd ?? manager.cwd);
     },
   });
 }
@@ -292,6 +305,9 @@ function formatTask(task: ShellTaskSnapshot): string {
     `status: ${task.status}`,
     ...(task.exitCode === undefined ? [] : [`exit_code: ${task.exitCode}`]),
     `output_file: ${task.outputPath}`,
+    ...(task.outputTruncated ? ["output_truncated: true (showing recent output)"] : []),
+    ...(task.logTruncated ? ["log_truncated: true (log quota reached; only a prefix was saved)"] : []),
+    ...(task.logError ? [`log_error: ${task.logError}`] : []),
   ];
   return `${header.join("\n")}\n\n${task.output.trim() || "(no output yet)"}`;
 }

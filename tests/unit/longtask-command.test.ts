@@ -1,0 +1,13 @@
+import { expect, test } from "bun:test";
+import { parseSlashCommand, slashCommandHelp, suggestSlashCommands } from "../../src/ui/slash-commands";
+
+test("long tasks are discoverable slash commands with aliases in the shared parser", () => {
+  for (const name of ["task", "TASK", "longtask", "long", "长任务", "LONGTASK"]) {
+    expect(parseSlashCommand(`/${name} status`)).toMatchObject({ kind: "command", command: { name: "longtask", argument: "status" } });
+  }
+  expect(suggestSlashCommands("/long").some((command) => command.name === "longtask")).toBe(true);
+  expect(suggestSlashCommands("/长").some((command) => command.name === "longtask")).toBe(true);
+  expect(suggestSlashCommands("/task").some((command) => command.name === "longtask")).toBe(true);
+  expect(parseSlashCommand("/tasks")).toMatchObject({ kind: "command", command: { name: "tasks" } });
+  expect(slashCommandHelp()).toContain('/longtask "objective"');
+});

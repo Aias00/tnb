@@ -33,6 +33,7 @@ export type TuiState = {
   todos: TodoItem[];
   streamingText: string;
   busy: boolean;
+  activity?: "working" | "compacting";
   usage: UsageTotals;
   lastInputTokens: number;
   contextWindowTokens: number;
@@ -41,6 +42,8 @@ export type TuiState = {
 };
 
 export type TuiAction =
+  | { type: "activity"; phase: "working" | "compacting" }
+  | { type: "notice"; message: string; noticeId?: string }
   | { type: "submit"; text: string }
   | { type: "command-start"; text: string }
   | {
@@ -115,6 +118,13 @@ function commitStreamingText(state: TuiState): TuiState {
 }
 
 export function reduceTuiState(state: TuiState, action: TuiAction): TuiState {
+  if (action.type === "activity") return { ...state, activity: action.phase };
+  if (action.type === "notice") {
+    const id = action.noticeId ? `runtime-notice:${action.noticeId}` : undefined;
+    if (id && state.transcript.some((entry) => entry.id === id)) return state;
+    return { ...state, ...appendTranscript(state, { kind: "system", text: action.message, tone: "info" }, id),
+      messages: [...state.messages, { role: "system", text: action.message, tone: "info" }] };
+  }
   if (action.type === "permission-mode-change") {
     return { ...state, permissionMode: action.mode };
   }

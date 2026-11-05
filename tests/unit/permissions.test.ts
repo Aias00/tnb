@@ -25,6 +25,28 @@ function tool(name: string, risk: "read" | "write" | "execute" | "network" | "un
 }
 
 describe("permission checker", () => {
+  test("live bypass requests still respect disabled bypass and trusted folders", async () => {
+    for (const constraints of [{ disableYolo: true }, { cwd: "/untrusted", trustedFolders: ["/trusted"] }]) {
+      const check = createPermissionChecker({ mode: "default", getMode: () => "bypassPermissions", ...constraints });
+      expect((await check(tool("Write", "write"), {})).behavior).toBe("deny");
+    }
+  });
+
+  test("an approval cannot override plan or deny rules installed while the prompt was open", async () => {
+    for (const source of ["prompt", "hook"] as const) {
+      let plan = false;
+      const check = createPermissionChecker({ mode: "default", getMode: () => plan ? "plan" : "default",
+        ...(source === "prompt" ? { onAsk: async () => { plan = true; return "allow" as const; } }
+          : { onPermissionRequest: async () => { plan = true; return { behavior: "allow" as const }; } }),
+      });
+      expect((await check(tool("Write", "write"), {})).behavior).toBe("deny");
+    }
+    const rules = { deny: [] as string[] };
+    const check = createPermissionChecker({ mode: "default", rules,
+      onAsk: async () => { rules.deny.push("Write"); return "allow"; },
+    });
+    expect((await check(tool("Write", "write"), {})).behavior).toBe("deny");
+  });
   test("default mode allows reads and denies mutations in non-interactive use", async () => {
     const check = createPermissionChecker({ mode: "default" });
 

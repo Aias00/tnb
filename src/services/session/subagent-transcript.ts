@@ -1,10 +1,13 @@
-import { appendFile, mkdir, readFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 
 import type { ConversationMessage } from "../../core/message";
+import { CallJournal } from "./call-journal";
+import { appendJsonl } from "../../utils/jsonl-append";
 
 export class SubagentTranscript {
   readonly filePath: string;
+  readonly calls: CallJournal;
 
   constructor(options: { projectDir: string; sessionId: string; agentId: string }) {
     this.filePath = join(
@@ -13,19 +16,11 @@ export class SubagentTranscript {
       "subagents",
       `${options.agentId}.jsonl`,
     );
+    this.calls = new CallJournal(`${this.filePath}.calls`);
   }
 
   async append(message: ConversationMessage): Promise<void> {
-    await mkdir(dirname(this.filePath), { recursive: true });
-    await appendFile(
-      this.filePath,
-      `${JSON.stringify({
-        version: 1,
-        timestamp: new Date().toISOString(),
-        message,
-      })}\n`,
-      "utf8",
-    );
+    await appendJsonl(this.filePath, [{ version: 1, timestamp: new Date().toISOString(), message }]);
   }
 
   async read(): Promise<ConversationMessage[]> {
@@ -50,7 +45,9 @@ export class SubagentTranscript {
         throw error;
       }
     }
-    return coalesceUserMessages(repairInterruptedTail(messages));
+    // Preserve outstanding calls: a missing result does not prove the effect never happened.
+    // The shared recovery gate reconciles journaled outcomes or blocks unknown effects.
+    return this.calls.recover(coalesceUserMessages(messages), (message) => this.append(message));
   }
 }
 
@@ -80,16 +77,6 @@ function isConversationMessage(value: unknown): value is ConversationMessage {
       (item.type === "image" && typeof item.source === "object") ||
       (item.type === "document" && typeof item.source === "object" && typeof item.filename === "string");
   });
-}
-
-function repairInterruptedTail(messages: ConversationMessage[]): ConversationMessage[] {
-  const restored = structuredClone(messages);
-  const last = restored.at(-1);
-  if (last?.role !== "assistant") return restored;
-  if (!last.content.some((block) => block.type === "tool-use")) return restored;
-  last.content = last.content.filter((block) => block.type !== "tool-use");
-  if (!last.content.length) restored.pop();
-  return restored;
 }
 
 function coalesceUserMessages(messages: ConversationMessage[]): ConversationMessage[] {

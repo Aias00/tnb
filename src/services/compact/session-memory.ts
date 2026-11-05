@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 import type { ConversationMessage } from "../../core/message";
@@ -17,6 +17,8 @@ export type SessionMemorySnapshot = {
   toolCallCount: number;
   messageCount: number;
   updatedAt: string;
+  /** Monotonic session-log revision, independent of context size after compaction. */
+  sourceRevision?: number;
   compaction: {
     consecutiveFailures: number;
     lastAttemptAt?: string;
@@ -53,7 +55,8 @@ export class SessionMemoryStore {
       toolCallCount - this.snapshot.toolCallCount >= TOOL_CALLS_BETWEEN_UPDATES;
   }
 
-  async save(summary: string, messages: ConversationMessage[], tokenCount: number): Promise<SessionMemorySnapshot> {
+  async save(summary: string, messages: ConversationMessage[], tokenCount: number, sourceRevision?: number, signal?: AbortSignal): Promise<SessionMemorySnapshot> {
+    signal?.throwIfAborted();
     const normalized = summary.trim().slice(0, MAX_SNAPSHOT_CHARS);
     if (!normalized) throw new Error("Session Memory summary must not be empty");
     const snapshot: SessionMemorySnapshot = {
@@ -63,12 +66,13 @@ export class SessionMemoryStore {
       toolCallCount: countToolCalls(messages),
       messageCount: messages.length,
       updatedAt: new Date().toISOString(),
+      ...(sourceRevision === undefined ? {} : { sourceRevision }),
       compaction: this.snapshot?.compaction ?? { consecutiveFailures: 0 },
     };
     await this.update((current) => {
       if (current && compareSnapshotProgress(current, snapshot) > 0) return current;
       return { ...snapshot, compaction: current?.compaction ?? snapshot.compaction };
-    });
+    }, signal);
     return this.current()!;
   }
 
@@ -76,11 +80,13 @@ export class SessionMemoryStore {
     messages: ConversationMessage[],
     tokenCount: number,
     summarize: (messages: ConversationMessage[], signal?: AbortSignal) => Promise<string>,
+    sourceRevision?: number,
+    signal?: AbortSignal,
   ): void {
     if (this.refreshTask || !this.shouldRefresh(messages, tokenCount)) return;
     const snapshotMessages = structuredClone(messages);
-    this.refreshTask = summarize(snapshotMessages)
-      .then((summary) => this.save(summary, snapshotMessages, tokenCount))
+    this.refreshTask = summarize(snapshotMessages, signal)
+      .then((summary) => { signal?.throwIfAborted(); return this.save(summary, snapshotMessages, tokenCount, sourceRevision, signal); })
       .then(() => undefined)
       .catch(() => undefined)
       .finally(() => { this.refreshTask = undefined; });
@@ -121,14 +127,22 @@ export class SessionMemoryStore {
     ].join("\n");
   }
 
-  private async update(operation: (current: SessionMemorySnapshot | undefined) => SessionMemorySnapshot): Promise<void> {
+  private async update(operation: (current: SessionMemorySnapshot | undefined) => SessionMemorySnapshot, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     await withFileLock(this.filePath, async () => {
+      signal?.throwIfAborted();
       const current = await readSnapshot(this.filePath);
+      signal?.throwIfAborted();
       const snapshot = operation(current);
       await mkdir(dirname(this.filePath), { recursive: true });
       const temporary = `${this.filePath}.${process.pid}.${randomUUID()}.tmp`;
-      await writeFile(temporary, `${JSON.stringify(snapshot, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-      await rename(temporary, this.filePath);
+      try {
+        await writeFile(temporary, `${JSON.stringify(snapshot, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx", signal });
+        signal?.throwIfAborted();
+        await rename(temporary, this.filePath);
+      } finally {
+        await unlink(temporary).catch((error) => { if (!isMissing(error)) throw error; });
+      }
       this.snapshot = snapshot;
     });
   }
@@ -156,6 +170,9 @@ async function readSnapshot(path: string): Promise<SessionMemorySnapshot | undef
 }
 
 function compareSnapshotProgress(left: SessionMemorySnapshot, right: SessionMemorySnapshot): number {
+  if (left.sourceRevision !== undefined || right.sourceRevision !== undefined) {
+    return (left.sourceRevision ?? -1) - (right.sourceRevision ?? -1);
+  }
   return left.tokenCount - right.tokenCount || left.toolCallCount - right.toolCallCount || left.messageCount - right.messageCount;
 }
 

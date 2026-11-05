@@ -10,6 +10,7 @@ export type OpenAITransportOptions = {
   headers?: Record<string, string>;
   fetch?: FetchLike;
   maxOutputTokens?: number;
+  maxRetries?: number;
   compat?: OpenAICompatibility;
   reasoning?: boolean;
   reasoningEffort?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -22,7 +23,7 @@ export function createOpenAITransport(options: OpenAITransportOptions): ModelTra
     async *stream(request, signal) {
       yield* streamWithRetry(
         () => streamOpenAI(fetcher, options, request, signal),
-        { ...(signal ? { signal } : {}) },
+        { maxRetries: options.maxRetries, ...(signal ? { signal } : {}) },
       );
     },
   };
@@ -86,7 +87,14 @@ async function* streamOpenAI(
       });
 
       let ended = false;
+      const blockIndexes = new Map<string, number>();
+      const blockIndex = (key: string): number => {
+        let index = blockIndexes.get(key);
+        if (index === undefined) { index = blockIndexes.size; blockIndexes.set(key, index); }
+        return index;
+      };
       const toolCalls = new Map<number, {
+        index: number;
         id?: string;
         name?: string;
         started: boolean;
@@ -108,17 +116,20 @@ async function* streamOpenAI(
         }
         for (const choice of chunk.choices ?? []) {
           if (typeof choice.delta?.content === "string" && choice.delta.content) {
-            yield { type: "text", index: 0, text: choice.delta.content };
+            yield { type: "text", index: blockIndex("text"), text: choice.delta.content };
           }
           const reasoning = reasoningDelta(choice.delta);
-          if (reasoning) yield { type: "thinking", index: 0, thinking: reasoning };
+          if (reasoning) yield { type: "thinking", index: blockIndex("thinking"), thinking: reasoning };
           for (const call of choice.delta?.tool_calls ?? []) {
-            const index = call.index ?? 0;
-            const state = toolCalls.get(index) ?? { started: false, pendingJson: [] };
+            const wireIndex = call.index ?? 0;
+            if (!Number.isSafeInteger(wireIndex) || wireIndex < 0) throw new ProviderStreamError("Invalid OpenAI tool call index");
+            // Chat tool indexes are local to tool_calls; canonical indexes span every content kind.
+            const state = toolCalls.get(wireIndex) ?? { index: blockIndex(`tool:${wireIndex}`), started: false, pendingJson: [] };
+            const index = state.index;
             if (call.id) state.id = call.id;
             if (call.function?.name) state.name = call.function.name;
             if (call.function?.arguments) state.pendingJson.push(call.function.arguments);
-            toolCalls.set(index, state);
+            toolCalls.set(wireIndex, state);
             if (!state.started && state.id && state.name) {
               state.started = true;
               yield { type: "tool-start", index, id: state.id, name: state.name };

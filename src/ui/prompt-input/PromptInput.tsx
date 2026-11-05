@@ -31,6 +31,7 @@ export type PromptInputControllerProps = {
   onSubmit(input: PromptInputSubmit): void;
   onNotice?(message: string): void;
   mousePosition?: { row: number; column: number; nonce: number; maxVisibleLines?: number };
+  restoredInput?: { input: PromptInputSubmit; nonce: string };
 };
 
 export function PromptInputController(props: PromptInputControllerProps): null {
@@ -56,6 +57,12 @@ export function PromptInputController(props: PromptInputControllerProps): null {
       : { ...state.current, value: props.value, cursorOffset: props.cursorOffset };
   }, [props.cursorOffset, props.value]);
   useEffect(() => { undo.current.push(state.current, true); }, []);
+  useEffect(() => {
+    const restored = props.restoredInput?.input; if (!restored) return;
+    state.current = { ...createPromptEditorState(restored.display), mode: restored.mode, pastedContents: structuredClone(restored.pastedContents),
+      nextPasteId: Math.max(0, ...Object.keys(restored.pastedContents).map(Number)) + 1 };
+    undo.current.push(state.current, true); props.onChange(structuredClone(state.current));
+  }, [props.restoredInput?.nonce]);
   useEffect(() => {
     if (!props.mousePosition) return;
     const layout = buildPromptLayout({ text: state.current.value, offset: state.current.cursorOffset, terminalColumns: props.columns, prefixColumns: 0, maxVisibleLines: props.mousePosition.maxVisibleLines ?? props.maxVisibleLines });

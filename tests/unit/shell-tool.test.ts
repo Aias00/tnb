@@ -12,12 +12,13 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-async function createManager() {
+async function createManager(env?: Record<string, string | undefined>) {
   const root = await mkdtemp(join(tmpdir(), "tnb-shell-tool-"));
   roots.push(root);
   return new ShellSessionManager({
     cwd: root,
     outputDir: join(root, ".tnb", "shell"),
+    ...(env ? { env } : {}),
   });
 }
 
@@ -34,13 +35,20 @@ describe("shell tool", () => {
   });
 
   test("marks read-only PowerShell aliases as read-only", async () => {
-    const manager = await createManager();
+    const manager = await createManager({ TNB_SHELL: "pwsh.exe" });
     const bash = createShellTools(manager, { TNB_SHELL: "pwsh.exe" }).find((tool) => tool.name === "bash");
 
     expect(bash).toBeDefined();
     expect(bash!.isReadOnly({ command: "dir src | select Name" })).toBe(true);
     expect(bash!.isReadOnly({ command: "New-Item -Path src/tmp -ItemType Directory" })).toBe(false);
 
+    await manager.close();
+  });
+
+  test("permission classification uses the manager's actual shell instead of a conflicting tool environment", async () => {
+    const manager = await createManager({ TNB_SHELL: "/bin/sh" });
+    const bash = createShellTools(manager, { TNB_SHELL: "pwsh.exe" })[0]!;
+    expect(bash.isReadOnly({ command: "dir src | select Name" })).toBe(false);
     await manager.close();
   });
 

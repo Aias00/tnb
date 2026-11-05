@@ -1,5 +1,10 @@
 # Goals and workflows
 
+The [durable task runtime design](superpowers/specs/2026-11-03-durable-task-runtime-design.md)
+and its [review](superpowers/specs/2026-11-03-durable-task-runtime-review.md)
+describe the planned migration to persistent tasks with single/auto/multi
+execution policies. The behavior below describes the existing implementation.
+
 ## Persistent goals
 
 A goal is stored per session under:

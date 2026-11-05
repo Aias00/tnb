@@ -1,15 +1,18 @@
-import { createWriteStream, type WriteStream } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { platform } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { spawn as spawnChild, type ChildProcessWithoutNullStreams } from "node:child_process";
+import type { Readable } from "node:stream";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
 
 import { Terminal } from "@xterm/headless";
 import { resolveShellInvocation } from "../../core/shell-permissions";
 import type { SandboxRuntime } from "../sandbox/macos";
+import { probeSandboxRuntime } from "../sandbox/probe";
 import type { ToolProgressReporter } from "../../core/tool";
+import { MAX_RUNTIME_LOG_BYTES, ShellOutputLog } from "./output";
 
 export const DEFAULT_BASH_TIMEOUT_MS = 120_000;
 export const MAX_BASH_TIMEOUT_MS = 600_000;
@@ -21,7 +24,6 @@ export const MAX_PTY_SESSIONS = 10;
 export const PTY_SESSION_TTL_MS = 1_800_000;
 
 const TASK_OUTPUT_CHARS = 160_000;
-const MAX_TASK_OUTPUT_BYTES = 5 * 1024 * 1024 * 1024;
 
 export type ShellTaskStatus = "running" | "completed" | "failed" | "killed";
 
@@ -33,6 +35,9 @@ export type ShellTaskSnapshot = {
   exitCode?: number;
   output: string;
   outputPath: string;
+  outputTruncated?: boolean;
+  logTruncated?: boolean;
+  logError?: string;
 };
 
 export type PtySnapshot = {
@@ -59,7 +64,7 @@ type BackgroundTask = {
   output: string;
   outputBytes: number;
   outputPath: string;
-  writer: WriteStream;
+  log: ShellOutputLog;
   result: Promise<void>;
   lineBuffer: string;
   onStdoutLine?: (line: string) => void;
@@ -79,10 +84,29 @@ type PtySession = {
   disposables: Array<{ dispose(): void }>;
 };
 
+type BackgroundOptions = {
+  cwd?: string;
+  signal?: AbortSignal;
+  kind?: "bash" | "monitor";
+  onStdoutLine?(line: string): void;
+  onExit?(status: ShellTaskStatus, exitCode: number): void;
+};
+
+type PtyStartOptions = {
+  cwd?: string;
+  signal?: AbortSignal;
+  command: string;
+  cols?: number;
+  rows?: number;
+  waitMs?: number;
+  idleMs?: number;
+};
+
 type Disposable = { dispose(): void };
 
 type PtyBridge = {
   readonly pid: number;
+  readonly closed: Promise<void>;
   onData(listener: (data: string) => void): Disposable;
   onExit(listener: (event: { exitCode: number }) => void): Disposable;
   write(data: string): void;
@@ -98,6 +122,15 @@ export class ShellSessionManager {
   readonly #tasks = new Map<string, BackgroundTask>();
   readonly #taskIdsByPid = new Map<number, string>();
   readonly #ptySessions = new Map<number, PtySession>();
+  readonly #sandboxProbes = new Map<string, Promise<void>>();
+  readonly #lifetime = new AbortController();
+  readonly #operations = new Set<Promise<unknown>>();
+  readonly #closingPtys = new Set<Promise<void>>();
+  #closing: Promise<void> | undefined;
+  #pendingPtys = 0;
+  #targetRevision = 0;
+  #logBytes = 0;
+  get targetRevision(): number { return this.#targetRevision; }
 
   constructor(options: {
     cwd: string;
@@ -107,7 +140,7 @@ export class ShellSessionManager {
   }) {
     this.#cwd = options.cwd;
     this.#outputDir = options.outputDir;
-    this.#env = options.env ?? process.env;
+    this.#env = Object.freeze({ ...(options.env ?? process.env) });
     this.#sandbox = options.sandbox;
   }
 
@@ -119,37 +152,66 @@ export class ShellSessionManager {
     return this.#cwd;
   }
 
+  get environment(): Record<string, string | undefined> { return { ...this.#env }; }
+
+  captureCwd(): string { return realpathSync(this.#cwd); }
+
   async runForeground(
     command: string,
     timeoutMs: number,
     signal: AbortSignal,
     onProgress?: ToolProgressReporter,
+    cwd = this.#cwd,
   ): Promise<string> {
-    const child = this.#spawnChild(command);
+    return this.#own(() => this.#runForeground(command, timeoutMs,
+      AbortSignal.any([signal, this.#lifetime.signal]), onProgress, cwd));
+  }
+
+  async #runForeground(command: string, timeoutMs: number, signal: AbortSignal,
+    onProgress: ToolProgressReporter | undefined, cwd: string): Promise<string> {
+    signal.throwIfAborted();
+    await this.#ensureSandbox(cwd);
+    signal.throwIfAborted();
+    await mkdir(this.#outputDir, { recursive: true });
+    const log = await this.#createLog(`foreground_${randomUUID()}`);
+    if (signal.aborted) { await log.finish(); signal.throwIfAborted(); }
+    let child: ChildProcessWithoutNullStreams;
+    try { child = this.#spawnChild(command, cwd); }
+    catch (error) { await log.finish(); throw error; }
     let stdout = "";
     let stderr = "";
     let liveOutput = "";
+    let totalBytes = 0;
+    let totalLines = 0;
+    let truncated = false;
     const startedAt = Date.now();
     const report = () => onProgress?.({
       output: liveOutput,
       fullOutput: liveOutput,
       elapsedTimeSeconds: Math.max(0, Math.floor((Date.now() - startedAt) / 1000)),
-      totalLines: countOutputLines(liveOutput),
-      totalBytes: Buffer.byteLength(liveOutput, "utf8"),
+      totalLines: totalLines + (liveOutput && !liveOutput.endsWith("\n") ? 1 : 0),
+      totalBytes,
       timeoutMs,
     });
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
-      liveOutput += chunk;
+      stdout = (stdout + chunk).slice(-TASK_OUTPUT_CHARS);
+      append(chunk, child.stdout);
       report();
     });
     child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
-      liveOutput += chunk;
+      stderr = (stderr + chunk).slice(-TASK_OUTPUT_CHARS);
+      append(chunk, child.stderr);
       report();
     });
+    function append(chunk: string, source: Readable) {
+      totalBytes += Buffer.byteLength(chunk, "utf8");
+      totalLines += (chunk.match(/\n/g) ?? []).length;
+      truncated ||= liveOutput.length + chunk.length > TASK_OUTPUT_CHARS;
+      liveOutput = (liveOutput + chunk).slice(-TASK_OUTPUT_CHARS);
+      log.append(chunk, source);
+    }
     const progressTimer = onProgress ? setInterval(report, 1_000) : undefined;
     progressTimer?.unref?.();
 
@@ -160,30 +222,44 @@ export class ShellSessionManager {
     }, timeoutMs);
     const abort = () => killChildTree(child);
     signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
     try {
       const exitCode = await childExit(child);
+      await log.finish();
       if (signal.aborted) throw signal.reason ?? new Error("Command was interrupted");
       if (timedOut) throw new Error(`Command timed out after ${timeoutMs}ms`);
-      const output = formatCommandOutput(stdout, stderr);
+      const notice = truncated || log.truncated || log.error
+        ? `\n[Output preview truncated: ${truncated}. Log: ${log.path}. ${log.error ? `Log write failed: ${log.error}.` : log.truncated ? "Log quota reached; only a prefix was saved." : "Complete output saved."}]` : "";
+      const output = formatCommandOutput(stdout, stderr) + notice;
       if (exitCode !== 0) throw new Error(output || `Command exited with code ${exitCode}`);
       return output || "Command completed successfully with no output";
     } finally {
       clearTimeout(timeout);
       if (progressTimer) clearInterval(progressTimer);
       signal.removeEventListener("abort", abort);
+      await log.finish();
     }
   }
 
-  async runBackground(command: string, options: {
-    kind?: "bash" | "monitor";
-    onStdoutLine?(line: string): void;
-    onExit?(status: ShellTaskStatus, exitCode: number): void;
-  } = {}): Promise<ShellTaskSnapshot> {
+  async runBackground(command: string, options: BackgroundOptions = {}): Promise<ShellTaskSnapshot> {
+    const bound = { ...options, cwd: options.cwd ?? this.#cwd,
+      signal: options.signal ? AbortSignal.any([options.signal, this.#lifetime.signal]) : this.#lifetime.signal };
+    return this.#own(() => this.#runBackground(command, bound));
+  }
+
+  async #runBackground(command: string, options: BackgroundOptions): Promise<ShellTaskSnapshot> {
+    const cwd = options.cwd!;
+    options.signal?.throwIfAborted();
     await mkdir(this.#outputDir, { recursive: true });
+    await this.#ensureSandbox(cwd);
+    options.signal?.throwIfAborted();
     const id = `${options.kind ?? "bash"}_${randomUUID().slice(0, 8)}`;
-    const outputPath = join(this.#outputDir, `${id}.log`);
-    const writer = createWriteStream(outputPath, { flags: "a", encoding: "utf8" });
-    const child = this.#spawnChild(command);
+    const log = await this.#createLog(id);
+    if (options.signal?.aborted) { await log.finish(); options.signal.throwIfAborted(); }
+    let child: ChildProcessWithoutNullStreams;
+    try { child = this.#spawnChild(command, cwd); }
+    catch (error) { await log.finish(); throw error; }
+    const exited = childExit(child);
     const task: BackgroundTask = {
       id,
       pid: child.pid ?? 0,
@@ -192,30 +268,40 @@ export class ShellSessionManager {
       status: "running",
       output: "",
       outputBytes: 0,
-      outputPath,
-      writer,
+      outputPath: log.path,
+      log,
       result: Promise.resolve(),
       lineBuffer: "",
       ...(options.onStdoutLine ? { onStdoutLine: options.onStdoutLine } : {}),
       ...(options.onExit ? { onExit: options.onExit } : {}),
     };
     if (!task.pid) {
-      writer.end();
+      await exited.finally(() => log.finish());
       throw new Error("Background command did not expose a process id");
     }
     this.#tasks.set(id, task);
+    this.#targetRevision++;
     this.#taskIdsByPid.set(task.pid, id);
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => this.#appendTaskOutput(task, chunk, true));
     child.stderr.on("data", (chunk: string) => this.#appendTaskOutput(task, chunk));
-    task.result = childExit(child).then((exitCode) => {
-      if (task.lineBuffer) task.onStdoutLine?.(task.lineBuffer);
-      task.lineBuffer = "";
+    task.result = exited.then(async (exitCode) => {
+      await log.finish();
       task.exitCode = exitCode;
       task.status = task.status === "killed" ? "killed" : exitCode === 0 ? "completed" : "failed";
-      task.onExit?.(task.status, exitCode);
-      writer.end();
+      const reportObserverError = (error: unknown) => {
+        task.output = `${task.output}\n[Task observer failed: ${error instanceof Error ? error.message : String(error)}]`.slice(-TASK_OUTPUT_CHARS);
+      };
+      try { if (task.lineBuffer) task.onStdoutLine?.(task.lineBuffer); }
+      catch (error) { reportObserverError(error); }
+      task.lineBuffer = "";
+      try { task.onExit?.(task.status, exitCode); }
+      catch (error) { reportObserverError(error); }
+    }).catch(async (error: Error) => {
+      await log.finish();
+      task.status = "failed";
+      task.output = `${task.output}\n${error.message}`.slice(-TASK_OUTPUT_CHARS);
     });
     return snapshotTask(task);
   }
@@ -231,28 +317,38 @@ export class ShellSessionManager {
     ];
   }
 
-  async startPty(options: {
-    command: string;
-    cols?: number;
-    rows?: number;
-    waitMs?: number;
-    idleMs?: number;
-  }): Promise<PtySnapshot> {
+  async startPty(options: PtyStartOptions): Promise<PtySnapshot> {
+    const bound = { ...options, cwd: options.cwd ?? this.#cwd,
+      signal: options.signal ? AbortSignal.any([options.signal, this.#lifetime.signal]) : this.#lifetime.signal };
+    if (this.#ptySessions.size + this.#pendingPtys >= MAX_PTY_SESSIONS) {
+      throw new Error(`At most ${MAX_PTY_SESSIONS} PTY sessions may be active`);
+    }
+    this.#pendingPtys++;
+    try { return await this.#own(() => this.#startPty(bound)); }
+    finally { this.#pendingPtys--; }
+  }
+
+  async #startPty(options: PtyStartOptions): Promise<PtySnapshot> {
     if (this.#ptySessions.size >= MAX_PTY_SESSIONS) {
       throw new Error(`At most ${MAX_PTY_SESSIONS} PTY sessions may be active`);
     }
     const cols = positiveDimension(options.cols, DEFAULT_PTY_COLS, "cols");
     const rows = positiveDimension(options.rows, DEFAULT_PTY_ROWS, "rows");
+    const cwd = options.cwd ?? this.#cwd;
+    await this.#ensureSandbox(cwd);
+    options.signal?.throwIfAborted();
     const shell = resolveShell(this.#env);
-    const executable = this.#wrapExecutable(shell.file, shell.args(options.command));
+    const executable = this.#wrapExecutable(shell.file, shell.args(options.command), cwd);
     const process = await spawnPtyBridge({
       file: executable.file,
       args: executable.args,
       cols,
       rows,
-      cwd: this.#cwd,
+      cwd,
       env: this.#env,
+      signal: options.signal,
     });
+    if (options.signal?.aborted) { process.kill(); await process.closed; options.signal.throwIfAborted(); }
     const terminal = new Terminal({ cols, rows, scrollback: 10_000, allowProposedApi: true });
     const session: PtySession = {
       pid: process.pid,
@@ -282,7 +378,9 @@ export class ShellSessionManager {
       }),
     );
     this.#ptySessions.set(session.pid, session);
+    this.#targetRevision++;
     await this.#waitForPty(session, options.waitMs, options.idleMs, initialActivity);
+    options.signal?.throwIfAborted();
     return this.#snapshotPty(session);
   }
 
@@ -349,6 +447,8 @@ export class ShellSessionManager {
     const session = this.#ptySessions.get(pid);
     if (!session) return;
     clearTimeout(session.expires);
+    this.#closingPtys.add(session.process.closed);
+    void session.process.closed.finally(() => { this.#closingPtys.delete(session.process.closed); });
     if (session.alive) {
       try {
         session.process.kill();
@@ -359,48 +459,75 @@ export class ShellSessionManager {
     for (const disposable of session.disposables) disposable.dispose();
     session.terminal.dispose();
     this.#ptySessions.delete(pid);
+    this.#targetRevision++;
   }
 
-  async close(): Promise<void> {
-    for (const task of this.#tasks.values()) {
-      if (task.status === "running") {
-        task.status = "killed";
-        killChildTree(task.process);
+  close(): Promise<void> {
+    if (this.#closing) return this.#closing;
+    this.#lifetime.abort(new Error("Shell runtime is closing; new commands are not admitted"));
+    this.#closing = (async () => {
+      for (const task of this.#tasks.values()) {
+        if (task.status === "running") { task.status = "killed"; killChildTree(task.process); }
       }
-    }
-    for (const pid of [...this.#ptySessions.keys()]) this.closePty(pid);
-    await Promise.allSettled([...this.#tasks.values()].map((task) => task.result));
+      for (const pid of [...this.#ptySessions.keys()]) this.closePty(pid);
+      await Promise.allSettled([...this.#operations]);
+      for (const pid of [...this.#ptySessions.keys()]) this.closePty(pid);
+      await Promise.allSettled([...this.#tasks.values()].map((task) => task.result));
+      await Promise.all([...this.#closingPtys]);
+    })();
+    return this.#closing;
   }
 
-  #spawnChild(command: string): ChildProcessWithoutNullStreams {
+  #own<T>(operation: () => Promise<T>): Promise<T> {
+    this.#lifetime.signal.throwIfAborted();
+    const pending = Promise.resolve().then(() => { this.#lifetime.signal.throwIfAborted(); return operation(); });
+    this.#operations.add(pending);
+    void pending.finally(() => { this.#operations.delete(pending); }).catch(() => undefined);
+    return pending;
+  }
+
+  #spawnChild(command: string, cwd: string): ChildProcessWithoutNullStreams {
     const shell = resolveShell(this.#env);
-    const executable = this.#wrapExecutable(shell.file, shell.args(command));
+    const executable = this.#wrapExecutable(shell.file, shell.args(command), cwd);
     return spawnChild(executable.file, executable.args, {
-      cwd: this.#cwd,
+      cwd,
       env: this.#env as NodeJS.ProcessEnv,
       detached: platform() !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
     });
   }
 
-  #wrapExecutable(file: string, args: string[]): { file: string; args: string[] } {
-    return this.#sandbox?.wrap(file, args, this.#cwd) ?? { file, args };
+  async #ensureSandbox(cwd: string): Promise<void> {
+    if (!this.#sandbox) return;
+    let probe = this.#sandboxProbes.get(cwd);
+    if (!probe) {
+      probe = probeSandboxRuntime(this.#sandbox, cwd, this.#env, this.#lifetime.signal);
+      this.#sandboxProbes.set(cwd, probe);
+    }
+    await probe;
+  }
+
+  #wrapExecutable(file: string, args: string[], cwd: string): { file: string; args: string[] } {
+    return this.#sandbox?.wrap(file, args, cwd) ?? { file, args };
   }
 
   #appendTaskOutput(task: BackgroundTask, chunk: string, notify = false): void {
     task.outputBytes += Buffer.byteLength(chunk, "utf8");
-    if (task.outputBytes > MAX_TASK_OUTPUT_BYTES) {
-      task.status = "killed";
-      killChildTree(task.process);
-      return;
-    }
-    task.writer.write(chunk);
+    task.log.append(chunk, notify ? task.process.stdout : task.process.stderr);
     task.output = `${task.output}${chunk}`.slice(-TASK_OUTPUT_CHARS);
     if (notify && task.onStdoutLine) {
       const lines = `${task.lineBuffer}${chunk}`.split(/\r?\n/);
-      task.lineBuffer = lines.pop() ?? "";
+      task.lineBuffer = (lines.pop() ?? "").slice(-TASK_OUTPUT_CHARS);
       for (const line of lines) if (line.trim()) task.onStdoutLine(line);
     }
+  }
+
+  async #createLog(id: string): Promise<ShellOutputLog> {
+    return ShellOutputLog.create(join(this.#outputDir, `${id}.log`), (requested) => {
+      const bytes = Math.min(requested, MAX_RUNTIME_LOG_BYTES - this.#logBytes);
+      this.#logBytes += bytes;
+      return bytes;
+    });
   }
 
   #requireTask(idOrPid: string | number): BackgroundTask {
@@ -466,12 +593,6 @@ export class ShellSessionManager {
   }
 }
 
-function countOutputLines(output: string): number {
-  if (!output) return 0;
-  const lines = output.split(/\r?\n/);
-  return output.endsWith("\n") ? lines.length - 1 : lines.length;
-}
-
 async function spawnPtyBridge(options: {
   file: string;
   args: string[];
@@ -479,8 +600,13 @@ async function spawnPtyBridge(options: {
   rows: number;
   cwd: string;
   env: Record<string, string | undefined>;
+  signal?: AbortSignal;
 }): Promise<PtyBridge> {
-  const moduleUrl = import.meta.resolve("@lydell/node-pty");
+  options.signal?.throwIfAborted();
+  // The Node bridge needs real JS/native files; Bun's virtual bundle cannot
+  // supply a require() target to a separate Node process.
+  const companion = join(dirname(process.execPath), "node_modules", "@lydell", "node-pty", "index.js");
+  const moduleUrl = existsSync(companion) ? companion : import.meta.resolve("@lydell/node-pty");
   const modulePath = moduleUrl.startsWith("file:") ? fileURLToPath(moduleUrl) : moduleUrl;
   const node = options.env.TNB_NODE_PATH ?? "node";
   const host = spawnChild(node, ["-e", PTY_HOST_SOURCE], {
@@ -494,8 +620,11 @@ async function spawnPtyBridge(options: {
       TNB_PTY_ROWS: String(options.rows),
       TNB_PTY_CWD: options.cwd,
     } as NodeJS.ProcessEnv,
+    detached: platform() !== "win32",
     stdio: ["pipe", "pipe", "pipe"],
   });
+  const closed = new Promise<void>((resolve) => { host.once("close", () => resolve()); });
+  const terminateHost = () => killChildTree(host);
   host.stdout.setEncoding("utf8");
   host.stderr.setEncoding("utf8");
   let stderr = "";
@@ -558,11 +687,21 @@ async function spawnPtyBridge(options: {
       for (const listener of exitListeners) listener({ exitCode: code ?? 1 });
     }
   });
+  const abortStartup = () => {
+    rejectStarted(options.signal?.reason ?? new Error("PTY startup cancelled"));
+    terminateHost();
+  };
+  options.signal?.addEventListener("abort", abortStartup, { once: true });
+  if (options.signal?.aborted) abortStartup();
   try {
     await started;
   } catch (error) {
-    host.kill();
+    terminateHost();
+    await closed;
     throw error;
+  } finally {
+    clearTimeout(startupTimeout);
+    options.signal?.removeEventListener("abort", abortStartup);
   }
 
   const send = (message: Record<string, unknown>) => {
@@ -570,6 +709,7 @@ async function spawnPtyBridge(options: {
   };
   return {
     pid: ptyPid,
+    closed,
     onData(listener) {
       dataListeners.add(listener);
       for (const data of pendingData.splice(0)) listener(data);
@@ -589,7 +729,7 @@ async function spawnPtyBridge(options: {
     kill() {
       send({ type: "kill" });
       setTimeout(() => {
-        if (!host.killed) host.kill();
+        if (host.exitCode === null && host.signalCode === null) terminateHost();
       }, 250).unref();
     },
   };
@@ -612,6 +752,8 @@ const reserved = new Set([
 const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !reserved.has(key)));
 const emit = (event) => process.stdout.write(JSON.stringify(event) + "\n");
 let terminal;
+process.on("exit", () => { try { terminal?.kill("SIGKILL"); } catch {} });
+process.on("SIGTERM", () => { try { terminal?.kill("SIGKILL"); } catch {} process.exit(0); });
 try {
   terminal = spawn(process.env.TNB_PTY_FILE, args, {
     name: "xterm-256color",
@@ -630,12 +772,15 @@ terminal.onExit(({ exitCode }) => {
   emit({ type: "exit", exitCode });
   setTimeout(() => process.exit(0), 20);
 });
-readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("line", (line) => {
+readline.createInterface({ input: process.stdin, crlfDelay: Infinity }).on("close", () => {
+  try { terminal.kill("SIGKILL"); } catch {}
+  setTimeout(() => process.exit(0), 100);
+}).on("line", (line) => {
   try {
     const message = JSON.parse(line);
     if (message.type === "write") terminal.write(Buffer.from(message.data, "base64").toString("utf8"));
     else if (message.type === "resize") terminal.resize(message.cols, message.rows);
-    else if (message.type === "kill") terminal.kill();
+    else if (message.type === "kill") terminal.kill("SIGKILL");
   } catch (error) {
     emit({ type: "error", message: error instanceof Error ? error.message : String(error) });
   }
@@ -658,6 +803,9 @@ function snapshotTask(task: BackgroundTask): ShellTaskSnapshot {
     ...(task.exitCode === undefined ? {} : { exitCode: task.exitCode }),
     output: task.output,
     outputPath: task.outputPath,
+    outputTruncated: task.outputBytes > Buffer.byteLength(task.output, "utf8"),
+    logTruncated: task.log.truncated,
+    ...(task.log.error ? { logError: task.log.error } : {}),
   };
 }
 
@@ -668,12 +816,27 @@ function formatCommandOutput(stdout: string, stderr: string): string {
 function childExit(child: ChildProcessWithoutNullStreams): Promise<number> {
   return new Promise((resolve, reject) => {
     child.once("error", reject);
-    child.once("exit", (code, signal) => resolve(code ?? (signal === "SIGTERM" ? 143 : 1)));
+    child.once("close", (code, signal) => resolve(code ?? (signal === "SIGTERM" ? 143 : 1)));
   });
 }
 
 function killChildTree(child: ChildProcessWithoutNullStreams): void {
   if (!child.pid) return;
+  if (!terminations.has(child)) {
+    const timer = setTimeout(() => {
+      terminations.delete(child);
+      // A group member can keep inherited pipes open after the leader exits.
+      // On Unix, close (which clears this timer) is the drain boundary.
+      if (platform() === "win32" && (child.exitCode !== null || child.signalCode !== null)) return;
+      try {
+        if (platform() === "win32") child.kill("SIGKILL");
+        else process.kill(-child.pid!, "SIGKILL");
+      } catch { try { child.kill("SIGKILL"); } catch { /* Already gone. */ } }
+    }, 250);
+    timer.unref();
+    terminations.set(child, timer);
+    child.once("close", () => { clearTimeout(timer); terminations.delete(child); });
+  }
   try {
     if (platform() === "win32") child.kill();
     else process.kill(-child.pid, "SIGTERM");
@@ -685,6 +848,8 @@ function killChildTree(child: ChildProcessWithoutNullStreams): void {
     }
   }
 }
+
+const terminations = new WeakMap<ChildProcessWithoutNullStreams, ReturnType<typeof setTimeout>>();
 
 function positiveDimension(value: number | undefined, fallback: number | undefined, name: string): number {
   const resolved = value ?? fallback;

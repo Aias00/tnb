@@ -37,10 +37,15 @@ for (const entry of await readdir(nativeLibrary, { withFileTypes: true })) {
   }
 }
 await copyFile(join(nativePackage, "NOTICE.txt"), join(outputDirectory, "typescript-NOTICE.txt"));
+await cp(join(root, "third_party", "licenses"), join(outputDirectory, "licenses"), { recursive: true, force: true });
 await cp(
   join(root, "src", "services", "skills", "bundled"),
   join(outputDirectory, "skills", "bundled"),
   { recursive: true, force: true },
 );
+for (const name of ["node-pty", `node-pty-${platform()}-${arch()}`]) {
+  await cp(join(root, "node_modules", "@lydell", name), join(outputDirectory, "node_modules", "@lydell", name),
+    { recursive: true, force: true, dereference: true });
+}
 
-process.stdout.write(`Built ${join(outputDirectory, cliName)} with TypeScript semantic-analysis companion and bundled skill resources\n`);
+process.stdout.write(`Built ${join(outputDirectory, cliName)} with TypeScript, PTY companions and bundled skill resources\n`);

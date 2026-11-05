@@ -6,6 +6,7 @@ import {
   createSandboxRuntime,
   getSandboxAvailability,
 } from "../../src/services/sandbox/macos";
+import { defaultReadableRoots } from "../../src/services/sandbox/shared";
 
 function host(overrides: Partial<ReturnType<typeof createSandboxHost>>) {
   const base = createSandboxHost({ PATH: "/usr/bin:/bin" });
@@ -23,6 +24,19 @@ function host(overrides: Partial<ReturnType<typeof createSandboxHost>>) {
 }
 
 describe("sandbox runtime factory", () => {
+  test("snapshots non-cloneable environment objects before retaining sandbox options", () => {
+    const values = { PATH: "/usr/bin:/bin", TNB_BWRAP_PATH: "/usr/bin/bwrap" };
+    const env = new Proxy(values, {});
+    const settings = { profile: "restrictive" as const, allowedPaths: ["/approved"] };
+    const runtime = createSandbox({ requested: true, env, settings }, host({ platform: "linux" }))!;
+    values.TNB_BWRAP_PATH = "/changed"; settings.allowedPaths.push("/unapproved");
+    expect(runtime.allowedPaths).toEqual(["/approved"]);
+    expect(runtime.wrap("/bin/sh", ["-c", "true"], "/workspace").file).toBe("/usr/bin/bwrap");
+  });
+  test("system bin paths never expand strict read access to the entire filesystem", () => {
+    const roots = defaultReadableRoots("/workspace", [], { PATH: "/bin:/usr/bin:/" }, host({ execPath: "/bin/bun" }));
+    expect(roots).not.toContain("/"); expect(roots).toContain("/bin"); expect(roots).toContain("/workspace");
+  });
   test("returns undefined when sandbox is disabled", () => {
     expect(createSandboxRuntime({ requested: false, env: {} }, host({ platform: "darwin" }))).toBeUndefined();
   });
@@ -117,12 +131,11 @@ describe("sandbox runtime factory", () => {
     const wrapped = runtime?.wrap("C:/Windows/System32/cmd.exe", ["/c", "echo ok"], "C:/work");
     expect(wrapped?.file).toBe("C:/Program Files/PowerShell/7/pwsh.exe");
     expect(wrapped?.args).toEqual(expect.arrayContaining(["-EncodedCommand"]));
-    expect(wrapped?.args.slice(-4)).toEqual([
-      "--tnb-profile",
-      "restrictive",
-      "--tnb-allowed-paths",
-      JSON.stringify(["C:/cache"]),
-    ]);
+    const script = Buffer.from(wrapped!.args.at(-1)!, "base64").toString("utf16le");
+    expect(script).toContain("$tnbCwd = 'C:/work'");
+    expect(script).toContain("$tnbExeArgs = @('/c', 'echo ok')");
+    expect(script).toContain(`$env:TNB_SANDBOX_ALLOWED_PATHS = '["C:/cache"]'`);
+
   });
 
   test("fails closed when no backend is available", () => {

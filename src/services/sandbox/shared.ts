@@ -1,6 +1,6 @@
 import { accessSync, constants, existsSync, realpathSync } from "node:fs";
 import { homedir, platform, tmpdir } from "node:os";
-import { dirname, delimiter, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import type {
   SandboxCommandPreference,
@@ -113,9 +113,7 @@ export function defaultWritableRoots(cwd: string, allowedPaths: readonly string[
   return uniquePaths([
     cwd,
     host.temporaryDirectory,
-    join(host.homeDirectory, ".npm"),
-    join(host.homeDirectory, ".cache"),
-    join(host.homeDirectory, ".bun"),
+    ...[".npm", ".cache", ".bun"].map((name) => join(host.homeDirectory, name)).filter((path) => host.exists(path)),
     ...allowedPaths,
   ], host);
 }
@@ -126,11 +124,15 @@ export function defaultReadableRoots(
   env: Record<string, string | undefined>,
   host: SandboxHost,
 ): string[] {
-  const roots = new Set<string>([cwd, host.canonicalize(dirname(dirname(host.execPath)))]);
+  const executableDirectory = dirname(host.execPath); const runtimeDirectory = dirname(executableDirectory);
+  const roots = new Set<string>([cwd, host.canonicalize(dirname(runtimeDirectory) === runtimeDirectory ? executableDirectory : runtimeDirectory)]);
   for (const entry of splitPathEntries(env.PATH)) {
     if (!entry.trim()) continue;
     const canonical = host.canonicalize(entry);
-    roots.add(canonical.endsWith("/bin") ? dirname(canonical) : canonical);
+    if (dirname(canonical) === canonical) continue;
+    const parent = dirname(canonical);
+    // /bin must never turn strict read access into a grant for the filesystem root.
+    roots.add(canonical.endsWith("/bin") && parent !== "/" ? parent : canonical);
   }
   for (const path of writableRoots) roots.add(host.canonicalize(path));
   return [...roots];
@@ -151,7 +153,9 @@ export function findExecutable(
     : [...names];
   for (const directory of directories) {
     for (const name of candidates) {
-      const candidate = join(directory, name);
+      // Host adapters also simulate other platforms in tests; do not let the
+      // executing OS change separators in the supplied target PATH.
+      const candidate = directory.replace(/[\\/]+$/, "") + "/" + name;
       if (host.canExecute(candidate)) return candidate;
     }
   }
@@ -160,7 +164,7 @@ export function findExecutable(
 
 function splitPathEntries(pathValue: string | undefined, targetPlatform: NodeJS.Platform = platform()): string[] {
   if (!pathValue) return [];
-  const separator = targetPlatform === "win32" ? ";" : delimiter;
+  const separator = targetPlatform === "win32" ? ";" : ":";
   return pathValue.split(separator).filter(Boolean);
 }
 

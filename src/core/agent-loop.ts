@@ -6,6 +6,9 @@ import type {
   ToolUseBlock,
 } from "./message";
 import type { AgentTool, ToolProgressData } from "./tool";
+import { executeTool } from "./tool-runtime";
+import { assertBalancedToolHistory } from "./history";
+import { toolCallScope, type ToolCallJournal } from "./call-journal";
 import type { ToolCatalog } from "./tool-search";
 import type { ModelEvent, ModelTransport, StopReason, TokenUsage } from "../providers/types";
 import { addUsage, EMPTY_USAGE } from "../services/usage/cost";
@@ -23,6 +26,7 @@ export type AgentCompactionResult = {
   messages: ConversationMessage[];
   preTokens: number;
   postTokens: number;
+  details?: Record<string, unknown>;
 };
 
 export type ToolExecutionEvent =
@@ -45,15 +49,19 @@ export type AgentLoopOptions = {
   messages?: ConversationMessage[];
   systemPrompt?: string | (() => string);
   tools: AgentTool[];
+  callJournal?: ToolCallJournal;
+  /** Revision/identity snapshot of mutable session authority; compared after awaits. */
+  executionContext?(): unknown;
+  resolveTools?(): AgentTool[];
   toolCatalog?: ToolCatalog;
   authorize(
     tool: AgentTool,
     input: unknown,
-    context: { toolUseId: string },
+    context: { toolUseId: string; preApproved?: boolean },
   ): Promise<AuthorizationDecision>;
   onEvent?(event: ModelEvent): void;
   onToolEvent?(event: ToolExecutionEvent): void;
-  onMessage?(message: ConversationMessage): void | Promise<void>;
+  onMessage?(message: ConversationMessage, context?: { stopReason?: StopReason }): void | Promise<void>;
   compactMessages?(
     messages: ConversationMessage[],
     signal: AbortSignal,
@@ -64,7 +72,7 @@ export type AgentLoopOptions = {
     prompt?: string | Array<TextBlock | MediaBlock>;
     context?: string[];
   }>;
-  beforeTurn?(): Promise<{ context?: string[] }>;
+  beforeTurn?(): Promise<{ context?: string[]; messages?: ConversationMessage[]; persisted?: boolean }>;
   beforeTool?(event: { id: string; name: string; input: unknown }): Promise<{
     input?: unknown;
     decision?: AuthorizationDecision;
@@ -93,6 +101,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<{
   stopReason: Exclude<StopReason, "tool-use">;
   usage: TokenUsage;
 }> {
+  assertBalancedToolHistory(options.messages ?? []);
   const signal = options.signal ?? new AbortController().signal;
   const maxTurns = options.maxTurns;
   const messages: ConversationMessage[] = structuredClone(options.messages ?? []);
@@ -119,6 +128,10 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<{
   for (let turn = 0; maxTurns === undefined || turn < maxTurns; turn += 1) {
     signal.throwIfAborted();
     const turnContext = await options.beforeTurn?.();
+    for (const message of turnContext?.messages ?? []) {
+      messages.push(structuredClone(message));
+      if (!turnContext?.persisted) await options.onMessage?.(structuredClone(message));
+    }
     if (turnContext?.context?.length) {
       const message: ConversationMessage = {
         role: "user",
@@ -134,7 +147,10 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<{
         await options.onCompact?.(structuredClone(compacted));
       }
     }
-    const availableTools = options.toolCatalog?.listTools() ?? options.tools;
+    assertBalancedToolHistory(messages);
+    const currentTools = options.resolveTools?.() ?? options.tools;
+    if (options.resolveTools) options.toolCatalog?.replaceTools?.(currentTools);
+    const availableTools = options.toolCatalog?.listTools() ?? currentTools;
     const blocks = new Map<
       number,
       | { kind: "text"; text: string }
@@ -221,16 +237,25 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<{
             ...(block.signature ? { signature: block.signature } : {}),
           } as const;
         }
+        if (stopReason === "max-tokens" || stopReason === "cancelled") return undefined;
         return {
           type: "tool-use",
           id: block.id,
           name: block.name,
           input: parseInput(block.name, block.json),
         } as const;
-      });
+      }).filter((block): block is NonNullable<typeof block> => block !== undefined);
     const assistantMessage: ConversationMessage = { role: "assistant", content };
-    messages.push(assistantMessage);
-    await options.onMessage?.(structuredClone(assistantMessage));
+    const callIds = new Set<string>();
+    for (const block of content) {
+      if (block.type !== "tool-use") continue;
+      if (!block.id || callIds.has(block.id)) throw new Error(`Duplicate or empty tool call ID: ${block.id}`);
+      callIds.add(block.id);
+    }
+    if (content.length) {
+      messages.push(assistantMessage);
+      await options.onMessage?.(structuredClone(assistantMessage), { stopReason });
+    }
     if (stopReason === "max-tokens" && outputTokenRecoveries < MAX_OUTPUT_TOKEN_RECOVERIES) {
       outputTokenRecoveries += 1;
       const recoveryMessage: ConversationMessage = {
@@ -270,8 +295,9 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<{
     }
 
     const results: Array<ToolResultBlock | MediaBlock> = [];
+    const scope = options.callJournal ? options.callJournal.scope?.(messages) ?? toolCallScope(messages) : undefined;
     for (const use of content.filter((block): block is ToolUseBlock => block.type === "tool-use")) {
-      const outcome = await executeTool(use, options, signal);
+      const outcome = await executeTool(use, { ...options, tools: availableTools, toolCatalog: undefined }, signal, scope);
       results.push(outcome.result, ...outcome.attachments);
     }
     if (results.length === 0) throw new Error("Model requested tool use without a tool call");
@@ -290,7 +316,7 @@ function providerMessages(messages: ConversationMessage[]): ConversationMessage[
   });
 }
 
-function isContextOverflowError(error: unknown): boolean {
+export function isContextOverflowError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   const message = `${error.name} ${error.message}`.toLowerCase();
   return [
@@ -307,94 +333,6 @@ function parseInput(name: string, json: string): unknown {
   }
 }
 
-async function executeTool(
-  use: ToolUseBlock,
-  options: AgentLoopOptions,
-  signal: AbortSignal,
-): Promise<{ result: ToolResultBlock; attachments: MediaBlock[] }> {
-  const tool = options.toolCatalog
-    ? options.toolCatalog.getTool(use.name)
-    : options.tools.find((candidate) => candidate.name === use.name);
-  if (!tool) return { result: toolError(use.id, `Unknown tool: ${use.name}`), attachments: [] };
-  let started = false;
-  let startedAt = 0;
-  try {
-    let input = tool.validate(use.input);
-    const pre = await options.beforeTool?.({ id: use.id, name: use.name, input: structuredClone(input) });
-    if (pre?.input !== undefined) input = tool.validate(pre.input);
-    const decision = pre?.decision ?? await options.authorize(tool, input, { toolUseId: use.id });
-    if (decision.behavior === "deny") {
-      return { result: toolError(use.id, decision.message), attachments: [] };
-    }
-    if (decision.updatedInput !== undefined) input = tool.validate(decision.updatedInput);
-    signal.throwIfAborted();
-    startedAt = Date.now();
-    options.onToolEvent?.({
-      type: "tool-execution-start",
-      id: use.id,
-      name: use.name,
-      input: structuredClone(input),
-      startedAt,
-    });
-    started = true;
-    const output = await tool.execute(input, signal, (data) => {
-      options.onToolEvent?.({
-        type: "tool-execution-progress",
-        id: use.id,
-        name: use.name,
-        data: structuredClone(data),
-      });
-    });
-    const content = typeof output === "string" ? output : output.content;
-    const attachments = typeof output === "string" ? [] : output.attachments;
-    const post = await options.afterTool?.({
-      id: use.id,
-      name: use.name,
-      input: structuredClone(input),
-      output: content,
-      isError: false,
-    });
-    const resultContent = appendTextContext(content, [...(pre?.context ?? []), ...(post?.context ?? [])]);
-    options.onToolEvent?.({
-      type: "tool-execution-end",
-      id: use.id,
-      name: use.name,
-      output: resultContent,
-      isError: false,
-      durationMs: Date.now() - startedAt,
-    });
-    return {
-      result: {
-        type: "tool-result",
-        toolUseId: use.id,
-        content: resultContent,
-        isError: false,
-      },
-      attachments,
-    };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const post = await options.afterTool?.({
-      id: use.id,
-      name: use.name,
-      input: use.input,
-      output: message,
-      isError: true,
-    }).catch(() => undefined);
-    const resultContent = appendTextContext(message, post?.context);
-    if (started) {
-      options.onToolEvent?.({
-        type: "tool-execution-end",
-        id: use.id,
-        name: use.name,
-        output: resultContent,
-        isError: true,
-        durationMs: Date.now() - startedAt,
-      });
-    }
-    return { result: toolError(use.id, resultContent), attachments: [] };
-  }
-}
 
 function appendContext(
   prompt: string | Array<TextBlock | MediaBlock>,
@@ -404,14 +342,4 @@ function appendContext(
   const text = context.join("\n\n");
   if (typeof prompt === "string") return `${prompt}\n\n<hook-context>\n${text}\n</hook-context>`;
   return [...prompt, { type: "text", text: `\n\n<hook-context>\n${text}\n</hook-context>` }];
-}
-
-function appendTextContext(value: string, context: string[] | undefined): string {
-  return context?.length
-    ? `${value}\n\nHook context:\n${context.join("\n\n")}`
-    : value;
-}
-
-function toolError(toolUseId: string, content: string): ToolResultBlock {
-  return { type: "tool-result", toolUseId, content, isError: true };
 }

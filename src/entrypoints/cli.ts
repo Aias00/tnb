@@ -2,7 +2,7 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { readdir, readFile, stat, unlink } from "node:fs/promises";
+import { readdir, readFile, stat, unlink, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { arch, platform, release } from "node:os";
 import { join, resolve } from "node:path";
@@ -23,7 +23,7 @@ import {
   type PermissionChecker,
   type ToolPolicy,
 } from "../core/permissions";
-import { inferPlanModeState, PermissionModeState } from "../core/plan-mode";
+import { inferPlanModeState } from "../core/plan-mode";
 import type { AgentTool } from "../core/tool";
 import { WorkspaceState, type WorkspaceRootSource } from "../core/workspace-state";
 import { buildSystemPrompt } from "../constants/prompts";
@@ -31,6 +31,7 @@ import { getAutoCompactThresholdForCapabilities } from "../providers/models";
 import {
   createConfiguredTransport,
   createConfiguredTransportWithFallback,
+  resolveBillingRoute,
   type ReasoningEffort,
 } from "../providers/factory";
 import { ProviderHttpError, ProviderStreamError } from "../providers/retry";
@@ -124,6 +125,7 @@ import {
 } from "../services/commands/loader";
 import {
   createEditTool,
+  isolateFileToolReads,
   createGlobTool,
   createGrepTool,
   createReadTool,
@@ -160,7 +162,8 @@ import { formatIdeContextPrompt, IdeJsonRpcBridge, isIdeJsonRpcLine } from "../s
 import { runIdeCommand } from "../services/remote-control/ide-command";
 import { createSessionWorktree } from "../services/worktree/manager";
 import { CheckpointManager } from "../services/checkpoint/manager";
-import { addUsage, calculateCostUsd, EMPTY_USAGE } from "../services/usage/cost";
+import { EMPTY_USAGE } from "../services/usage/cost";
+import { UsageBudget } from "../services/usage/budget";
 import {
   loadPlugins,
   loadPluginHooks,
@@ -189,6 +192,7 @@ import {
   type TodoItem,
 } from "../tools/interaction";
 import { createTerminalPermissionPrompt, createTerminalQuestionPrompt, runRepl } from "../ui/repl";
+import { FileInputQueueStorage } from "../ui/input-queue";
 import { formatResumeHint, runTui } from "../ui/app";
 import { editPromptInExternalEditor } from "../ui/external-editor";
 import { CLI_COMMANDS, isUnknownCliCommand, SIMPLE_COMMAND_HELP } from "../services/cli/commands";
@@ -201,15 +205,17 @@ import { setShutdownResumeHint, setupGracefulShutdown } from "../utils/graceful-
 import { McpActivityController } from "../ui/mcp-activity-controller";
 import { PermissionController } from "../ui/permission-controller";
 import { QuestionController } from "../ui/question-controller";
-import type { ManagementView, SlashCommandRequest, SlashCommandResult } from "../ui/slash-commands";
+import { DurableQuestionInbox } from "../services/runtime/attention";
+import { parseSlashCommand, type ManagementView, type SlashCommandRequest, type SlashCommandResult } from "../ui/slash-commands";
 import packageJson from "../../package.json";
+import { createDurableTaskTool, DURABLE_CONVERSATION_INSTRUCTIONS } from "../services/runtime/conversation-tool";
 
 type Writer = { write(text: string): unknown };
 
 const BUILT_IN_TOOL_NAMES = [
   "agent", "ask_user_question", "bash", "bash_input", "bash_kill", "bash_output", "bash_resize",
   "checkpoint_create", "checkpoint_list", "checkpoint_rollback", "codebase_investigator",
-  "complete_task", "cron_create", "cron_delete", "cron_list", "edit", "enter_plan_mode",
+  "complete_task", "cron_create", "cron_delete", "cron_list", "durable_task", "edit", "enter_plan_mode",
   "enter_worktree", "exit_plan_mode", "exit_worktree", "glob", "goal_create", "goal_get",
   "goal_update", "grep", "monitor", "notebook_edit", "read", "schedule_wakeup", "send_message", "skill", "task_create", "task_get",
   "task_list", "task_output", "task_stop", "task_update", "todo_write", "update_topic", "web_fetch",
@@ -223,6 +229,8 @@ export type CliOptions = {
   stdout: Writer;
   stderr: Writer;
   transport?: ModelTransport;
+  /** Route requests from shared MCP connections through the current invocation ledger. */
+  onInvocationTransport?(transport: ModelTransport | undefined): void;
   shellManager?: ShellSessionManager;
   mcpConnections?: McpConnections;
   taskManager?: TaskManager;
@@ -243,6 +251,7 @@ export type CliOptions = {
   quiet?: boolean;
   signal?: AbortSignal;
   onEvent?(event: ModelEvent): void;
+  onActivity?(phase: "working" | "compacting"): void;
   onToolEvent?(event: ToolExecutionEvent): void;
   onPermissionModeChange?(mode: PermissionMode): void;
   teamRecoveryActive?: boolean;
@@ -250,7 +259,7 @@ export type CliOptions = {
   contextWindowOverride?: number;
 };
 
-type ParsedArguments = {
+export type ParsedArguments = {
   prompt: string;
   provider?: string;
   model?: string;
@@ -300,6 +309,9 @@ export type StreamJsonCliOptions = Omit<CliOptions, "promptContent"> & {
 };
 
 export async function runStreamJsonCli(options: StreamJsonCliOptions): Promise<number> {
+  // Subscribe before asynchronous resume/fork preparation: readline starts flowing
+  // immediately and can otherwise lose piped input (including EOF) during startup.
+  const input = options.input[Symbol.asyncIterator]();
   const sessionIdFactory = options.sessionIdFactory ?? randomUUID;
   const permissionSessionRules = options.permissionSessionRules ?? [];
   const configDir = options.configDir ?? options.env.TNB_HOME ?? join(homedir(), ".tnb");
@@ -376,13 +388,10 @@ export async function runStreamJsonCli(options: StreamJsonCliOptions): Promise<n
       return undefined;
     }
     if (record.subtype === "set_model") {
-      const separator = record.model.indexOf("/");
-      if (separator > 0) {
-        selectedProvider = record.model.slice(0, separator);
-        selectedModel = record.model.slice(separator + 1);
-      } else {
-        selectedModel = record.model;
-      }
+      const catalog = await loadProviderCatalog({ configDir, env: options.env });
+      const selection = resolveInteractiveModel(catalog, record.model);
+      selectedProvider = selection.provider.id;
+      selectedModel = selection.model.id;
       return {
         provider: selectedProvider,
         model: selectedModel,
@@ -390,6 +399,7 @@ export async function runStreamJsonCli(options: StreamJsonCliOptions): Promise<n
     }
     if (record.subtype === "set_permission_mode") {
       selectedPermissionMode = record.mode;
+      sharedTaskManager?.permissionModeState.synchronize({ mode: record.mode });
       return { permissionMode: selectedPermissionMode };
     }
     if (record.subtype === "context_usage") {
@@ -471,7 +481,7 @@ export async function runStreamJsonCli(options: StreamJsonCliOptions): Promise<n
 
   const inputTask = (async () => {
     try {
-      for await (const line of options.input) {
+      for await (const line of { [Symbol.asyncIterator]: () => input }) {
         if (!line.trim()) continue;
         const record = parseStreamInput(line);
         if (record.type === "user") {
@@ -544,6 +554,10 @@ export async function runStreamJsonCli(options: StreamJsonCliOptions): Promise<n
       ],
       sessionIdFactory: () => sessionId!,
       permissionSessionRules,
+      onPermissionModeChange(mode) {
+        selectedPermissionMode = mode;
+        options.onPermissionModeChange?.(mode);
+      },
       ...(sharedTaskManager ? { taskManager: sharedTaskManager } : {}),
       signal: activeController.signal,
       permissionPrompt: (request) => inputClosed
@@ -975,6 +989,17 @@ function stripGoalLoopOptions(argv: string[]): string[] {
 }
 
 export async function runCli(options: CliOptions): Promise<number> {
+  let releaseSession: (() => Promise<void>) | undefined;
+  const workspaceReleases: Array<() => Promise<void>> = [];
+  const lockedWorkspaces = new Set<string>();
+  const workspaceOwner = randomUUID();
+  const lockWorkspace = async (path: string) => {
+    const canonical = await realpath(path); if (lockedWorkspaces.has(canonical)) return;
+    const { acquireWorkspace } = await import("../services/runtime/workspace");
+    workspaceReleases.push(await acquireWorkspace(canonical, workspaceOwner)); lockedWorkspaces.add(canonical);
+  };
+  let usageBudget: UsageBudget | undefined;
+  let releasePermissionObserver: (() => void) | undefined;
   let teamSupervisor = options.teamSupervisor;
   let ownsTeamSupervisor = false;
   let mcp: McpConnections | undefined;
@@ -991,11 +1016,21 @@ export async function runCli(options: CliOptions): Promise<number> {
   let completed = false;
   try {
     const parsed = parseArguments(options.argv, options.env);
-    await loadPromptFiles(parsed, options.cwd);
     const configDir =
       options.configDir ?? options.env.TNB_HOME ?? join(homedir(), ".tnb");
     const workspace = options.workspaceState ?? new WorkspaceState(options.cwd);
     applyAdditionalWorkspaceRoots(workspace, parsed.additionalDirectories);
+    try { for (const root of [options.cwd, ...workspace.roots()]) await lockWorkspace(root); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ELOCKED") throw error;
+      const { runtimeRequest } = await import("../services/runtime/server");
+      try { await runtimeRequest(configDir, "/health"); } catch { throw error; }
+      for (const release of workspaceReleases.splice(0).reverse()) await release();
+      const { runRuntimeControlTurn } = await import("../services/runtime/conversation");
+      return await runRuntimeControlTurn(options, parsed, { workspace: workspace.current(), roots: workspace.roots(),
+        prepare: () => prepareInteractiveSession({ parsed, configDir, cwd: options.cwd, sessionIdFactory: options.sessionIdFactory ?? randomUUID }) });
+    }
+    await loadPromptFiles(parsed, options.cwd);
     const [providerCatalog, settings] = await Promise.all([
       loadProviderCatalog({ configDir, env: options.env }),
       loadSettings({ configDir, cwd: options.cwd, ...(parsed.settingsInput ? { additional: parsed.settingsInput } : {}) }),
@@ -1044,7 +1079,6 @@ export async function runCli(options: CliOptions): Promise<number> {
         throw new Error(`--max-budget-usd requires pricing for fallback ${fallbackSelection.provider.id}/${fallbackSelection.model.id}`);
       }
     }
-    let billingSelection = selection;
     for (const warning of settings.warnings ?? []) options.stderr.write(`tnb: ${warning}\n`);
     const requestedPermissionMode =
       parsed.permissionMode ?? mainAgentProfile?.permissionMode ?? settings.permissions?.defaultMode ?? "default";
@@ -1096,6 +1130,10 @@ export async function runCli(options: CliOptions): Promise<number> {
       });
       if (parsed.sessionId) await assertSessionIdAvailable(configDir, options.cwd, parsed.sessionId);
     }
+    releaseSession = await session.acquireRun();
+    const restoredSession = resumedSessionId
+      ? await session.readState()
+      : { messages: [] as ConversationMessage[] };
     if (parsed.sessionName) await session.setTitle(parsed.sessionName);
     pluginToolRuntime = options.pluginToolRuntime ?? new PluginToolRuntimeManager(options.env);
     ownsPluginToolRuntime = options.pluginToolRuntime === undefined;
@@ -1106,13 +1144,21 @@ export async function runCli(options: CliOptions): Promise<number> {
     );
     await pluginLifecycle.initialize();
     await pluginLifecycle.start(activePlugins);
-    const transport = options.transport ?? lazyModelTransport(() => createConfiguredTransportWithFallback(
-      selection,
-      fallbackSelection,
-      parsed.thinking,
-      () => { billingSelection = fallbackSelection!; },
-      effectiveFastMode,
-    ));
+    usageBudget = new UsageBudget({
+      ...(parsed.maxBudgetUsd !== undefined ? { maxCostUsd: parsed.maxBudgetUsd } : {}),
+      maxConcurrentRequests: positiveInteger(options.env.TNB_MAX_CONCURRENT_MODEL_REQUESTS, "TNB_MAX_CONCURRENT_MODEL_REQUESTS"),
+      onUsage: (record) => session.appendUsage(record),
+    });
+    const budget = usageBudget;
+    // A local options copy shares cancellation with tools, children and maintenance work.
+    options = { ...options, signal: options.signal
+      ? AbortSignal.any([options.signal, budget.signal]) : budget.signal };
+    const meter = (raw: ModelTransport, route: ProviderSelection) => budget.wrap(raw,
+      (request) => resolveBillingRoute(route, request.model), { workspace: options.cwd });
+    const transport = meter(options.transport ?? lazyModelTransport(() => createConfiguredTransportWithFallback(
+      selection, fallbackSelection, parsed.thinking, undefined, effectiveFastMode,
+    )), selection);
+    options.onInvocationTransport?.(transport);
     const hooks = options.hookRunner ?? new HookRunner({
         ...(Object.keys(effectiveHooks).length ? { hooks: effectiveHooks } : {}),
         cwd: options.cwd,
@@ -1151,7 +1197,7 @@ export async function runCli(options: CliOptions): Promise<number> {
       teamStatePath(configDir, session.sessionId),
     );
     if (!options.teamManager) await teamManager.initialize();
-    attachTaskHooks(taskManager, () => hooks, options.signal);
+    attachTaskHooks(taskManager, () => hooks, options.signal, budget);
     const goalManager = new GoalManager(goalStatePath(configDir, session.sessionId));
     await goalManager.initialize();
     shellManager = options.shellManager ?? new ShellSessionManager({
@@ -1165,9 +1211,6 @@ export async function runCli(options: CliOptions): Promise<number> {
       }),
     });
     ownsShellManager = options.shellManager === undefined;
-    const restoredSession = resumedSessionId
-      ? await session.readState()
-      : { messages: [] as ConversationMessage[] };
     if (parsed.worktree) {
       const worktreeName = typeof parsed.worktree === "string"
         ? parsed.worktree
@@ -1199,7 +1242,8 @@ export async function runCli(options: CliOptions): Promise<number> {
       shellManager.setCwd(workspace.current());
       hooks.setCwd(workspace.current());
     }
-    const history = restoredSession.messages;
+    for (const root of workspace.roots()) await lockWorkspace(root);
+    const history = await session.calls.recover(restoredSession.messages, (message) => session.append([message]));
     const permissionRequestHook = (request: PermissionAskRequest, signal?: AbortSignal) =>
       requestPermissionThroughHooks(hooks, request, signal);
     const hookedAskUser: AskUser | undefined = options.askUser
@@ -1210,14 +1254,23 @@ export async function runCli(options: CliOptions): Promise<number> {
       restoredSession.permissionMode ?? resolvedPermissionMode.mode,
       restoredSession.prePlanMode,
     );
-    const permissionModeState = new PermissionModeState(
-      inferredPlanMode.mode,
-      options.onPermissionModeChange,
-      inferredPlanMode.prePlanMode,
-    );
+    const permissionModeState = taskManager.permissionModeState;
+    permissionModeState.synchronize(inferredPlanMode);
+    if (options.onPermissionModeChange) {
+      releasePermissionObserver = permissionModeState.subscribe(options.onPermissionModeChange);
+    }
     if (inferredPlanMode.mode !== resolvedPermissionMode.mode) {
       options.onPermissionModeChange?.(inferredPlanMode.mode);
     }
+    const executionContext = () => ({
+      workspace: workspace.revision,
+      cwd: workspace.current(),
+      shellCwd: shellManager?.cwd,
+      roots: workspace.additionalRoots(),
+      permissionMode: permissionModeState.revision,
+      denyRules: settings.permissions?.deny,
+      askRules: settings.permissions?.ask,
+    });
     const checkPermission = createPermissionChecker({
       ...permissionBaseOptions,
       mode: resolvedPermissionMode.mode,
@@ -1435,7 +1488,8 @@ export async function runCli(options: CliOptions): Promise<number> {
       });
       const prompt = parsed.systemPrompt ?? mainAgentProfile?.prompt ?? defaultPrompt;
       const goalReminder = goalManager.reminder();
-      return [prompt, parsed.appendSystemPrompt, memory.prompt(), sessionMemory.prompt(), goalReminder].filter(Boolean).join("\n\n");
+      return [prompt, parsed.appendSystemPrompt, memory.prompt(), sessionMemory.prompt(), goalReminder,
+        enabledTools.some((tool) => tool.name === "durable_task") ? DURABLE_CONVERSATION_INSTRUCTIONS : undefined].filter(Boolean).join("\n\n");
     };
     const runAgentTask = async ({
       prompt, description, profile, model, runInBackground, name, teamName, taskId, resume, signal, existingRuntimeTaskId, existingAgentId, restoreTranscript,
@@ -1470,7 +1524,11 @@ export async function runCli(options: CliOptions): Promise<number> {
           agentId = member.agentId;
           if (taskId) await taskManager.update(taskId, { status: "in_progress", owner: teammateName });
         }
-        const ordinaryTools = selectAgentTools(baseTools.filter((tool) => !isTeamTool(tool.name)), profile);
+        const ordinaryTools = isolateFileToolReads(
+          selectAgentTools(baseTools.filter((tool) => !isTeamTool(tool.name)), profile), workspace.current,
+          { supportsVision: selection.model.supportsVision, supportsPdf: selection.model.supportsPdf },
+          () => [...workspace.additionalRoots(), ...(memory.enabled ? [memory.directory] : [])],
+        );
         const nestedTools = teamName && teammateName
           ? [
               ...ordinaryTools,
@@ -1491,19 +1549,30 @@ export async function runCli(options: CliOptions): Promise<number> {
           ...permissionBaseOptions,
           mode: requestedAgentMode,
         });
+        const agentHooks = hooks.fork();
         const authorizeAgent = createPermissionChecker({
           ...permissionBaseOptions,
           mode: resolvedAgentMode.mode,
-          onPermissionRequest: permissionRequestHook,
+          getMode: () => permissionModeState.current === "plan" || permissionModeState.current === "dontAsk"
+            ? permissionModeState.current : profile.permissionMode ? resolvedAgentMode.mode : permissionModeState.current,
+          onPermissionRequest: (request, hookSignal) => requestPermissionThroughHooks(agentHooks, request, hookSignal),
         });
-        const executeAgent = async (agentSignal: AbortSignal) => {
+        agentHooks.setModelHandlers({
+          prompt: createHookModelHandler({ transport, model: nestedModel, tools: [] }),
+          agent: createHookModelHandler({ transport, model: nestedModel, tools: nestedTools,
+            executionContext, authorize: withPermissionDeniedHooks(authorizeAgent, () => agentHooks),
+            systemPrompt: () => systemPromptFor(nestedTools, nestedModel),
+          }),
+        });
+        const executeAgentWork = async (agentSignal: AbortSignal) => {
+          agentSignal = AbortSignal.any([agentSignal, budget.signal]);
           const transcript = new SubagentTranscript({
             projectDir: session.projectDir,
             sessionId: session.sessionId,
             agentId,
           });
           const restoredMessages = shouldRestoreTranscript || runtimeTaskId ? await transcript.read() : [];
-          const start = await hooks.run("SubagentStart", {
+          const start = await agentHooks.run("SubagentStart", {
             agent_id: agentId,
             agent_type: profile.name,
           }, agentSignal);
@@ -1522,18 +1591,20 @@ export async function runCli(options: CliOptions): Promise<number> {
               ...(restoredMessages.length ? { messages: restoredMessages } : {}),
               systemPrompt: `${systemPromptFor(nestedTools, nestedModel)}\n\n${buildAgentProfileInstruction(profile, description)}`,
               tools: nestedTools,
+              executionContext,
               ...(teamName && teammateName ? {
                 beforeTurn: async () => ({
                   context: await drainTeamContext(teamManager, teamName, teammateName),
                 }),
               } : {}),
               onMessage: (message) => transcript.append(message),
+              callJournal: transcript.calls,
               onStop: async ({ stopHookActive: active, lastAssistantMessage }) => {
                 if (teamName && teammateName) {
                   const inbox = await drainTeamContext(teamManager, teamName, teammateName);
                   if (inbox.length) return { feedback: inbox.join("\n\n") };
                 }
-                const stopped = await hooks.run("SubagentStop", {
+                const stopped = await agentHooks.run("SubagentStop", {
                   agent_id: agentId,
                   agent_type: profile.name,
                   agent_transcript_path: transcript.filePath,
@@ -1548,8 +1619,8 @@ export async function runCli(options: CliOptions): Promise<number> {
                 }
                 return {};
               },
-              authorize: (tool, input, { toolUseId }) =>
-                authorizeToolWithDeniedHook(authorizeAgent, hooks, tool, input, toolUseId, agentSignal),
+              authorize: (tool, input, { toolUseId, preApproved }) =>
+                authorizeToolWithDeniedHook(authorizeAgent, agentHooks, tool, input, toolUseId, agentSignal, preApproved),
               signal: agentSignal,
               maxTurns: profile.maxTurns ?? DEFAULT_SUBAGENT_MAX_TURNS,
             });
@@ -1565,7 +1636,7 @@ export async function runCli(options: CliOptions): Promise<number> {
                   kind: "idle_notification",
                   text: `Teammate ${teammateName} is idle and available for more work.`,
                 });
-                await hooks.run("TeammateIdle", { teammate_name: teammateName, team_name: teamName }, agentSignal);
+                await agentHooks.run("TeammateIdle", { teammate_name: teammateName, team_name: teamName }, agentSignal);
               }
             }
             return finalAssistantText(result.messages);
@@ -1585,6 +1656,10 @@ export async function runCli(options: CliOptions): Promise<number> {
             }
             throw error;
           }
+        };
+        const executeAgent = (agentSignal: AbortSignal) => {
+          const release = budget.retain();
+          return executeAgentWork(agentSignal).finally(release);
         };
         if (runtimeTaskId) {
           if (teamName && teammateName) await teamManager.attachTask(teamName, agentId, runtimeTaskId);
@@ -1633,16 +1708,19 @@ export async function runCli(options: CliOptions): Promise<number> {
               ? agentProfiles.find((profile) => profile.name.toLowerCase() === skill.agent!.toLowerCase())
               : undefined;
             if (skill.agent && !requestedProfile) throw new Error(`Skill ${skill.name} requests unknown agent profile: ${skill.agent}`);
-            const nestedTools = requestedProfile
-              ? selectAgentTools(selectSkillTools(baseTools, skill.allowedTools), requestedProfile)
-              : selectSkillTools(baseTools, skill.allowedTools);
+            const nestedTools = isolateFileToolReads(
+              requestedProfile ? selectAgentTools(selectSkillTools(baseTools, skill.allowedTools), requestedProfile)
+                : selectSkillTools(baseTools, skill.allowedTools), workspace.current,
+              { supportsVision: selection.model.supportsVision, supportsPdf: selection.model.supportsPdf },
+              () => [...workspace.additionalRoots(), ...(memory.enabled ? [memory.directory] : [])],
+            );
             const skillSelection = skill.model
               ? resolveInteractiveModel(providerCatalog, skill.model)
               : selection;
             const skillEffort = normalizeSkillEffort(skill.effort, parsed.thinking);
             const skillTransport = skillSelection.provider.id === selection.provider.id && skillEffort === parsed.thinking
               ? transport
-              : createConfiguredTransport(skillSelection, skillEffort);
+              : meter(createConfiguredTransport(skillSelection, skillEffort), skillSelection);
             const agentId = randomUUID();
             const agentType = requestedProfile?.name ?? `skill:${skill.name}`;
             const transcript = new SubagentTranscript({
@@ -1664,11 +1742,13 @@ export async function runCli(options: CliOptions): Promise<number> {
                 transport: skillTransport,
                 model: skillSelection.model.id,
                 tools: nestedTools,
+                executionContext,
               }),
               agent: createHookModelHandler({
                 transport: skillTransport,
                 model: skillSelection.model.id,
                 tools: nestedTools,
+                executionContext,
               }),
             });
             await skillHooks?.start("startup", skillSelection.model.id, signal);
@@ -1702,7 +1782,9 @@ export async function runCli(options: CliOptions): Promise<number> {
                   "# Active skill\n\nFollow the selected skill instructions and return its result to the parent Agent. Supporting resources remain on disk and should be read only when needed.",
                 ].filter(Boolean).join("\n\n"),
                 tools: nestedTools,
+                executionContext,
                 onMessage: (message) => transcript.append(message),
+                callJournal: transcript.calls,
                 ...(skillHooks ? { beforePrompt: async (submittedPrompt: string | Array<TextBlock | MediaBlock>) => {
                       const text = typeof submittedPrompt === "string"
                         ? submittedPrompt
@@ -1749,7 +1831,7 @@ export async function runCli(options: CliOptions): Promise<number> {
                     ? { feedback: blocked.reason ?? "A SubagentStop hook requested that the skill agent continue." }
                     : {};
                 },
-                authorize: (tool, input, { toolUseId }) =>
+                authorize: (tool, input, { toolUseId, preApproved }) =>
                   authorizeToolWithDeniedHooks(
                     skillPermission,
                     skillHooks ? [skillHooks, hooks] : [hooks],
@@ -1757,6 +1839,7 @@ export async function runCli(options: CliOptions): Promise<number> {
                     input,
                     toolUseId,
                     signal,
+                    preApproved,
                   ),
                 signal,
                 maxTurns: requestedProfile?.maxTurns ?? DEFAULT_SUBAGENT_MAX_TURNS,
@@ -1770,9 +1853,11 @@ export async function runCli(options: CliOptions): Promise<number> {
       : undefined;
     const workflowTool = createWorkflowTool(agentTool);
     const planModeTools = createPlanModeTools(permissionModeState);
+    const durableTool = createDurableTaskTool({ configDir, env: options.env, sessionId: session.sessionId, sourceText: typeof options.promptContent === "string" ? options.promptContent : parsed.prompt,
+      workspace: workspace.current, roots: workspace.roots, provider: selection.provider.id, model: selectedModel });
     const availableTools = skillTool
-      ? [...baseTools, agentTool, workflowTool, ...planModeTools, skillTool]
-      : [...baseTools, agentTool, workflowTool, ...planModeTools];
+      ? [...baseTools, agentTool, workflowTool, ...planModeTools, skillTool, durableTool]
+      : [...baseTools, agentTool, workflowTool, ...planModeTools, durableTool];
     if (options.taskManager && !options.teamRecoveryActive) {
       const recoverTask = async (task: TaskRecord, cause: "recovery" | "message") => {
         const metadata = task.metadata ?? {};
@@ -1864,20 +1949,28 @@ export async function runCli(options: CliOptions): Promise<number> {
       ? undefined
       : createDeferredToolCatalog(tools, {
           threshold: deferredThreshold,
-          eagerNames: ["agent", "skill", "workflow", "enter_plan_mode", "exit_plan_mode", "structured_output"],
+          eagerNames: ["agent", "skill", "workflow", "durable_task", "enter_plan_mode", "exit_plan_mode", "structured_output"],
         });
     if (toolCatalog) {
       toolCatalog.setAuxiliaryTools([createToolSearchTool(toolCatalog)]);
     }
+    const resolveTools = () => {
+      const current = [...availableTools.filter((tool) => !tool.name.startsWith("mcp__")), ...mcp!.tools];
+      const profiled = mainAgentProfile && parsed.tools === undefined
+        ? selectAgentTools(current, mainAgentProfile, { mainThread: true }) : current;
+      const selected = filterCliTools(selectCliTools(profiled, parsed.tools), parsed.allowedTools, parsed.disallowedTools);
+      return parsed.jsonSchema ? [...selected, ...tools.filter((tool) => tool.name === "structured_output")] : selected;
+    };
     const exposedTools = toolCatalog?.listTools() ?? tools;
     hooks.setModelHandlers({
       prompt: createHookModelHandler({ transport, model: selectedModel, tools: [] }),
       agent: createHookModelHandler({
+        executionContext,
         transport,
         model: selectedModel,
-        tools,
+        tools: tools.filter((tool) => tool.name !== "durable_task"),
         authorize: hookedPermission,
-        systemPrompt: () => systemPromptFor(tools),
+        systemPrompt: () => systemPromptFor(tools.filter((tool) => tool.name !== "durable_task")),
       }),
     });
     const compactThresholdTokens = positiveInteger(
@@ -1915,7 +2008,6 @@ export async function runCli(options: CliOptions): Promise<number> {
     const goalWasActive = goalManager.current()?.status === "active";
     let goalLoopObservedActive = goalWasActive;
     let completedGoalTurnRecorded = false;
-    let invocationCostUsd = 0;
     let structuredOutputRetries = 0;
     const maxStructuredOutputRetries = positiveInteger(
       options.env.MAX_STRUCTURED_OUTPUT_RETRIES,
@@ -1935,9 +2027,12 @@ export async function runCli(options: CliOptions): Promise<number> {
       model: selectedModel,
       prompt: explicitPromptContent ?? expandedCommand?.prompt ?? parsed.prompt,
       ...(options.promptInput ? { promptInput: options.promptInput } : {}),
-      systemPrompt: () => systemPromptFor(toolCatalog?.listTools() ?? exposedTools),
+      systemPrompt: () => systemPromptFor(toolCatalog?.listTools() ?? resolveTools()),
       messages: history,
       tools: exposedTools,
+      resolveTools,
+      callJournal: session.calls,
+      executionContext,
       ...(toolCatalog ? { toolCatalog } : {}),
       beforePrompt: async (prompt) => {
         const promptText = typeof prompt === "string"
@@ -2017,10 +2112,13 @@ export async function runCli(options: CliOptions): Promise<number> {
       },
       onMessage: (message) => session.append([message]),
       compactMessages: async (messages, signal, context) => {
+        try { options.onActivity?.("compacting"); } catch { /* UI observers cannot change execution. */ }
+        try {
         const result = await compactConversationPipeline({
           messages,
           thresholdTokens: compactThresholdTokens,
           sessionMemory,
+          historyRevision: session.revision,
           summarize: async (summaryMessages, summarySignal) => {
             await hooks.run("PreCompact", {
               trigger: "auto",
@@ -2048,6 +2146,7 @@ export async function runCli(options: CliOptions): Promise<number> {
           hooks.queueSessionContext(compactContext);
         }
         return result;
+        } finally { try { options.onActivity?.("working"); } catch { /* UI observer only. */ } }
       },
       onCompact: ({ messages, preTokens, postTokens }) => {
         const mode = permissionModeState.snapshot();
@@ -2059,8 +2158,8 @@ export async function runCli(options: CliOptions): Promise<number> {
           ...(mode.prePlanMode ? { prePlanMode: mode.prePlanMode } : {}),
         });
       },
-      authorize: (tool, input, { toolUseId }) =>
-        authorizeToolWithDeniedHook(checkPermission, hooks, tool, input, toolUseId, options.signal),
+      authorize: (tool, input, { toolUseId, preApproved }) =>
+        authorizeToolWithDeniedHook(checkPermission, hooks, tool, input, toolUseId, options.signal, preApproved),
       ...(mainMaxTurns ? { maxTurns: mainMaxTurns } : {}),
       ...(options.signal ? { signal: options.signal } : {}),
       onToolEvent(event) {
@@ -2070,17 +2169,7 @@ export async function runCli(options: CliOptions): Promise<number> {
         }
       },
       onEvent(event) {
-        const reportedEvent = event.type === "usage"
-          ? { ...event, usage: { ...event.usage, costUsd: calculateCostUsd(event.usage, billingSelection.model.pricing) } }
-          : event;
-        if (reportedEvent.type === "usage" && parsed.maxBudgetUsd !== undefined) {
-          invocationCostUsd += reportedEvent.usage.costUsd ?? 0;
-          if (invocationCostUsd > parsed.maxBudgetUsd) {
-            throw new Error(
-              `Maximum budget of $${parsed.maxBudgetUsd.toFixed(2)} exceeded (current: $${invocationCostUsd.toFixed(4)})`,
-            );
-          }
-        }
+        const reportedEvent = event;
         options.onEvent?.(reportedEvent);
         if (parsed.outputFormat === "stream-json" && !options.quiet && (
           parsed.includePartialMessages || !isPartialModelEvent(reportedEvent)
@@ -2105,18 +2194,17 @@ export async function runCli(options: CliOptions): Promise<number> {
       }
       throw error;
     });
-    const currentCostUsd = calculateCostUsd(result.usage, billingSelection.model.pricing);
-    await session.appendUsage({
-      provider: billingSelection.provider.id,
-      model: billingSelection.model.id,
-      usage: result.usage,
-      costUsd: currentCostUsd,
-    });
-    const totalTokens = addUsage(restoredSession.usage ?? EMPTY_USAGE, result.usage);
-    const totalUsage = {
-      ...totalTokens,
-      costUsd: (restoredSession.usage?.costUsd ?? 0) + currentCostUsd,
-    };
+    // Session-end model hooks are still part of this invocation's spend.
+    if (ownedHooks) {
+      const endingHooks = ownedHooks;
+      ownedHooks = undefined;
+      try { await endingHooks.end("prompt_input_exit"); }
+      catch (error) { options.stderr.write(`tnb hook: ${errorMessage(error)}\n`); }
+    }
+    budget.signal.throwIfAborted();
+    await budget.finish();
+    const invocationUsage = budget.totals;
+    const totalUsage = (await session.readState()).usage ?? { ...EMPTY_USAGE };
     if (!options.quiet && parsed.outputFormat === "json") {
       options.stdout.write(`${JSON.stringify({
         type: "result",
@@ -2125,7 +2213,7 @@ export async function runCli(options: CliOptions): Promise<number> {
         stop_reason: result.stopReason,
         result: lastAssistantText(result.messages),
         ...(structuredOutput !== undefined ? { structured_output: structuredOutput } : {}),
-        usage: { ...result.usage, costUsd: currentCostUsd },
+        usage: invocationUsage,
         total_usage: totalUsage,
         total_cost_usd: totalUsage.costUsd,
       })}\n`);
@@ -2137,7 +2225,7 @@ export async function runCli(options: CliOptions): Promise<number> {
         stop_reason: result.stopReason,
         result: lastAssistantText(result.messages),
         ...(structuredOutput !== undefined ? { structured_output: structuredOutput } : {}),
-        usage: { ...result.usage, costUsd: currentCostUsd },
+        usage: invocationUsage,
         total_usage: totalUsage,
         total_cost_usd: totalUsage.costUsd,
       })}\n`);
@@ -2152,29 +2240,39 @@ export async function runCli(options: CliOptions): Promise<number> {
     options.stderr.write(`tnb: ${message}\n`);
     return 1;
   } finally {
-    if (ownsTeamSupervisor) await teamSupervisor?.close();
-    if (pluginLifecycle) {
-      try {
-        await pluginLifecycle.stop(activePlugins, ownsPluginToolRuntime);
-      } catch (error) {
-        options.stderr.write(`tnb plugin lifecycle: ${error instanceof Error ? error.message : String(error)}\n`);
+    try {
+      if (ownsTeamSupervisor) await teamSupervisor?.close();
+      if (pluginLifecycle) {
+        try {
+          await pluginLifecycle.stop(activePlugins, ownsPluginToolRuntime);
+        } catch (error) {
+          options.stderr.write(`tnb plugin lifecycle: ${error instanceof Error ? error.message : String(error)}\n`);
+        }
       }
-    }
-    if (ownedHooks) {
-      try {
-        await ownedHooks.end(completed ? "prompt_input_exit" : "other");
-      } catch (error) {
-        options.stderr.write(`tnb hook: ${error instanceof Error ? error.message : String(error)}\n`);
+      if (ownedHooks) {
+        try {
+          await ownedHooks.end(completed ? "prompt_input_exit" : "other");
+        } catch (error) {
+          options.stderr.write(`tnb hook: ${error instanceof Error ? error.message : String(error)}\n`);
+        }
       }
+      if (ownsMcp) await mcp?.close();
+      await Promise.all([...lspManagers.values()].map((manager) => manager.close()));
+      if (ownsShellManager) await shellManager?.close();
+    } finally {
+      releasePermissionObserver?.();
+      options.onInvocationTransport?.(undefined);
+      try {
+        if (completed) await usageBudget?.finish();
+        else await usageBudget?.close();
+      } finally { try { await releaseSession?.(); } finally { for (const release of workspaceReleases.reverse()) await release(); } }
     }
-    if (ownsMcp) await mcp?.close();
-    await Promise.all([...lspManagers.values()].map((manager) => manager.close()));
-    if (ownsShellManager) await shellManager?.close();
   }
 }
 
 export type InteractiveCliOptions = Omit<CliOptions, "permissionPrompt" | "interactive"> & {
   question(prompt: string): Promise<string>;
+  inputValue?(): string;
 };
 
 export async function runInteractiveCli(options: InteractiveCliOptions): Promise<number> {
@@ -2230,6 +2328,7 @@ export async function runInteractiveCli(options: InteractiveCliOptions): Promise
   const fallbackSelection = parsed.fallbackModel
     ? resolveInteractiveModel(providerCatalog, parsed.fallbackModel)
     : undefined;
+  let invocationTransport: ModelTransport | undefined;
   const transport = options.transport ?? createConfiguredTransportWithFallback(
     selection,
     fallbackSelection,
@@ -2288,6 +2387,7 @@ export async function runInteractiveCli(options: InteractiveCliOptions): Promise
   });
   const workspaceState = new WorkspaceState(options.cwd);
   applyAdditionalWorkspaceRoots(workspaceState, parsed.additionalDirectories);
+  const durableQuestions = new DurableQuestionInbox({ configDir, workspace: workspaceState.current });
   const sharedPluginToolRuntime = new PluginToolRuntimeManager(options.env);
   let interactiveMcp: McpConnections | undefined;
   try {
@@ -2304,7 +2404,10 @@ export async function runInteractiveCli(options: InteractiveCliOptions): Promise
       configDir,
       sampling: (serverName) => createMcpSamplingHandler({
         serverName,
-        transport,
+        transport: { stream(request, signal) {
+          if (!invocationTransport) throw new Error("MCP sampling requires an active invocation");
+          return invocationTransport.stream(request, signal);
+        } },
         model: selection.model.id,
         authorize: samplingPermission,
       }),
@@ -2327,10 +2430,25 @@ export async function runInteractiveCli(options: InteractiveCliOptions): Promise
       },
     });
     const mcp = interactiveMcp;
+    durableQuestions.start();
     return await runRepl({
+      durableQuestions,
+      ...(options.inputValue ? { inputValue: options.inputValue } : {}),
       question: options.question,
       write: (text) => void options.stdout.write(text),
       sessionIdFactory: () => sessionId,
+      async handleCommand(input) {
+        const parsedCommand = parseSlashCommand(input);
+        if (parsedCommand.kind !== "command" || !["runtime", "longtask"].includes(parsedCommand.command.name)) return false;
+        try {
+          const { runRuntimeChatCommand, runLongTaskChatCommand } = await import("./runtime");
+          const execute = parsedCommand.command.name === "runtime" ? runRuntimeChatCommand : runLongTaskChatCommand;
+          options.stdout.write(`${await execute({ args: splitCommandWords(parsedCommand.command.argument),
+            cwd: options.cwd, workspace: workspaceState.current(), configDir, env: options.env,
+            provider: selection.provider.id, model: selection.model.id, sessionId })}\n`);
+        } catch (error) { options.stderr.write(`tnb: ${error instanceof Error ? error.message : String(error)}\n`); }
+        return true;
+      },
       async runTurn(turn) {
         try {
           const promptContent = await expandMcpPromptInput(
@@ -2348,6 +2466,7 @@ export async function runInteractiveCli(options: InteractiveCliOptions): Promise
             shellManager,
             workspaceState,
             transport,
+            onInvocationTransport: (value) => { invocationTransport = value; },
             mcpConnections: mcp,
             hookRunner: interactiveHooks,
             pluginToolRuntime: sharedPluginToolRuntime,
@@ -2365,6 +2484,7 @@ export async function runInteractiveCli(options: InteractiveCliOptions): Promise
       },
     });
   } finally {
+    await durableQuestions.close();
     await interactiveHooks.end("prompt_input_exit");
     await interactiveMcp?.close();
     await sharedPluginToolRuntime.close();
@@ -2384,11 +2504,13 @@ export type InkCliOptions = Omit<
 export async function runInkCli(options: InkCliOptions): Promise<number> {
   let shellManager: ShellSessionManager | undefined;
   let interactiveMcp: McpConnections | undefined;
+  let invocationTransport: ModelTransport | undefined;
   let interactiveTaskManager: TaskManager | undefined;
   let teamSupervisor: TeamSupervisor | undefined;
   let activeHooks: HookRunner | undefined;
   let scheduleManager: ScheduleManager | undefined;
   let extensionRefreshTimer: ReturnType<typeof setInterval> | undefined;
+  let durableQuestions: DurableQuestionInbox | undefined;
   const sharedPluginToolRuntime = new PluginToolRuntimeManager(options.env);
   let cleanupPromise: Promise<void> | undefined;
   let clearResumeHint: () => void = () => undefined;
@@ -2396,6 +2518,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
     if (extensionRefreshTimer) clearInterval(extensionRefreshTimer);
     extensionRefreshTimer = undefined;
     await Promise.allSettled([
+      durableQuestions?.close(),
       activeHooks?.end("prompt_input_exit"),
       interactiveMcp?.close(),
       interactiveTaskManager?.shutdown(),
@@ -2590,6 +2713,8 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
     let activeVimMode = settings.general?.vimMode === true;
     let activeTheme = settings.ui?.theme ?? "cyan";
     const questionController = new QuestionController();
+    durableQuestions = new DurableQuestionInbox({ configDir, workspace: () => activeWorkspaceState.current() });
+    durableQuestions.start();
     const mcpActivityController = new McpActivityController();
     const samplingPermission = createPermissionChecker({
       mode: activePermissionMode,
@@ -2614,7 +2739,10 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
         configDir,
         sampling: (serverName) => (params, signal) => createMcpSamplingHandler({
           serverName,
-          transport: activeTransport,
+          transport: { stream(request, signal) {
+            if (!invocationTransport) throw new Error("MCP sampling requires an active invocation");
+            return invocationTransport.stream(request, signal);
+          } },
           model: activeSelection.model.id,
           authorize: samplingPermission,
         })(params, signal),
@@ -2681,6 +2809,9 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
       ...(initialManagement ? { initialManagement } : {}),
       permissionController,
       questionController,
+      durableQuestions,
+      workspace: () => activeWorkspaceState.current(),
+      queueStorage: new FileInputQueueStorage(configDir),
       mcpActivityController,
       taskManager,
       shellManager: activeShellManager,
@@ -2837,6 +2968,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
                 : {}),
             });
             activePermissionMode = resolved.mode;
+            taskManager.permissionModeState.synchronize({ mode: resolved.mode });
             return resolved;
           },
           updateSecurityPolicy(update) {
@@ -2852,6 +2984,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
                 ...(activeTrustedFolders.length ? { trustedFolders: activeTrustedFolders } : {}),
               });
               activePermissionMode = resolved.mode;
+              taskManager.permissionModeState.synchronize({ mode: resolved.mode });
             }
           },
           async updateUiSettings(update) {
@@ -2959,6 +3092,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
             ...(teamSupervisor ? { teamSupervisor } : {}),
             ...(scheduleManager ? { scheduleManager } : {}),
             transport: activeTransport,
+            onInvocationTransport: (value) => { invocationTransport = value; },
             contextWindowOverride: activeContextWindow,
             mcpConnections: mcp,
             hookRunner: activeHooks!,
@@ -2972,6 +3106,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
             quiet: true,
             signal: turn.signal,
             onEvent: turn.onModelEvent,
+            onActivity: turn.onActivity,
             onToolEvent: turn.onToolEvent,
             onPermissionModeChange(mode) {
               activePermissionMode = mode;
@@ -3089,6 +3224,13 @@ async function runInteractiveSlashCommand(
   command: SlashCommandRequest,
   context: InteractiveSlashCommandContext,
 ): Promise<SlashCommandResult> {
+  if (command.name === "runtime" || command.name === "longtask") {
+    const { runRuntimeChatCommand, runLongTaskChatCommand } = await import("./runtime"); const selection = context.currentSelection();
+    const execute = command.name === "runtime" ? runRuntimeChatCommand : runLongTaskChatCommand;
+    return { message: await execute({ args: splitCommandWords(command.argument), cwd: context.cwd,
+      workspace: context.currentWorkspaceRoots()[0] ?? context.cwd, configDir: context.configDir, env: context.env,
+      provider: selection.provider.id, model: selection.model.id, sessionId: command.sessionId }) };
+  }
   if (command.name === "about") {
     requireNoCommandArgument(command);
     const current = context.currentSelection();
@@ -4741,7 +4883,7 @@ function stripInteractiveRuntimeOptions(argv: string[]): string[] {
     "--attachment",
     "-a",
   ]);
-  const optionsWithMultipleValues = new Set(["--add-dir", "--mcp-config", "--tools"]);
+  const optionsWithMultipleValues = new Set(["--add-dir", "--mcp-config"]);
   const flags = new Set(["--continue", "--fork-session", "--yolo", "--dangerously-skip-permissions", "--strict-mcp-config", "-p", "--print"]);
   flags.add("--fast");
   const result: string[] = [];
@@ -5450,6 +5592,7 @@ function createHookModelHandler(options: {
   model: string;
   tools: AgentTool[];
   authorize?: PermissionChecker;
+  executionContext?(): unknown;
   systemPrompt?: string | (() => string);
 }) {
   return async (hook: HookPrompt | HookAgent, input: Record<string, unknown>, signal?: AbortSignal) => {
@@ -5467,6 +5610,7 @@ function createHookModelHandler(options: {
     const result = await runAgentLoop({
       transport: options.transport,
       model: options.model,
+      executionContext: options.executionContext,
       prompt,
       ...(options.systemPrompt ? { systemPrompt: options.systemPrompt } : {}),
       tools,
@@ -5669,16 +5813,22 @@ function attachTaskHooks(
   taskManager: TaskManager,
   hooks: () => HookRunner,
   signal?: AbortSignal,
+  budget?: UsageBudget,
 ): void {
-  const runTaskHook = (event: "TaskCreated" | "TaskCompleted", task: TaskRecord) =>
-    runBlockingHook(hooks(), event, {
+  const handlers = (runner: HookRunner) => ({
+    ...(budget ? { retain: () => budget.retain() } : {}),
+    beforeCreate: (task: TaskRecord, taskSignal?: AbortSignal) => runTaskHook(runner, "TaskCreated", task, taskSignal),
+    beforeComplete: (task: TaskRecord, taskSignal?: AbortSignal) => runTaskHook(runner, "TaskCompleted", task, taskSignal),
+  });
+  const runTaskHook = (runner: HookRunner, event: "TaskCreated" | "TaskCompleted", task: TaskRecord, taskSignal?: AbortSignal) =>
+    runBlockingHook(runner, event, {
       task_id: task.id,
       task_subject: task.subject,
       ...(task.description ? { task_description: task.description } : {}),
-    }, signal);
+    }, signal && taskSignal ? AbortSignal.any([signal, taskSignal]) : taskSignal ?? signal);
   taskManager.setLifecycleHooks({
-    beforeCreate: (task) => runTaskHook("TaskCreated", task),
-    beforeComplete: (task) => runTaskHook("TaskCompleted", task),
+    ...handlers(hooks()),
+    capture: () => handlers(hooks().fork()),
   });
 }
 
@@ -5699,8 +5849,8 @@ function withPermissionDeniedHooks(
   checker: PermissionChecker,
   hooks: () => HookRunner,
 ): PermissionChecker {
-  return async (tool, input, signal) => {
-    const decision = await checker(tool, input, signal);
+  return async (tool, input, signal, context) => {
+    const decision = await checker(tool, input, signal, context);
     if (decision.behavior === "deny") {
       await hooks().run("PermissionDenied", {
         tool_name: tool.name,
@@ -5720,9 +5870,10 @@ async function authorizeToolWithDeniedHook(
   input: unknown,
   toolUseId: string,
   signal?: AbortSignal,
+  preApproved?: boolean,
 ) {
   const policy = policyForTool(tool);
-  const decision = await checker(policy, input, signal);
+  const decision = await checker(policy, input, signal, { preApproved });
   if (decision.behavior === "deny") {
     await hooks.run("PermissionDenied", {
       tool_name: tool.name,
@@ -5741,9 +5892,10 @@ async function authorizeToolWithDeniedHooks(
   input: unknown,
   toolUseId: string,
   signal?: AbortSignal,
+  preApproved?: boolean,
 ) {
   const policy = policyForTool(tool);
-  const decision = await checker(policy, input, signal);
+  const decision = await checker(policy, input, signal, { preApproved });
   if (decision.behavior === "deny") {
     await Promise.all(hookRunners.map((runner) => runner.run("PermissionDenied", {
       tool_name: tool.name,
@@ -5882,6 +6034,9 @@ if (import.meta.main) {
     process.exitCode = 1;
   } else if (argv.includes("--version") || argv.includes("-V")) {
     process.stdout.write(`${packageJson.version}\n`);
+  } else if (argv[0] === "runtime") {
+    const { runRuntimeCommand } = await import("./runtime");
+    process.exitCode = await runRuntimeCommand({ argv, cwd: process.cwd(), env: process.env, stdout: process.stdout, stderr: process.stderr });
   } else if (suppliedArgv[0] === "remote-control" && (suppliedArgv.includes("--help") || suppliedArgv.includes("-h"))) {
     process.stdout.write(`Usage: tnb remote-control [--socket <path>] [--server-file <path>] [runtime options]\n\nWithout --socket, runs the bidirectional stream-json protocol over stdin/stdout.\nWith --socket, serves the same protocol to local Unix socket clients and writes a 0600 discovery descriptor beside the socket.\n`);
   } else if (suppliedArgv[0] === "remote-control" && remoteControlSocket) {
@@ -6026,6 +6181,7 @@ if (import.meta.main) {
           stdout: process.stdout,
           stderr: process.stderr,
           question: (prompt) => readline.question(prompt),
+          inputValue: () => readline.line,
         });
       } finally {
         readline.close();

@@ -1,11 +1,13 @@
 import { randomUUID } from "node:crypto";
 import { readFile, rename, writeFile } from "node:fs/promises";
 import { withFileLock } from "../../utils/lockfile";
+import { PermissionModeState } from "../../core/plan-mode";
 
 export type TaskStatus =
   | "pending"
   | "in_progress"
   | "running"
+  | "stopping"
   | "completed"
   | "failed"
   | "stopped";
@@ -26,6 +28,7 @@ export type TaskRecord = {
   error?: string;
   createdAt: string;
   updatedAt: string;
+  attemptId?: string;
 };
 
 type PersistedTaskState = {
@@ -47,20 +50,33 @@ export type TaskUpdate = {
 };
 
 export type TaskLifecycleHooks = {
-  beforeCreate?(task: TaskRecord): Promise<void>;
-  beforeComplete?(task: TaskRecord): Promise<void>;
+  /** Capture model/policy callbacks and retain resources for one runtime attempt. */
+  capture?(): TaskLifecycleHooks;
+  retain?(): () => void;
+  beforeCreate?(task: TaskRecord, signal?: AbortSignal): Promise<void>;
+  beforeComplete?(task: TaskRecord, signal?: AbortSignal): Promise<void>;
 };
 
+type TaskActivationScope = { hooks: TaskLifecycleHooks; release?: () => void };
+
 export class TaskManager {
+  /** Session authority outlives individual foreground turns and their callbacks. */
+  readonly permissionModeState = new PermissionModeState("default");
   private filePath: string;
   private nextWorkItemId = 1;
   private tasks = new Map<string, TaskRecord>();
   private deletedTasks = new Map<string, string>();
   private controllers = new Map<string, AbortController>();
+  private running = new Map<string, Promise<void>>();
   private listeners = new Set<() => void>();
   private snapshot: readonly TaskRecord[] = [];
   private writeQueue: Promise<void> = Promise.resolve();
   private generation = 0;
+  private draining = false;
+  private closed = false;
+  private pendingSwitches = 0;
+  private transitionQueue: Promise<void> = Promise.resolve();
+  private shutdownTask: Promise<void> | undefined;
   private lifecycleHooks: TaskLifecycleHooks = {};
 
   constructor(filePath: string) {
@@ -83,16 +99,44 @@ export class TaskManager {
   }
 
   async switchStorage(filePath: string): Promise<void> {
-    this.stopAll("Task was stopped because the active session changed", false);
-    await this.commit();
-    this.generation += 1;
-    this.filePath = filePath;
-    await this.load(filePath);
+    if (this.closed) throw new Error("Task runtime is closed; session switching is unavailable");
+    this.pendingSwitches++;
+    this.draining = true;
+    const switching = this.transitionQueue.catch(() => undefined).then(async () => {
+      if (this.closed) throw new Error("Task runtime is closed; session switching is unavailable");
+      this.stopAll("Task was stopped because the active session changed", false);
+      await Promise.allSettled([...this.running.values()]);
+      await this.commit();
+      this.generation += 1;
+      const previous = { filePath: this.filePath, nextWorkItemId: this.nextWorkItemId, tasks: this.tasks, deletedTasks: this.deletedTasks };
+      this.filePath = filePath;
+      try { await this.load(filePath); }
+      catch (error) {
+        this.filePath = previous.filePath;
+        this.nextWorkItemId = previous.nextWorkItemId;
+        this.tasks = previous.tasks;
+        this.deletedTasks = previous.deletedTasks;
+        this.publish();
+        throw error;
+      }
+    });
+    this.transitionQueue = switching;
+    try { await switching; }
+    finally { this.pendingSwitches--; this.draining = this.closed || this.pendingSwitches > 0; }
   }
 
-  async shutdown(): Promise<void> {
+  shutdown(): Promise<void> {
+    if (this.shutdownTask) return this.shutdownTask;
+    this.closed = true;
+    this.draining = true;
     this.stopAll("Task was stopped because tnb exited", true);
-    await this.commit();
+    this.shutdownTask = this.transitionQueue.catch(() => undefined).then(async () => {
+      this.stopAll("Task was stopped because tnb exited", true);
+      await Promise.allSettled([...this.running.values()]);
+      await this.commit();
+    });
+    this.transitionQueue = this.shutdownTask;
+    return this.shutdownTask;
   }
 
   recoverableAgents(): TaskRecord[] {
@@ -110,51 +154,40 @@ export class TaskManager {
     taskId: string,
     run: (signal: AbortSignal) => Promise<string>,
   ): Promise<TaskRecord> {
+    this.assertAdmitting();
     const task = this.tasks.get(taskId);
     if (!task || task.type !== "agent") throw new Error(`Agent task not found: ${taskId}`);
+    if (task.status === "stopping") throw new Error(`Agent task ${taskId} is still stopping`);
     if (task.status === "running") return structuredClone(task);
     if (!['completed', 'stopped', 'failed'].includes(task.status)) {
       throw new Error(`Agent task ${taskId} cannot restart from status ${task.status}`);
     }
-    const controller = new AbortController();
-    const generation = this.generation;
+    const activation = this.captureActivation();
+    task.attemptId = randomUUID();
     task.status = "running";
     task.updatedAt = new Date().toISOString();
     task.metadata = { ...task.metadata, recoveryPending: false, restartedAt: task.updatedAt };
     delete task.error;
     delete task.output;
-    this.controllers.set(task.id, controller);
-    await this.commit();
-    void run(controller.signal).then(
-      (output) => this.finishRuntimeTask(task.id, generation, "completed", { output }),
-      (error: unknown) => this.finishRuntimeTask(task.id, generation, controller.signal.aborted ? "stopped" : "failed", {
-        error: controller.signal.aborted ? "Task was stopped" : error instanceof Error ? error.message : String(error),
-      }),
-    );
+    await this.launchRuntimeTask(task, run, false, activation);
     return structuredClone(task);
   }
 
   async recoverAgent(taskId: string, run: (signal: AbortSignal) => Promise<string>): Promise<TaskRecord> {
+    this.assertAdmitting();
     const task = this.tasks.get(taskId);
     if (!task || task.type !== "agent") throw new Error(`Recoverable agent task not found: ${taskId}`);
     if (task.status !== "stopped" || task.metadata?.recoveryPending !== true) {
       throw new Error(`Agent task ${taskId} is not pending recovery`);
     }
-    const controller = new AbortController();
-    const generation = this.generation;
+    const activation = this.captureActivation();
+    task.attemptId = randomUUID();
     task.status = "running";
     task.updatedAt = new Date().toISOString();
     task.metadata = { ...task.metadata, recoveryPending: false, recoveredAt: task.updatedAt };
     delete task.error;
     delete task.output;
-    this.controllers.set(task.id, controller);
-    await this.commit();
-    void run(controller.signal).then(
-      (output) => this.finishRuntimeTask(task.id, generation, "completed", { output }),
-      (error: unknown) => this.finishRuntimeTask(task.id, generation, controller.signal.aborted ? "stopped" : "failed", {
-        error: controller.signal.aborted ? "Task was stopped" : error instanceof Error ? error.message : String(error),
-      }),
-    );
+    await this.launchRuntimeTask(task, run, false, activation);
     return structuredClone(task);
   }
 
@@ -164,7 +197,10 @@ export class TaskManager {
     activeForm?: string;
     metadata?: Record<string, unknown>;
   }): Promise<TaskRecord> {
-    const id = await this.reserveWorkItemId();
+    this.assertAdmitting();
+    const generation = this.generation;
+    const id = await this.reserveWorkItemId(generation);
+    this.assertMutationGeneration(generation);
     const now = new Date().toISOString();
     const task: TaskRecord = {
       id,
@@ -180,6 +216,7 @@ export class TaskManager {
       ...(input.metadata ? { metadata: structuredClone(input.metadata) } : {}),
     };
     await this.lifecycleHooks.beforeCreate?.(structuredClone(task));
+    this.assertMutationGeneration(generation);
     this.tasks.set(task.id, task);
     this.deletedTasks.delete(task.id);
     await this.commit();
@@ -196,6 +233,8 @@ export class TaskManager {
   }
 
   async update(taskId: string, update: TaskUpdate): Promise<TaskRecord | undefined> {
+    this.assertAdmitting();
+    const generation = this.generation;
     const current = this.tasks.get(taskId);
     if (!current) return undefined;
     if (current.type !== "work-item") {
@@ -237,6 +276,7 @@ export class TaskManager {
     if (current.status !== "completed" && next.status === "completed") {
       await this.lifecycleHooks.beforeComplete?.(structuredClone(next));
     }
+    this.assertMutationGeneration(generation);
     this.tasks.set(taskId, next);
     await this.commit();
     return structuredClone(next);
@@ -250,6 +290,7 @@ export class TaskManager {
     metadata?: Record<string, unknown>;
     run(signal: AbortSignal): Promise<string>;
   }): Promise<TaskRecord> {
+    this.assertAdmitting();
     const now = new Date().toISOString();
     const task: TaskRecord = {
       id: `agent-${randomUUID().slice(0, 8)}`,
@@ -258,6 +299,7 @@ export class TaskManager {
       description: input.description,
       profile: input.profile,
       status: "running",
+      attemptId: randomUUID(),
       blocks: [],
       blockedBy: [],
       createdAt: now,
@@ -265,41 +307,23 @@ export class TaskManager {
       ...(input.owner ? { owner: input.owner } : {}),
       ...(input.metadata ? { metadata: structuredClone(input.metadata) } : {}),
     };
-    const controller = new AbortController();
-    const generation = this.generation;
-    await this.lifecycleHooks.beforeCreate?.(structuredClone(task));
-    this.tasks.set(task.id, task);
-    this.controllers.set(task.id, controller);
-    await this.commit();
-    void input.run(controller.signal).then(
-      (output) => this.finishRuntimeTask(task.id, generation, "completed", { output }),
-      (error: unknown) => {
-        const stopped = controller.signal.aborted;
-        return this.finishRuntimeTask(task.id, generation, stopped ? "stopped" : "failed", {
-          error: stopped
-            ? "Task was stopped"
-            : error instanceof Error
-              ? error.message
-              : String(error),
-        });
-      },
-    );
+    await this.launchRuntimeTask(task, input.run, true);
     return structuredClone(task);
   }
 
   async stop(taskId: string): Promise<TaskRecord> {
     const task = this.tasks.get(taskId);
     if (!task) throw new Error(`No task found with ID: ${taskId}`);
+    if (task.status === "stopping") return structuredClone(task);
     if (task.status !== "running") {
       throw new Error(`Task ${taskId} is not running (status: ${task.status})`);
     }
     const controller = this.controllers.get(taskId);
     if (!controller) throw new Error(`Task ${taskId} cannot be stopped by this process`);
     controller.abort();
-    task.status = "stopped";
+    task.status = "stopping";
     task.error = "Task was stopped";
     task.updatedAt = new Date().toISOString();
-    this.controllers.delete(taskId);
     await this.commit();
     return structuredClone(task);
   }
@@ -317,7 +341,7 @@ export class TaskManager {
     this.deletedTasks = new Map(Object.entries(state.deletedTasks));
     let changed = false;
     for (const task of this.tasks.values()) {
-      if (task.status !== "running") continue;
+      if (task.status !== "running" && task.status !== "stopping") continue;
       task.status = "stopped";
       task.error = "Task process ended before the session was restored";
       if (task.type === "agent") task.metadata = { ...task.metadata, recoveryPending: true };
@@ -341,33 +365,88 @@ export class TaskManager {
     blocked.updatedAt = blocker.updatedAt;
   }
 
+  private captureActivation(): TaskActivationScope {
+    const hooks = { ...(this.lifecycleHooks.capture?.() ?? this.lifecycleHooks) };
+    return { hooks, release: hooks.retain?.() };
+  }
+
+  private async launchRuntimeTask(task: TaskRecord, run: (signal: AbortSignal) => Promise<string>, creating = false,
+    activation = this.captureActivation()): Promise<void> {
+    const { hooks, release } = activation;
+    const controller = new AbortController();
+    const generation = this.generation;
+    const attemptId = task.attemptId!;
+    const assertActive = () => {
+      this.assertAdmitting();
+      controller.signal.throwIfAborted();
+      if (generation !== this.generation) throw new Error("Task session changed before activation dispatch");
+    };
+    // Register ownership synchronously, before Hooks or persistence can yield.
+    this.controllers.set(task.id, controller);
+    const startup = Promise.resolve().then(async () => {
+      assertActive();
+      if (creating) await hooks.beforeCreate?.(structuredClone(task), controller.signal);
+      assertActive();
+      this.tasks.set(task.id, task);
+      await this.commit();
+      assertActive();
+    });
+    const running = startup.then(() => { assertActive(); return run(controller.signal); }).then(
+      (output) => this.finishRuntimeTask(task.id, generation, attemptId, controller.signal.aborted ? "stopped" : "completed", { output }, hooks, controller.signal),
+      (error: unknown) => this.finishRuntimeTask(task.id, generation, attemptId, controller.signal.aborted ? "stopped" : "failed", {
+        error: controller.signal.aborted ? "Task was stopped" : error instanceof Error ? error.message : String(error),
+      }, hooks, controller.signal),
+    ).finally(release);
+    this.track(task.id, attemptId, running, controller);
+    await startup;
+  }
+
   private async finishRuntimeTask(
     taskId: string,
     generation: number,
+    attemptId: string,
     status: "completed" | "failed" | "stopped",
     result: { output?: string; error?: string },
+    hooks: TaskLifecycleHooks,
+    signal: AbortSignal,
   ): Promise<void> {
     if (generation !== this.generation) return;
-    const task = this.tasks.get(taskId);
-    if (!task || task.status !== "running") return;
+    let task = this.tasks.get(taskId);
+    if (!task || task.attemptId !== attemptId || (task.status !== "running" && task.status !== "stopping")) return;
+    if (task.status === "stopping") status = "stopped";
     if (status === "completed") {
       try {
-        await this.lifecycleHooks.beforeComplete?.(structuredClone({
+        await hooks.beforeComplete?.(structuredClone({
           ...task,
           status,
           ...(result.output !== undefined ? { output: result.output } : {}),
-        }));
+        }), signal);
       } catch (error) {
         status = "failed";
         result = { error: error instanceof Error ? error.message : String(error) };
       }
     }
-    task.status = status;
+    // A stop/restart can arrive while a completion hook is awaiting.
+    const current = this.tasks.get(taskId);
+    if (generation !== this.generation || current?.attemptId !== attemptId ||
+      (current.status !== "running" && current.status !== "stopping")) return;
+    current.status = current.status === "stopping" ? "stopped" : status;
+    task = current;
     task.updatedAt = new Date().toISOString();
     if (result.output !== undefined) task.output = result.output;
     if (result.error !== undefined) task.error = result.error;
     this.controllers.delete(taskId);
     await this.commit();
+  }
+
+  private track(taskId: string, attemptId: string, promise: Promise<void>, controller: AbortController): void {
+    this.running.set(attemptId, promise);
+    void promise.catch(() => {
+      // Keep an unsettled persisted attempt recoverable if storage fails.
+    }).finally(() => {
+      this.running.delete(attemptId);
+      if (this.controllers.get(taskId) === controller) this.controllers.delete(taskId);
+    });
   }
 
   private async commit(): Promise<void> {
@@ -391,21 +470,26 @@ export class TaskManager {
     this.writeQueue = currentWrite;
     await currentWrite;
     if (committed && this.filePath === filePath) {
-      this.nextWorkItemId = committed.nextWorkItemId;
-      this.tasks = new Map(committed.tasks.map((task) => [task.id, structuredClone(task)]));
-      this.deletedTasks = new Map(Object.entries(committed.deletedTasks));
+      const latest = mergeTaskStates(committed, {
+        version: 2, nextWorkItemId: this.nextWorkItemId,
+        tasks: [...this.tasks.values()], deletedTasks: Object.fromEntries(this.deletedTasks),
+      });
+      this.nextWorkItemId = latest.nextWorkItemId;
+      this.tasks = new Map(latest.tasks.map((task) => [task.id, structuredClone(task)]));
+      this.deletedTasks = new Map(Object.entries(latest.deletedTasks));
       this.publish();
     }
   }
 
-  private async reserveWorkItemId(): Promise<string> {
+  private async reserveWorkItemId(generation: number): Promise<string> {
     const filePath = this.filePath;
+    const localNext = this.nextWorkItemId;
     return withFileLock(filePath, async () => {
       const persisted = await readPersistedTaskState(filePath);
-      const next = Math.max(this.nextWorkItemId, persisted.nextWorkItemId);
+      const next = Math.max(localNext, persisted.nextWorkItemId);
       persisted.nextWorkItemId = next + 1;
       await writeTaskState(filePath, persisted);
-      this.nextWorkItemId = next + 1;
+      if (this.generation === generation && this.filePath === filePath) this.nextWorkItemId = next + 1;
       return String(next);
     });
   }
@@ -415,13 +499,22 @@ export class TaskManager {
     for (const listener of this.listeners) listener();
   }
 
+  private assertMutationGeneration(generation: number): void {
+    this.assertAdmitting();
+    if (generation !== this.generation) throw new Error("Task session changed while mutating a work item");
+  }
+
+  private assertAdmitting(): void {
+    if (this.draining) throw new Error("Task runtime is draining; new agent runs are not admitted");
+  }
+
   private stopAll(reason: string, recoverable: boolean): void {
     const now = new Date().toISOString();
     for (const [taskId, controller] of this.controllers) {
       controller.abort();
       const task = this.tasks.get(taskId);
-      if (task?.status === "running") {
-        task.status = "stopped";
+      if (task?.status === "running" || task?.status === "stopping") {
+        task.status = "stopping";
         task.error = reason;
         if (task.type === "agent") task.metadata = { ...task.metadata, recoveryPending: recoverable };
         task.updatedAt = now;
@@ -515,7 +608,7 @@ function validateTask(value: unknown, path: string): asserts value is TaskRecord
     !Array.isArray(task.blockedBy) ||
     typeof task.createdAt !== "string" ||
     typeof task.updatedAt !== "string" ||
-    !["pending", "in_progress", "running", "completed", "failed", "stopped"].includes(task.status ?? "")
+    !["pending", "in_progress", "running", "stopping", "completed", "failed", "stopped"].includes(task.status ?? "")
   ) {
     throw new Error(`Invalid task record: ${path}`);
   }

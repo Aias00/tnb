@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,14 @@ import type { TaskRecord } from "../../src/services/tasks/manager";
 
 const roots: string[] = [];
 afterEach(async () => Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true }))));
+
+async function until(check: () => boolean): Promise<void> {
+  const deadline = Date.now() + 5000;
+  while (!check()) {
+    if (Date.now() >= deadline) throw new Error("Team recovery did not settle");
+    await Bun.sleep(5);
+  }
+}
 
 describe("Agent Team recovery", () => {
   test("keeps an empty session supervisor idle without creating a lease or reporting an error", async () => {
@@ -226,11 +234,10 @@ describe("Agent Team recovery", () => {
       resumed.push(recovered.id);
       await restored.setStatus("delivery", member.agentId, "running");
     });
-    supervisor.start();
-    await Bun.sleep(10);
-
-    expect(resumed).toEqual(["runtime-original"]);
-    await supervisor.close();
+    try {
+      await supervisor.recoverAll();
+      expect(resumed).toEqual(["runtime-original"]);
+    } finally { await supervisor.close(); }
   });
 
   test("retries failed recovery with backoff and stops scheduling after close", async () => {
@@ -280,12 +287,12 @@ describe("Agent Team recovery", () => {
       await restored.setStatus("delivery", member.agentId, "running");
     });
     supervisor.start();
-    await Bun.sleep(35);
-
-    expect(attempts).toBe(2);
-    expect(errors).toEqual(["temporary recovery failure"]);
-    expect(restored.member("delivery", member.agentId).recoveryAttempts).toBeUndefined();
-    await supervisor.close();
+    try {
+      await until(() => attempts === 2 && restored.member("delivery", member.agentId).recoveryAttempts === undefined);
+      expect(attempts).toBe(2);
+      expect(errors).toEqual(["temporary recovery failure"]);
+      expect(restored.member("delivery", member.agentId).recoveryAttempts).toBeUndefined();
+    } finally { await supervisor.close(); }
     const attemptsAtClose = attempts;
     await restored.setStatus("delivery", member.agentId, "recovering");
     await Bun.sleep(20);
@@ -347,25 +354,37 @@ describe("Agent Team recovery", () => {
     const first = new TeamSupervisor(restored, () => [task], undefined, {
       recoveryPollIntervalMs: 100, retryBaseDelayMs: 40, retryMaxDelayMs: 40,
     });
-    first.setResumeHandler(async () => { throw new Error("provider unavailable"); });
-    first.start();
-    await Bun.sleep(10);
-    await first.close();
-    expect(restored.member("delivery", member.agentId)).toMatchObject({ recoveryAttempts: 1, lastRecoveryError: "provider unavailable" });
+    let clock = Date.now();
+    const time = spyOn(Date, "now").mockImplementation(() => clock);
+    let replacement: TeamSupervisor | undefined;
+    try {
+      first.setResumeHandler(async () => { throw new Error("provider unavailable"); });
+      await first.recoverAll();
+      await first.close();
+      expect(restored.member("delivery", member.agentId)).toMatchObject({ recoveryAttempts: 1, lastRecoveryError: "provider unavailable" });
 
-    const replacement = new TeamSupervisor(restored, () => [task], undefined, {
-      recoveryPollIntervalMs: 5, retryBaseDelayMs: 5, retryMaxDelayMs: 5,
-    });
-    let attempts = 0;
-    replacement.setResumeHandler(async () => {
-      attempts += 1;
-      await restored.setStatus("delivery", member.agentId, "running");
-    });
-    replacement.start();
-    await Bun.sleep(15);
-    expect(attempts).toBe(0);
-    await Bun.sleep(35);
-    expect(attempts).toBe(1);
-    await replacement.close();
+      // Reload from disk and deliberately change the replacement's retry policy.
+      // Only the persisted deadline should determine when it can resume.
+      const reloaded = new TeamManager(path);
+      await reloaded.initialize();
+      replacement = new TeamSupervisor(reloaded, () => [task], undefined, {
+        recoveryPollIntervalMs: 5, retryBaseDelayMs: 5, retryMaxDelayMs: 5,
+      });
+      let attempts = 0;
+      replacement.setResumeHandler(async () => {
+        attempts += 1;
+        await reloaded.setStatus("delivery", member.agentId, "running");
+      });
+      clock += 39;
+      await replacement.recoverAll();
+      expect(attempts).toBe(0);
+      clock += 1;
+      await replacement.recoverAll();
+      expect(attempts).toBe(1);
+    } finally {
+      await first.close();
+      await replacement?.close();
+      time.mockRestore();
+    }
   });
 });

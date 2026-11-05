@@ -6,6 +6,13 @@ import {
 } from "../../src/ui/tui-state";
 
 describe("TUI state", () => {
+  test("background reminders preserve the active foreground turn and streaming response", () => {
+    let state = reduceTuiState(createTuiState("fixture", "default"), { type: "submit", text: "Foreground work" });
+    state = reduceTuiState(state, { type: "model-event", event: { type: "text", index: 0, text: "In progress" } });
+    const reminded = reduceTuiState(state, { type: "notice", message: "长任务需要你决定" });
+    expect(reminded.busy).toBe(true); expect(reminded.streamingText).toBe("In progress"); expect(reminded.usage).toEqual(state.usage);
+    expect(reminded.transcript.at(-1)).toMatchObject({ kind: "system", text: "长任务需要你决定" });
+  });
   test("keeps text before and after tools in chronological response segments", () => {
     let state = reduceTuiState(createTuiState("test", "default"), { type: "submit", text: "inspect" });
     const text = (value: string) => { state = reduceTuiState(state, { type: "model-event", event: { type: "text", index: 0, text: value } }); };

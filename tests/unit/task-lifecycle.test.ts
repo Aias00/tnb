@@ -6,6 +6,19 @@ import { join } from "node:path";
 import { TaskManager } from "../../src/services/tasks/manager";
 
 describe("task lifecycle", () => {
+  test("failed resource admission leaves a completed attempt available to restart", async () => {
+    const root = await mkdtemp(join(tmpdir(), "tnb-task-admission-"));
+    const manager = new TaskManager(join(root, "tasks.json"));
+    try {
+      await manager.initialize();
+      const task = await manager.startAgent({ subject: "fixture", description: "fixture", profile: "general-purpose", run: async () => "done" });
+      for (let i = 0; i < 100 && manager.get(task.id)?.status !== "completed"; i++) await Bun.sleep(5);
+      const before = manager.get(task.id);
+      manager.setLifecycleHooks({ retain: () => { throw new Error("Budget closed"); } });
+      await expect(manager.restartAgent(task.id, async () => "must not start")).rejects.toThrow("Budget closed");
+      expect(manager.get(task.id)).toEqual(before);
+    } finally { await manager.shutdown(); await rm(root, { recursive: true, force: true }); }
+  });
   test("runs blocking lifecycle callbacks before persistence and completion", async () => {
     const directory = await mkdtemp(join(tmpdir(), "tnb-tasks-"));
     try {
@@ -101,4 +114,25 @@ describe("task lifecycle", () => {
       await rm(directory, { recursive: true, force: true });
     }
   });
+});
+
+test("stop drains the old attempt before admitting a restart", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tnb-task-attempt-"));
+  let release!: (value: string) => void;
+  const slow = new Promise<string>((resolve) => { release = resolve; });
+  const manager = new TaskManager(join(root, "tasks.json"));
+  try {
+    await manager.initialize();
+    const task = await manager.startAgent({ subject: "fixture", description: "fixture", profile: "general-purpose", run: async () => slow });
+    const attemptId = task.attemptId;
+    expect((await manager.stop(task.id)).status).toBe("stopping");
+    await expect(manager.restartAgent(task.id, async () => "new")).rejects.toThrow("still stopping");
+    release("old result");
+    for (let i = 0; i < 100 && manager.get(task.id)?.status !== "stopped"; i++) await Bun.sleep(5);
+    expect(manager.get(task.id)?.status).toBe("stopped");
+    const restarted = await manager.restartAgent(task.id, async () => "new result");
+    expect(restarted.attemptId).not.toBe(attemptId);
+    for (let i = 0; i < 100 && manager.get(task.id)?.status !== "completed"; i++) await Bun.sleep(5);
+    expect(manager.get(task.id)?.output).toBe("new result");
+  } finally { release("cleanup"); await manager.shutdown(); await rm(root, { recursive: true, force: true }); }
 });

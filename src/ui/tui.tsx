@@ -12,6 +12,10 @@ import type { RefObject } from "react";
 import { TranscriptEntryView } from "./transcript/entry-view";
 import type { UserQuestion } from "../tools/interaction";
 import type { TaskRecord } from "../services/tasks/manager";
+import { WorkbenchView } from "./workbench-view";
+import { permissionDetails } from "./permission-details";
+import { parseRecommendedLabel } from "./question-label";
+import wrapAnsi from "wrap-ansi";
 import type { ExternalSlashCommand, SLASH_COMMANDS } from "./slash-commands";
 import type { ManagementView } from "./slash-commands";
 import type { McpActivity } from "./mcp-activity-controller";
@@ -48,6 +52,8 @@ export type TuiViewProps = {
   queuedPrompts?: readonly PromptInputSubmit[];
   queuePanel?: boolean;
   queueSelection?: number;
+  queueStates?: readonly ("pending" | "uncertain" | "draft")[];
+  queueConfirming?: boolean;
   entryExpansion?: Readonly<Record<string, boolean>>;
   onToggleEntry?(id: string): void;
   activityLabel?: string;
@@ -55,6 +61,15 @@ export type TuiViewProps = {
   sessionFilter?: string;
   sessionFilterEditing?: boolean;
   tasks?: readonly TaskRecord[];
+  durableQuestionCount?: number;
+  workbench?: Omit<React.ComponentProps<typeof WorkbenchView>, "height" | "width">;
+  permissionOffset?: number;
+  queuedInputCount?: number;
+  inputTarget?: string;
+  inputSending?: boolean;
+  workspaceLabel?: string;
+  backgroundSummary?: string;
+  runtimeConnectionMessage?: string;
   management?: ManagementView;
   managementSelection?: number;
   managementDetailOnly?: boolean;
@@ -97,6 +112,8 @@ export const TuiView = memo(function TuiView({
   queuedPrompts = [],
   queuePanel = false,
   queueSelection = 0,
+  queueStates = [],
+  queueConfirming = false,
   entryExpansion = {},
   onToggleEntry,
   activityLabel = "Working…",
@@ -104,6 +121,15 @@ export const TuiView = memo(function TuiView({
   sessionFilter = "",
   sessionFilterEditing = false,
   tasks = [],
+  durableQuestionCount = 0,
+  workbench,
+  permissionOffset = 0,
+  queuedInputCount = 0,
+  inputTarget,
+  inputSending = false,
+  workspaceLabel,
+  backgroundSummary,
+  runtimeConnectionMessage,
   management,
   managementSelection = 0,
   managementDetailOnly = false,
@@ -136,7 +162,8 @@ export const TuiView = memo(function TuiView({
   const taskRows = (state.todos.length ? Math.min(3, state.todos.length) + 4 + Number(state.todos.length > 3) : 0)
     + (tasks.length ? Math.min(3, tasks.length) + 4 + Number(tasks.length > 3) : 0);
   const activityRows = Number(state.busy) + Number(Boolean(state.busy && mcpActivity && !permission && !question && !activityLabel.startsWith("Cancelling")));
-  const activityBudget = Math.max(0, Math.min(taskRows + activityRows, rows - suggestionRows - queueRows - 7));
+  const infoRows = Number(Boolean(backgroundSummary)) + Number(Boolean(durableQuestionCount)) + Number(Boolean(inputTarget)) + Number(Boolean(runtimeConnectionMessage));
+  const activityBudget = Math.max(0, Math.min(taskRows + activityRows + infoRows, rows - suggestionRows - queueRows - 7));
   const auxiliaryRows = 1 + activityBudget + (transcriptSearch ? 3 : 0) + (historySearch ? 3 : 0);
   const maxPromptLines = Math.max(1, Math.min(6, Math.floor(rows / 3), rows - suggestionRows - queueRows - auxiliaryRows - 5));
   const promptLayout = buildPromptLayout({
@@ -151,7 +178,7 @@ export const TuiView = memo(function TuiView({
     <KeybindingProvider value={keybindings}>
     <AccentProvider value={primaryColor}>
     <Box width={columns} height={rows} overflow="hidden" flexDirection="column" paddingX={1}>
-      {!management && !shellPanel && !queuePanel ? (
+      {!management && !shellPanel && !workbench && !queuePanel ? (
         <Box flexGrow={1} flexBasis={0} overflow="hidden" flexDirection="column" marginTop={1}>
           {transcriptViewportRef
             ? <TranscriptViewport ref={transcriptViewportRef} entries={state.transcript} width={Math.max(1, columns - 2)} height={transcriptHeight} theme={primaryColor} verbose={verboseTranscript} entryExpansion={entryExpansion} onToggleEntry={onToggleEntry} {...(selectedTranscriptEntryId ? { selectedEntryId: selectedTranscriptEntryId } : {})} onStateChange={updateViewportStatus} />
@@ -163,13 +190,17 @@ export const TuiView = memo(function TuiView({
               <WorkingStatus label={activityLabel} startedAt={turnStartedAt} color={primaryColor} />
               {mcpActivity && !permission && !question && !activityLabel.startsWith("Cancelling") ? <McpActivityRow activity={mcpActivity} color={primaryColor} /> : null}
             </> : null}
+            {backgroundSummary ? <Text color={primaryColor} wrap="truncate-end">{backgroundSummary}</Text> : null}
+            {durableQuestionCount ? <Text color="yellow" wrap="truncate-end">{durableQuestionCount} 个长任务问题待你决定 · Ctrl+T → 待决定</Text> : null}
+            {inputTarget ? <Text color={primaryColor} wrap="truncate-end">{inputTarget}</Text> : null}
+            {runtimeConnectionMessage ? <Text color="yellow" wrap="truncate-end">{runtimeConnectionMessage}</Text> : null}
             {state.todos.length ? <TodoList todos={state.todos} /> : null}
             {tasks.length ? <TaskList tasks={tasks} /> : null}
           </Box>
         </Box>
       ) : null}
       {permission ? (
-        <PermissionDialog request={permission} selection={permissionSelection} />
+        <PermissionDialog request={permission} selection={permissionSelection} offset={permissionOffset} width={columns} height={rows} />
       ) : question ? (
         <QuestionDialog
           question={question}
@@ -177,7 +208,7 @@ export const TuiView = memo(function TuiView({
           selected={questionSelected}
           {...(questionOtherInput !== undefined ? { otherInput: questionOtherInput } : {})}
         />
-      ) : management ? (
+      ) : workbench ? <WorkbenchView {...workbench} width={Math.max(12, columns - 2)} height={Math.max(8, rows - 2)} /> : management ? (
         <ManagementDialog
           view={management}
           selection={managementSelection}
@@ -190,7 +221,7 @@ export const TuiView = memo(function TuiView({
           detailOnly={managementDetailOnly}
         />
       ) : queuePanel ? (
-        <QueuePanel prompts={queuedPrompts} selection={queueSelection} columns={columns} rows={rows} notice={completionNotice} />
+        <QueuePanel prompts={queuedPrompts} states={queueStates} confirming={queueConfirming} selection={queueSelection} columns={columns} rows={rows} notice={completionNotice} />
       ) : shellPanel ? (
         <ShellRuntimePanel runtimes={shellRuntimes} selection={shellSelection} {...(shellInput !== undefined ? { input: shellInput } : {})} />
       ) : (
@@ -206,6 +237,7 @@ export const TuiView = memo(function TuiView({
           {!commandSuggestions.length && !inputCompletions.length && completionNotice ? <CompletionNotice message={completionNotice} /> : null}
           {!transcriptSearch && !historySearch ? <PromptInputView
             layout={promptLayout}
+            disabled={inputSending}
             color={primaryColor}
             {...(promptMode ? { mode: promptMode } : {})}
             {...(onPromptClick ? { onClick: (row, column) => onPromptClick(row, column, maxPromptLines) } : {})}
@@ -219,7 +251,8 @@ export const TuiView = memo(function TuiView({
         usage={state.usage}
         lastInputTokens={state.lastInputTokens}
         contextWindowTokens={state.contextWindowTokens}
-        modal={Boolean(permission || question || management || transcriptSearch || historySearch || shellPanel || queuePanel)}
+        modal={Boolean(permission || question || management || transcriptSearch || historySearch || shellPanel || queuePanel || workbench)}
+        {...(workspaceLabel ? { workspaceLabel } : {})}
         transcriptOffset={newerRows}
         verboseTranscript={verboseTranscript}
         queuedPromptCount={queuedPromptCount}
@@ -240,7 +273,7 @@ function WorkingStatus({ label, startedAt, color }: { label: string; startedAt?:
   return <Text color={color} wrap="truncate-end">{frame} {shown}{startedAt ? ` · ${Math.max(0, Math.floor((now - startedAt) / 1000))}s` : ""}</Text>;
 }
 
-function QueuePanel({ prompts, selection, columns, rows, notice }: { prompts: readonly PromptInputSubmit[]; selection: number; columns: number; rows: number; notice?: string }) {
+function QueuePanel({ prompts, states, confirming, selection, columns, rows, notice }: { prompts: readonly PromptInputSubmit[]; states: readonly string[]; confirming: boolean; selection: number; columns: number; rows: number; notice?: string }) {
   const accent = useAccent();
   const queueKey = useKeybindingLabel("promptQueue");
   const listRef = useRef<ScrollBoxHandle | null>(null);
@@ -252,15 +285,15 @@ function QueuePanel({ prompts, selection, columns, rows, notice }: { prompts: re
   const itemRefs = useRef(new Map<number, DOMElement>());
   useEffect(() => { const element = itemRefs.current.get(selection); if (element) listRef.current?.scrollToElement(element); previewRef.current?.scrollTo(0); }, [selection, prompts]);
   return <Box height={Math.max(6, rows - 2)} borderStyle="round" borderColor={UI_COLORS.border} paddingX={1} flexDirection="column">
-    <Text bold color={accent}>Queued prompts · {prompts.length} pending</Text>
+    <Text bold color={accent}>Queued prompts · {prompts.length} saved</Text>
     <Text dimColor wrap="truncate-end">Execution pauses here after the current turn finishes.</Text>
     <ScrollBox ref={listRef} height={Math.max(1, Math.floor((rows - 7 - Number(Boolean(notice))) / 2))} flexDirection="column">
-      {prompts.map((prompt, index) => <Box key={index} ref={element => { if (element) itemRefs.current.set(index, element); else itemRefs.current.delete(index); }}><Text wrap="truncate-end" color={selection === index ? accent : undefined}>{selection === index ? figures.pointer : " "} {index + 1}. {prompt.display.replace(/\s+/g, " ").slice(0, Math.max(10, columns - 12))}</Text></Box>)}
+      {prompts.map((prompt, index) => <Box key={index} ref={element => { if (element) itemRefs.current.set(index, element); else itemRefs.current.delete(index); }}><Text wrap="truncate-end" color={selection === index ? accent : undefined}>{selection === index ? figures.pointer : " "} {index + 1}. {states[index] === "uncertain" ? "[未确认，先核对] " : states[index] === "draft" ? "[编辑中，原输入保留] " : ""}{prompt.display.replace(/\s+/g, " ").slice(0, Math.max(10, columns - 12))}</Text></Box>)}
       {!prompts.length ? <Text dimColor>No pending prompts.</Text> : null}
     </ScrollBox>
     {prompts[selection] ? <ScrollBox ref={previewRef} height={Math.max(1, Math.ceil((rows - 7 - Number(Boolean(notice))) / 2))}><Text>{prompts[selection]!.expanded}</Text></ScrollBox> : null}
     {notice ? <Text color="yellow" wrap="truncate-end">{notice}</Text> : null}
-    <Text dimColor wrap="truncate-end">↑/↓ select · Enter/E edit · D/Delete remove · PgUp/PgDn preview · {queueKey}/Esc close</Text>
+    <Text dimColor={!confirming} color={confirming ? "red" : undefined} wrap="truncate-end">{confirming ? "删除这条排队输入？ · Y 确认 / Esc 取消" : `↑/↓ select · Enter/E edit · D/Delete remove · PgUp/PgDn preview · ${queueKey}/Esc close`}</Text>
   </Box>;
 }
 
@@ -575,7 +608,7 @@ function CompletionNotice({ message }: { message: string }) {
   );
 }
 
-function TodoList({ todos }: { todos: TuiState["todos"] }) {
+function TodoList({ todos, total = todos.length }: { todos: TuiState["todos"]; total?: number }) {
   return (
     <Box flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1} marginBottom={1} flexShrink={0}>
       <Text bold>Tasks</Text>
@@ -614,7 +647,7 @@ function QuestionDialog({
       <Box flexDirection="column" marginTop={1}>
         {options.map((option, index) => (
           <Text key={option.label} {...(selection === index ? { color: accent } : {})} bold={selection === index}>
-            {selection === index ? figures.pointer : " "} {question.multiSelect ? (selected.has(index) ? "[x]" : "[ ]") : `${index + 1}.`} {option.label} — {option.description}
+            {selection === index ? figures.pointer : " "} {question.multiSelect ? (selected.has(index) ? "[x]" : "[ ]") : `${index + 1}.`} {parseRecommendedLabel(option.label).label}{parseRecommendedLabel(option.label).recommended ? " ★ 推荐" : ""} — {option.description}
           </Text>
         ))}
       </Box>
@@ -624,31 +657,32 @@ function QuestionDialog({
   );
 }
 
-function PromptInputView({ layout, mode, color, onClick }: { layout: PromptLayout; mode?: string; color: "magenta" | "cyan" | "blue" | "green"; onClick?(row: number, column: number): void }) {
+function PromptInputView({ layout, mode, color, disabled = false, onClick }: { layout: PromptLayout; mode?: string; disabled?: boolean; color: "magenta" | "cyan" | "blue" | "green"; onClick?(row: number, column: number): void }) {
   return (
     <Box flexShrink={0} borderStyle="round" borderColor={UI_COLORS.border} paddingX={1} {...(onClick ? { onClick: (event) => {
       const modeColumns = mode ? `[${mode}] `.length : 0;
       onClick(Math.max(0, event.localRow - 1), Math.max(0, event.localCol - 4 - modeColumns));
     } } : {})}>
       {mode ? <Text color={mode === "NORMAL" ? "yellow" : "green"}>[{mode}] </Text> : null}
-      <Text color={color}>{figures.pointer} </Text>
-      <Text><Ansi>{layout.visibleText}</Ansi></Text>
+      <Text color={color} dimColor={disabled}>{figures.pointer} </Text>
+      <Text dimColor={disabled}><Ansi>{layout.visibleText}</Ansi></Text>
     </Box>
   );
 }
 
-function PermissionDialog({ request, selection }: { request: PermissionAskRequest; selection: PermissionPromptDecision }) {
+function PermissionDialog({ request, selection, offset, width, height }: { request: PermissionAskRequest; selection: PermissionPromptDecision; offset: number; width: number; height: number }) {
   const plan = request.tool.name === "exit_plan_mode" &&
     request.input && typeof request.input === "object" && "plan" in request.input &&
     typeof (request.input as { plan?: unknown }).plan === "string"
     ? (request.input as { plan: string }).plan
     : undefined;
+  const lines = permissionDetails(request).flatMap((line) => wrapAnsi(line, Math.max(8, width - 6), { hard: true, wordWrap: false }).split("\n"));
+  const page = Math.max(2, height - 10), start = Math.min(offset, Math.max(0, lines.length - page));
   return (
     <Box flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1}>
       <Text bold color="yellow">Permission required</Text>
-      <Text>{request.message}</Text>
-      <Text bold>{request.tool.name}</Text>
-      {plan ? <Markdown>{plan}</Markdown> : <Text dimColor>{compactJson(request.input)}</Text>}
+      {lines.slice(start, start + page).map((line, index) => <Text key={index}>{line || " "}</Text>)}
+      {plan ? <Text dimColor>计划内容可用 PgUp/PgDn 查看；不会因未显示的内容自动批准。</Text> : null}
       <Box marginTop={1} gap={2}>
         <Text {...(selection === "allow" ? { color: "green" as const } : {})} bold={selection === "allow"}>
           {selection === "allow" ? figures.pointer : " "} Allow once
@@ -667,7 +701,7 @@ function PermissionDialog({ request, selection }: { request: PermissionAskReques
           {selection === "deny" ? figures.pointer : " "} Deny
         </Text>
       </Box>
-      <Text dimColor>←/→ select · Enter confirm · Esc deny</Text>
+      <Text dimColor>←/→ select · Enter confirm · Esc deny · PgUp/PgDn 全文 {start + 1}/{lines.length}</Text>
     </Box>
   );
 }
@@ -682,6 +716,7 @@ function StatusLine({
   modal,
   transcriptOffset,
   verboseTranscript,
+  workspaceLabel,
   queuedPromptCount,
 }: {
   model: string;
@@ -693,6 +728,7 @@ function StatusLine({
   modal: boolean;
   transcriptOffset: number;
   verboseTranscript: boolean;
+  workspaceLabel?: string;
   queuedPromptCount: number;
 }) {
   const queueKey = useKeybindingLabel("promptQueue");
@@ -712,7 +748,7 @@ function StatusLine({
               ? `enter queue · esc interrupt · ${queuedPromptCount} queued · ${queueKey} manage`
               : `enter send · ${toggleKey} tool · ${allKey} all · ${queueKey} queue`}
       </Text>
-      <Text wrap="truncate-end"><Text bold>{model}</Text><Text dimColor> · {permissionMode} · {context} · ↑{inputTokens.toLocaleString()} ↓{usage.outputTokens.toLocaleString()}{cost}</Text></Text>
+      <Text wrap="truncate-end"><Text bold>{model}</Text><Text dimColor> · {permissionMode} · {context} · 前台 ↑{inputTokens.toLocaleString()} ↓{usage.outputTokens.toLocaleString()}{cost}{workspaceLabel ? ` · ${workspaceLabel.slice(-36)}` : ""}</Text></Text>
     </Box>
   );
 }

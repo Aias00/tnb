@@ -56,3 +56,43 @@ agent ID and restores its isolated transcript.
 Run `/agents` to inspect all active definitions and parse failures. Run
 `/agents <name>` for one definition's resolved settings. The main model invokes
 the selected profile through the `agent` tool's `subagent_type` field.
+
+Background task cancellation reports `stopping` while the old invocation drains;
+a restart is rejected until that invocation settles. Each run has an independent
+attempt ID, so an old completion cannot settle its successor. Interrupted tool
+intents remain in child transcripts. Resume reuses journaled results or stops
+with an unknown-effect error when the prior action cannot be established.
+
+The managed task runtime shares permission-mode authority across foreground
+turns. An inherited mode follows the parent's current mode; a parent entering
+plan or dontAsk constrains a child even when its profile declares another
+mode. Permission changes during an approval are checked again before execution.
+
+An activation keeps its own Hook model handlers and originating budget after
+the foreground turn returns. `SubagentStop` and `TaskCompleted` are charged to
+that budget even if another foreground turn has installed new Hook handlers.
+The budget lease is released after completion callbacks and task persistence.
+
+Shutdown and session switching wait for attempts still inside a creation Hook
+or their first persistence write. Those attempts already belong to the task
+runtime, even though their Agent callback has not started. Cancellation is
+checked after startup I/O, so closing the runtime cannot dispatch a late Agent
+or move an old-session task into the new session. Creation/completion Hooks
+also receive the attempt's cancellation signal.
+
+Session switching and shutdown are serialized. Closing a runtime permanently
+rejects new activations, work-item mutations and session switches. Work-item
+creation/completion that awaited a Hook before the session changed is rejected
+before its final write. A failed session load restores the preceding storage.
+
+Transcript and journal appends preserve a torn final record in a private
+`.torn-<uuid>` sidecar before restoring the newline boundary. This lets a saved
+tool result repair an interrupted transcript without merging it into broken
+JSON. Journal lifecycle or result-ID corruption blocks recovery and further
+execution; an interrupted effect still requires reconciliation.
+
+Automatic recovery also requires the exact history scope written by the Agent
+loop. Unscoped legacy records are preserved but do not authorize replaying an
+old result for a current call. Reused Provider IDs across completed rounds
+remain supported; duplicate IDs within an unfinished round are rejected before
+any recovery result is written.

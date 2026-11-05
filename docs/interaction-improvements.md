@@ -10,7 +10,7 @@ by this change, and no dependencies are added.
 - **Draft during a turn and queue on Enter.** The reference's
   `src/utils/handlePromptSubmit.ts` separates editing from active-turn execution.
   tnb now retains structured prompts (including pasted text and images) in an
-  in-memory FIFO and executes them through the existing submission path only
+  per-session durable FIFO and executes them through the existing submission path only
   after the current turn and any permission/question/management dialog finish.
 - **Keep the current draft.** Starting a queued turn adds the submitted prompt
   to history without clearing whatever the user is currently writing. Escape
@@ -28,7 +28,9 @@ by this change, and no dependencies are added.
 Collapsed paste storage, prompt history, undo, image references, external editor,
 transcript scrolling and tool cards already exist in tnb. They should be improved
 in place rather than replaced with a second editor or the reference's product
-runtime. Queue state is local to the current process and is not persisted.
+runtime. Queue state uses the existing durable input store, shared by Ctrl+Q and
+the Ctrl+T task workbench. Inputs with an interrupted/unconfirmed dispatch remain
+saved and require inspection rather than automatic replay.
 
 ## Verification
 
@@ -53,17 +55,19 @@ choices; no new theme format or dependencies are introduced.
 
 | Capability | Controls and behavior |
 | --- | --- |
-| Queue management | Ctrl+Q opens a scrollable queue. Up/Down selects; Enter/E takes the prompt back for editing; D/Delete removes it. PgUp/PgDn scrolls the full preview. Execution pauses while the panel is open. Taking a prompt back refuses to overwrite an existing draft and retains structured paste/image payloads. |
+| Queue management | Ctrl+Q opens the same durable queue as Ctrl+T. Up/Down selects; Enter/E takes the prompt back for editing while retaining the saved original; D/Delete requests removal with Y confirmation. PgUp/PgDn scrolls the full preview. Execution pauses while the panel is open. Taking a prompt back refuses to overwrite an existing draft and retains structured paste/image payloads. |
 | Configurable shortcuts | The prompt controller receives the same keybinding map as the application. Remapping or disabling image paste and external-editor shortcuts takes effect. Ctrl+K/U/W cut text, Ctrl+Y yanks, Alt+Y cycles cuts, and modified Left/Right moves by word. Forward Delete and Backspace are distinct. Image attachments stay intact under text cut shortcuts; Backspace removes them. |
 | Per-tool output | Alt+Up/Down selects a tool card; Alt+Enter toggles that card. Clicking a card also toggles it. Ctrl+O toggles all cards and clears individual overrides. Footer and expansion hints follow configured bindings. |
 | Diff and output | Edit previews use a bounded line LCS, preserve shared context, distinguish insertions/deletions, and show fragment-relative line numbers. Compact previews start near the first change. Long outputs fold both lines and long individual lines; failures retain the end of the error output. Expanding a Read card shows its content. |
 | Runtime feedback | The activity row distinguishes requesting, thinking, writing and tools, displays total turn time, and reports cancellation while awaiting shutdown. Interrupted tool cards stop running. Permission/question waits receive explicit labels. |
-| Session navigation | In a session browser, / starts a live filter over title, ID and prompt previews. Enter accepts the filter; a further Enter resumes the visible selection. Escape clears a filter being edited. PgUp/PgDn scrolls the conversation preview, including narrow layouts. The browser retains its existing recent-20 limit; `/sessions <query>` searches history before that limit is applied. Switching/clearing sessions drops old pending prompts to avoid executing them in the wrong conversation. |
+| Session navigation | In a session browser, / starts a live filter over title, ID and prompt previews. Enter accepts the filter; a further Enter resumes the visible selection. Escape clears a filter being edited. PgUp/PgDn scrolls the conversation preview, including narrow layouts. The browser retains its existing recent-20 limit; `/sessions <query>` searches history before that limit is applied. Switching/clearing sessions detaches the old session queue without executing or deleting it. |
 | Markdown theme | Headings, list markers, links and inline code inherit the active accent. Code syntax highlighting retains its language-specific colors. |
 
 Additional configurable actions in `~/.tnb/keybindings.json`: `promptQueue`,
 `previousTool`, `nextTool`, and `toggleTool`. See `/shortcuts` for the active map.
-The queue and per-card expansion state are intentionally process-local.
+Per-card expansion remains process-local; queued inputs use the per-session
+durable store. Its limits and recovery behavior are described in
+[the durable runtime guide](durable-runtime.md#对话中的任务工作台).
 
 Behavior was implemented in tnb's existing components after examining the local
 reference's prompt submission/editor, queued-command view and design-system

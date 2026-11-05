@@ -96,6 +96,15 @@ export class HookRunner {
     this.agentHandler = handlers.agent;
   }
 
+  /** An activation gets its own model handlers without starting another watcher. */
+  fork(): HookRunner {
+    const runner = new HookRunner({ ...this.options, cwd: this.cwd });
+    runner.observer = this.observer;
+    runner.promptHandler = this.promptHandler;
+    runner.agentHandler = this.agentHandler;
+    return runner;
+  }
+
   setCwd(cwd: string): void {
     this.cwd = cwd;
     void this.fileWatcher?.setCwd(cwd);

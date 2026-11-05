@@ -2,15 +2,46 @@ import { createAnthropicTransport } from "./anthropic";
 import { createFallbackTransport } from "./fallback";
 import { createOpenAITransport } from "./openai";
 import { createOpenAIResponsesTransport } from "./openai-responses";
-import type { ProviderSelection } from "./config";
+import { resolveProviderSelection, type ProviderSelection } from "./config";
 import type { ModelTransport } from "./types";
+import type { BillingRoute } from "../services/usage/budget";
+import { createHash } from "node:crypto";
 
 export type ReasoningEffort = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+export function resolveBillingRoute(selection: ProviderSelection, modelId: string): BillingRoute {
+  const { provider } = selection;
+  const model = modelId === selection.model.id ? selection.model
+    : provider.models.find((item) => item.id === modelId)
+      ?? ((provider.id === "anthropic" || provider.id === "openai")
+        ? resolveProviderSelection({ providers: { [provider.id]: provider } }, provider.id, modelId).model : undefined);
+  return { provider: provider.id, model: modelId, ...(model?.pricing ? { pricing: model.pricing } : {}),
+    resourceDomain: createHash("sha256").update(JSON.stringify({ api: provider.api, endpoint: provider.baseUrl?.replace(/\/+$/, ""), credential: provider.apiKey,
+      headers: Object.fromEntries(Object.entries(provider.headers ?? {}).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)) })).digest("hex") };
+}
 
 export function createConfiguredTransport(
   selection: ProviderSelection,
   reasoningEffort?: ReasoningEffort,
   fastMode = false,
+  execution?: { maxRetries?: number },
+): ModelTransport {
+  const transport = createRawConfiguredTransport(selection, reasoningEffort, fastMode, execution);
+  return {
+    async *stream(request, signal) {
+      const billing = resolveBillingRoute(selection, request.model);
+      for await (const event of transport.stream(request, signal)) {
+        yield event.type === "usage" ? { ...event, billing } : event;
+      }
+    },
+  };
+}
+
+function createRawConfiguredTransport(
+  selection: ProviderSelection,
+  reasoningEffort?: ReasoningEffort,
+  fastMode = false,
+  execution?: { maxRetries?: number },
 ): ModelTransport {
   const { provider, model } = selection;
   if (fastMode && (provider.api !== "anthropic-messages" || !isAnthropicFastModeModel(model.id))) {
@@ -23,6 +54,7 @@ export function createConfiguredTransport(
       baseUrl: provider.baseUrl,
       headers: { ...provider.headers, ...model.headers },
       maxOutputTokens: model.maxTokens,
+      maxRetries: execution?.maxRetries,
       compat: model.compat,
       reasoning: model.reasoning,
       ...(reasoningEffort ? { reasoningEffort } : {}),
@@ -38,6 +70,7 @@ export function createConfiguredTransport(
     baseUrl: provider.baseUrl,
     headers: { ...provider.headers, ...model.headers },
     maxOutputTokens: model.maxTokens,
+    maxRetries: execution?.maxRetries,
     ...(provider.promptCaching ? { promptCaching: provider.promptCaching } : {}),
     ...(model.compat.anthropicRequiredToolChoice
       ? { requiredToolChoice: model.compat.anthropicRequiredToolChoice }

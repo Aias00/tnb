@@ -46,6 +46,7 @@ test("queues prompts without losing drafts and navigates slash commands", async 
     await send("\u001b");
     await until(() => turns[2]!.signal.aborted);
     finish[2]!();
+    await until(() => screen().includes("enter send"));
     await send("\r");
     await until(() => turns.length === 4);
     expect(turns[3]!.input.expanded).toBe("unfinished draft");
@@ -97,10 +98,13 @@ test("queue panel previews, removes and restores editable structured pastes", as
     await ui.send("\u001b[200~alpha\nbeta\ngamma\ndelta\u001b[201~"); await ui.send("\r");
     await ui.send("remove me"); await ui.send("\r");
     await ui.send("\u0011");
-    await until(() => ui.screen().includes("Queued prompts · 2 pending"));
+    await until(() => ui.screen().includes("Queued prompts · 2 saved"));
     expect(ui.screen()).toContain("alpha");
     await ui.send("\u001b[B"); await ui.send("d");
-    expect(ui.screen()).toContain("Queued prompts · 1 pending");
+    expect(ui.screen()).toContain("Y 确认");
+    expect(ui.screen()).toContain("Queued prompts · 2 saved");
+    await ui.send("y");
+    expect(ui.screen()).toContain("Queued prompts · 1 saved");
     // While the panel is open a completed turn must not drain the queue.
     finish(); await Bun.sleep(60);
     expect(turns).toHaveLength(1);
@@ -121,10 +125,33 @@ test("queue edit refuses to overwrite an existing draft", async () => {
     await ui.send("queued"); await ui.send("\r");
     await ui.send("valuable draft"); await ui.send("\u0011"); await ui.send("e");
     expect(ui.screen()).toContain("Keep or clear the current draft");
-    expect(ui.screen()).toContain("1 pending");
+    expect(ui.screen()).toContain("1 saved");
     await ui.send("\u0011");
     expect(ui.screen()).toContain("valuable draft");
   } finally { finish(); ui.close(); }
+});
+
+test("Ctrl+Q and task workbench share one durable queue and retain the original while editing", async () => {
+  const turns: TuiTurn[] = [], finish = Promise.withResolvers<void>();
+  let saved: import("../../src/ui/workbench").QueuedInput[] = [];
+  const ui = await interactive({ queueStorage: { load: async () => structuredClone(saved), save: async (_session, rows) => { saved = structuredClone([...rows]); } },
+    runTurn: async turn => { turns.push(turn); if (turns.length === 1) await finish.promise; } });
+  try {
+    await ui.send("start"); await ui.send("\r");
+    await ui.send("shared input"); await ui.send("\r");
+    await until(() => saved[0]?.state === "pending"); const id = saved[0]!.id;
+    await ui.send("\u0011"); await until(() => ui.screen().includes("Queued prompts · 1 saved"));
+    await ui.send("\u0011"); await ui.send("\u0014"); await ui.send("\t"); await ui.send("\t");
+    await until(() => ui.screen().includes("任务工作台 · 排队输入")); expect(ui.screen()).toContain("shared input");
+    await ui.send("e"); await until(() => saved[0]?.state === "draft");
+    expect(saved[0]).toMatchObject({ id, input: { expanded: "shared input" } });
+    await ui.send(" amended"); await ui.send("\r"); await until(() => saved[0]?.state === "pending");
+    expect(saved).toHaveLength(1); expect(saved[0]!.id).toBe(id);
+    await ui.send("\u0011"); await until(() => ui.screen().includes("shared input amended"));
+    finish.resolve(); await Bun.sleep(60); expect(turns).toHaveLength(1);
+    await ui.send("\u0011"); await until(() => turns.length === 2 && saved.length === 0);
+    expect(turns[1]!.input.expanded).toBe("shared input amended");
+  } finally { finish.resolve(); ui.close(); }
 });
 
 test("custom editor and image shortcuts work and disabled defaults stay disabled", async () => {

@@ -15,15 +15,23 @@ export function createMcpTools(
   _serverName: string,
   client: {
     callTool(name: string, input: unknown, signal?: AbortSignal): Promise<McpToolResult>;
+    readonly executionRevision?: number;
   },
   definitions: McpToolDefinition[],
 ): AgentTool[] {
   const names = new Set<string>();
-  return definitions.map((definition) => {
+  return structuredClone(definitions).map((definition) => {
     const name = buildMcpToolName(_serverName, definition.name);
     if (names.has(name)) throw new Error(`MCP tool name collision: ${name}`);
     names.add(name);
-    return {
+    const tool: AgentTool = {
+      bindExecution() {
+        const revision = client.executionRevision;
+        return { ...tool, async execute(input, signal) {
+          if (client.executionRevision !== revision) throw new Error("MCP connection changed; request fresh approval");
+          return tool.execute(input, signal);
+        } };
+      },
       name,
       description: definition.description ?? "",
       inputSchema: definition.inputSchema,
@@ -42,7 +50,8 @@ export function createMcpTools(
       access: "unknown",
       isReadOnly: () => false,
       isConcurrencySafe: () => false,
-    } satisfies AgentTool;
+    };
+    return tool;
   });
 }
 
@@ -58,6 +67,7 @@ export function createMcpResourceTool(
   client: {
     readResource(uri: string, signal?: AbortSignal): Promise<McpResourceContent[]>;
     subscribeResource?(uri: string, signal?: AbortSignal): Promise<void>;
+    readonly executionRevision?: number;
   },
   definitions: McpResourceDefinition[],
   options?: {
@@ -65,6 +75,7 @@ export function createMcpResourceTool(
     canSubscribe?: boolean;
   },
 ): AgentTool {
+  definitions = structuredClone(definitions);
   const name = buildMcpToolName(serverName, "read_resource");
   const templates = options?.templates ?? [];
   const available = definitions.length === 0
@@ -73,7 +84,14 @@ export function createMcpResourceTool(
   const templateDescription = templates.length > 0
     ? `\nAvailable URI templates:\n${templates.map(formatResourceTemplate).join("\n")}`
     : "";
-  return {
+  const tool: AgentTool = {
+    bindExecution() {
+      const revision = client.executionRevision;
+      return { ...tool, async execute(input, signal) {
+        if (client.executionRevision !== revision) throw new Error("MCP connection changed; request fresh approval");
+        return tool.execute(input, signal);
+      } };
+    },
     name,
     description: `Read a resource exposed by the ${serverName} MCP server. ${available}${templateDescription}`,
     inputSchema: {
@@ -112,7 +130,9 @@ export function createMcpResourceTool(
     },
     async execute(input, signal) {
       const request = input as { uri: string; subscribe?: boolean };
+      const revision = client.executionRevision;
       if (request.subscribe) await client.subscribeResource?.(request.uri, signal);
+      if (client.executionRevision !== revision) throw new Error("MCP connection changed; request fresh approval");
       const contents = await client.readResource(request.uri, signal);
       return formatMcpResourceContents(contents);
     },
@@ -120,6 +140,7 @@ export function createMcpResourceTool(
     isReadOnly: () => false,
     isConcurrencySafe: () => false,
   };
+  return tool;
 }
 
 export function createMcpResourceUpdatesTool(

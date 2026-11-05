@@ -85,7 +85,11 @@ successful Hook may emit:
 ```
 
 `PreToolUse` may allow, deny, ask through the ordinary permission system, or
-replace tool input; replaced input is validated again by the tool. A blocking
+replace tool input; replaced input is validated again by the tool. An allow
+result is a preapproval hint: explicit deny/ask, sensitive-file checks and
+mandatory approvals still run. PermissionRequest input rewrites are checked
+against policy again. PostToolUse failures are diagnostics and do not erase a
+successful tool effect. A blocking
 `Stop` result returns its reason to the model and continues the Agent loop.
 `PermissionDenied` receives the tool name, validated input, actual tool-use ID,
 and denial reason after the ordinary permission checker rejects a call.

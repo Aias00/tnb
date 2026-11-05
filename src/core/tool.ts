@@ -23,12 +23,15 @@ export type ToolProgressData = {
 };
 
 export type ToolProgressReporter = (progress: ToolProgressData) => void;
+export type ToolCallIdentity = { toolUseId: string; scope?: string };
 
 export type ToolDefinition<Input, Output extends ToolOutput = ToolOutput> = {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
   validate(input: unknown): Input;
+  /** Pin mutable execution dependencies before requesting authorization. */
+  bindExecution?(identity?: ToolCallIdentity): AgentTool;
   execute(input: Input, signal: AbortSignal, onProgress?: ToolProgressReporter): Promise<Output>;
   access?: ToolAccess;
   isReadOnly?(input: Input): boolean;
@@ -42,6 +45,7 @@ export type AgentTool<Output extends ToolOutput = ToolOutput> = {
   description: string;
   inputSchema: Record<string, unknown>;
   validate(input: unknown): unknown;
+  bindExecution?(identity?: ToolCallIdentity): AgentTool;
   execute(input: unknown, signal: AbortSignal, onProgress?: ToolProgressReporter): Promise<Output>;
   access: ToolAccess;
   isReadOnly(input: unknown): boolean;
@@ -58,6 +62,7 @@ export function defineTool<Input, Output extends ToolOutput = string>(
     description: definition.description,
     inputSchema: definition.inputSchema,
     validate: definition.validate,
+    ...(definition.bindExecution ? { bindExecution: definition.bindExecution } : {}),
     execute: (input, signal, onProgress) => definition.execute(input as Input, signal, onProgress),
     access: definition.access ?? "unknown",
     isReadOnly: definition.isReadOnly

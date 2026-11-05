@@ -3,6 +3,7 @@ import type { AgentTool } from "./tool";
 export type ToolCatalog = {
   listTools(): AgentTool[];
   getTool(name: string): AgentTool | undefined;
+  replaceTools?(tools: AgentTool[]): void;
 };
 
 export type ToolSearchMatch = {
@@ -41,6 +42,19 @@ export function createDeferredToolCatalog(
   return {
     listTools() {
       return listedTools();
+    },
+    replaceTools(next) {
+      const names = new Set<string>();
+      for (const tool of next) {
+        if (names.has(tool.name) || auxiliary.has(tool.name)) throw new Error(`Duplicate tool name: ${tool.name}`);
+        names.add(tool.name);
+      }
+      const previouslyActive = new Set(eager.keys());
+      eager.clear();
+      deferred.clear();
+      next.forEach((tool, index) => {
+        (index < eagerCount || eagerNames.has(tool.name.toLowerCase()) || previouslyActive.has(tool.name) ? eager : deferred).set(tool.name, tool);
+      });
     },
     getTool(name) {
       return eager.get(name) ?? auxiliary.get(name);

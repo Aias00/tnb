@@ -6,6 +6,16 @@ This repository uses public documentation and authorized implementation referenc
 
 The implementation selectively studies mature coding-agent implementations, including the MIT-licensed [Pi](https://github.com/earendil-works/pi), without taking a runtime dependency on an entire agent framework. Only the small capabilities required by tnb are implemented in this repository. See [docs/architecture-reference.md](docs/architecture-reference.md) for the boundary.
 
+## Runtime hardening
+
+The local runtime adds mandatory permission checks after hooks, balanced
+compaction and truncation handling, coordinated file edits, request-owned tool
+snapshots, per-run task identities, and conservative journal-based recovery.
+Shared transport billing covers children and summaries; per-call execution
+bindings protect approval waits; native sandbox checks exercise OS effects.
+See [runtime lifecycle and recovery](docs/architecture-reference.md#runtime-lifecycle-and-recovery)
+for the source comparison, behavior changes and implementation boundaries.
+
 ## Current milestone
 
 The current vertical slice includes:
@@ -116,6 +126,12 @@ a new session with the current conversation history while resetting usage,
 runtime task, worktree, and goal state. `/export` writes
 a plain-text transcript inside the active workspace and derives its default
 filename from the first prompt and current timestamp.
+
+When stdin or stdout is not a terminal, tnb uses a smaller text REPL. Its local
+commands are `/task` (and its aliases), `/runtime`, `/exit`, and `/quit`; other
+input follows the ordinary prompt path. The full slash-command management
+surface requires the TUI. Use CLI subcommands or the stream-json SDK for
+automation.
 
 The Agent can maintain a structured task list for multi-step work. The latest
 list is rendered in the TUI and recovered from session history on later turns.
@@ -255,7 +271,36 @@ language servers contribute structured document symbols; TypeScript uses its
 compiler AST and the offline parser remains available when an optional LSP is
 not installed.
 
-Run a persistent objective as a foreground autonomous loop with:
+For durable tasks that survive the submitting terminal, use the local owner service:
+
+```sh
+tnb runtime submit 'Fix the retry bug and verify it' --cwd /path/to/project \
+  --allow-write --allow-shell --check 'bun run typecheck' --check 'bun test'
+tnb runtime status RUN_ID
+tnb runtime result RUN_ID
+tnb runtime pause RUN_ID
+tnb runtime resume RUN_ID
+tnb runtime cancel RUN_ID
+```
+
+You can also say “run this as a durable background task” in a conversation.
+The main Agent uses `durable_task` through the normal permission checks, with the
+current workspace/model and relevant conversation context. Or enter
+`/longtask "objective" --mode auto` directly (`/task`, `/long` and `/长任务` are aliases).
+Use `/longtask status`, `/longtask result`, `/longtask pause` and
+`/longtask resume` to manage the latest task in this conversation;
+`/runtime submit` remains available. While the worker owns the
+workspace, chat retains task controls and text conversation; file tools resume
+after ownership is released.
+
+The default `auto` mode starts with one Agent and can admit bounded, independent
+read-only investigations. `--mode single` forbids delegation; writable child
+Agents and remote federation are not enabled. Results require runtime acceptance;
+unknown write/Shell outcomes block for explicit reconciliation. macOS validation
+covers native sandbox enforcement, actual process death and hierarchical recovery.
+See [the durable runtime guide](docs/durable-runtime.md) for controls, backups,
+limits and the exact recovery guarantees. Interactive `/runtime` commands inspect
+and control the same service. The existing foreground loop remains available:
 
 ```bash
 tnb goal-loop "Implement the requested migration and verify it" --turns 30
@@ -370,20 +415,46 @@ The `grep` and `glob` tools call the local `rg` executable, respect workspace
 ignore files, and cap returned results. Install [ripgrep](https://github.com/BurntSushi/ripgrep)
 and ensure `rg` is available on `PATH` before using them.
 
+Text `read` defaults to 64 KiB per call. Use `offset` (UTF-8 byte offset) and
+`limit` (up to 1 MiB) to continue; follow the returned next offset to avoid
+splitting characters. Partial pages do not authorize mutation. Existing files
+need one complete read from offset 0 before `edit`/`write`; these tools refuse
+existing files larger than 1 MiB rather than loading them without a bound.
+Use an explicitly authorized alternative workflow for larger edits.
+
 The `bash` tool supports three execution modes. Foreground commands default to
 a two-minute timeout and may request up to ten minutes. `run_in_background`
 returns a task id that can be inspected with `bash_output` or stopped with
-`bash_kill`; full output is persisted under the current session's task
-directory while the model receives the latest 160,000 characters. `pty=true`
+`bash_kill`. Foreground and background output use bounded previews and logs
+under the current session's task directory. Background previews retain the
+latest 160,000 characters; foreground stdout/stderr previews each retain at
+most that many. Logs save up to 8 MiB per command and 64 MiB per shell manager
+lifetime. Further output is drained and discarded from the log without killing
+the command; truncation and log errors are reported with the log path. Earlier
+logs remain on disk across restarts; this is not a disk retention policy. `pty=true`
 starts a persistent 160x50 terminal for interactive commands. Use
 `bash_input`, `bash_output`, and `bash_resize` with the returned PID. A CLI or
 TUI session owns these processes and terminates any still running when the
 session exits.
 
+Shell selection prefers `TNB_SHELL`, then `SHELL`. Without either variable,
+macOS uses `/bin/zsh`, Linux uses `/bin/sh`, and Windows uses PowerShell.
+
+Main, delegated, Skill, Hook, compaction, memory, and MCP sampling model
+requests share an invocation limit of four active streams and 64 queued
+requests. Set `TNB_MAX_CONCURRENT_MODEL_REQUESTS` to a positive integer to
+change the active limit. Queued requests cancel with their caller; the slot
+is released when the model stream ends, before executing tools. Background
+activations retain their originating invocation's limit. Separate invocations
+and processes have independent limits.
+
 PTY mode requires a `node` executable on `PATH` (or `TNB_NODE_PATH`) for
 the native `@lydell/node-pty` host. tnb uses this small host because the
 native PTY event bridge is reliable in Node while the main CLI and compiled
 binary continue to run on Bun.
+The build includes its JS and platform-native companions under
+`dist/node_modules/@lydell/`; keep that directory beside the binary when
+relocating the build. `install:local` copies the complete runtime bundle.
 
 `notebook_edit` performs cell-level replace, insert, and delete operations on
 existing `.ipynb` files. It accepts real Jupyter cell ids and `cell-N`

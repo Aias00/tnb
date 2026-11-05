@@ -116,6 +116,27 @@ describe("tnb session arguments", () => {
 });
 
 describe("tnb print mode", () => {
+  test("SDK model changes preserve configured slash identifiers and reject invalid selections atomically", async () => {
+    const cwd = await workspace(), configDir = await workspace();
+    await writeFile(join(configDir, "models.json"), JSON.stringify({ providers: { fixture: {
+      api: "openai-completions", baseUrl: "http://127.0.0.1:1/v1", apiKey: "fixture",
+      models: [{ id: "group/free-models", contextWindow: 32000, maxTokens: 256 }],
+    } } }));
+    const transport = new ScriptedTransport([[{ type: "text", index: 0, text: "done" }, { type: "response-end", reason: "end-turn" }]]);
+    async function* input() {
+      for (const [request_id, model] of [["exact", "group/free-models"], ["qualified", "fixture/group/free-models"], ["invalid", "missing/model"]]) {
+        yield JSON.stringify({ type: "control_request", request_id, request: { subtype: "set_model", model } });
+      }
+      yield JSON.stringify({ type: "user", prompt: "Continue with the last valid selection" });
+    }
+    let stdout = "";
+    expect(await runStreamJsonCli({ argv: ["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--provider", "fixture", "--model", "group/free-models"],
+      cwd, configDir, env: {}, transport, input: input(), stdout: { write: text => { stdout += text; } }, stderr: { write: () => undefined } })).toBe(0);
+    const controls = stdout.trim().split("\n").map(line => JSON.parse(line)).filter(record => record.type === "control_response");
+    expect(controls.map(record => record.response.subtype)).toEqual(["success", "success", "error"]);
+    expect(controls[0].response.payload).toEqual({ provider: "fixture", model: "group/free-models" });
+    expect(transport.requests[0]?.model).toBe("group/free-models");
+  });
   test("processes multiple stream-json user records in one persistent session", async () => {
     const cwd = await workspace();
     const configDir = await workspace();
@@ -347,7 +368,7 @@ describe("tnb print mode", () => {
       stderr: { write: (text) => { stderr += text; } },
       transport,
     })).toBe(1);
-    expect(stderr).toContain("Maximum budget of $0.01 exceeded");
+    expect(stderr).toContain("Maximum budget of $0.01 reached");
   });
 
   test("attaches repeated workspace text and image files to the initial prompt", async () => {
@@ -1222,7 +1243,7 @@ describe("tnb print mode", () => {
     const exitCode = await runCli({
       argv: ["-p", "Say hello", "--model", "test-model"],
       env: {},
-      cwd: process.cwd(),
+      cwd: await workspace(),
       configDir: await workspace(),
       stdout: { write: (text) => void (stdout += text) },
       stderr: { write: () => undefined },
@@ -1272,6 +1293,7 @@ describe("tnb print mode", () => {
       "enter_plan_mode",
       "exit_plan_mode",
       "skill",
+      "durable_task",
     ]);
   });
 
@@ -1475,7 +1497,7 @@ describe("tnb print mode", () => {
     expect(await readFile(hookLog, "utf8")).toBe("startstop");
     const parentSession = new SessionStore({ configDir, cwd, sessionId: "main-session" });
     const transcriptDirectory = join(parentSession.projectDir, "main-session", "subagents");
-    const transcripts = await readdir(transcriptDirectory);
+    const transcripts = (await readdir(transcriptDirectory)).filter((name) => name.endsWith(".jsonl"));
     expect(transcripts).toHaveLength(1);
     expect(await readFile(join(transcriptDirectory, transcripts[0]!), "utf8")).toContain(
       "Find the provider registry",
@@ -1558,7 +1580,7 @@ describe("tnb print mode", () => {
       await runCli({
         argv: ["-p", "search", "--model", "test"],
         env: { BRAVE_SEARCH_API_KEY: "search-key" },
-        cwd: process.cwd(),
+        cwd: await workspace(),
         configDir: await workspace(),
         stdout: { write: () => undefined },
         stderr: { write: () => undefined },
@@ -1573,7 +1595,7 @@ describe("tnb print mode", () => {
     const exitCode = await runCli({
       argv: ["-p", "hello"],
       env: {},
-      cwd: process.cwd(),
+      cwd: await workspace(),
       configDir: await workspace(),
       stdout: { write: () => undefined },
       stderr: { write: (text) => void (stderr += text) },

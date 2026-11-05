@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -26,6 +26,74 @@ afterEach(async () => {
 });
 
 describe("built-in tools", () => {
+  test("pages UTF-8 bytes without splitting characters and rejects partial mutation receipts", async () => {
+    const cwd = await workspace();
+    await writeFile(join(cwd, "notes.txt"), "a中😀z");
+    const cache = createFileStateCacheWithSizeLimit(100);
+    const read = createReadTool(cwd, undefined, undefined, cache);
+    const signal = new AbortController().signal;
+    expect(await read.execute(read.validate({ path: "notes.txt", limit: 2 }), signal)).toContain("Next offset: 4.");
+    expect(await read.execute(read.validate({ path: "notes.txt", offset: 4, limit: 1 }), signal)).toEndWith("😀");
+    const edit = createEditTool(cwd, undefined, cache);
+    await expect(edit.execute(edit.validate({ path: "notes.txt", oldText: "a", newText: "b" }), signal)).rejects.toThrow("has not been read");
+    const write = createWriteTool(cwd, undefined, cache);
+    await expect(write.execute(write.validate({ path: "notes.txt", content: "replacement" }), signal)).rejects.toThrow("has not been read");
+    await expect(read.execute(read.validate({ path: "notes.txt", offset: 2 }), signal)).rejects.toThrow("UTF-8");
+    expect(await read.execute(read.validate({ path: "notes.txt", limit: 64 }), signal)).toBe("a中😀z");
+    await edit.execute(edit.validate({ path: "notes.txt", oldText: "a", newText: "b" }), signal);
+    expect(await readFile(join(cwd, "notes.txt"), "utf8")).toBe("b中😀z");
+  });
+
+  test("caps default text reads, supports continuation, and grants a receipt only for a whole file", async () => {
+    const cwd = await workspace();
+    const content = "x".repeat(100_000) + "end";
+    await writeFile(join(cwd, "large.txt"), content);
+    const cache = createFileStateCacheWithSizeLimit(100);
+    const read = createReadTool(cwd, undefined, undefined, cache);
+    const signal = new AbortController().signal;
+    const first = await read.execute(read.validate({ path: "large.txt" }), signal);
+    expect(first).toContain("Next offset: 65536.");
+    expect((first as string).length).toBeLessThan(66_000);
+    const last = await read.execute(read.validate({ path: "large.txt", offset: 65536 }), signal);
+    expect(last).toContain("End of file.");
+    expect(cache.get(join(await realpath(cwd), "large.txt"))?.isPartialView).toBe(true);
+    expect(await read.execute(read.validate({ path: "large.txt", limit: 1048576 }), signal)).toBe(content);
+    expect(cache.get(join(await realpath(cwd), "large.txt"))?.isPartialView).toBe(false);
+    for (const input of [{ limit: 1048577 }, { offset: -1 }, { limit: 1.5 }]) {
+      expect(() => read.validate({ path: "large.txt", ...input })).toThrow();
+    }
+    await writeFile(join(cwd, "binary.txt"), Buffer.from([97, 0, 98]));
+    await expect(read.execute(read.validate({ path: "binary.txt" }), signal)).rejects.toThrow("binary");
+  });
+
+  test("refuses oversized mutation inputs even if a previously read file grows", async () => {
+    const cwd = await workspace();
+    const path = "growing.txt";
+    const cache = createFileStateCacheWithSizeLimit(100);
+    const read = createReadTool(cwd, undefined, undefined, cache);
+    const signal = new AbortController().signal;
+    await writeFile(join(cwd, path), "small");
+    await read.execute(read.validate({ path }), signal);
+    await writeFile(join(cwd, path), "x".repeat(1048580));
+    const edit = createEditTool(cwd, undefined, cache);
+    await expect(edit.execute(edit.validate({ path, oldText: "x", newText: "y" }), signal)).rejects.toThrow("mutation limit");
+    const write = createWriteTool(cwd, undefined, cache);
+    await expect(write.execute(write.validate({ path, content: "replacement" }), signal)).rejects.toThrow("mutation limit");
+    expect((await readFile(join(cwd, path))).length).toBe(1048580);
+  });
+
+  test("reads only a bounded page from a very large sparse file", async () => {
+    const cwd = await workspace();
+    const file = await open(join(cwd, "sparse.txt"), "w");
+    try { await file.write(Buffer.alloc(65540, 120)); await file.truncate(512 * 1024 * 1024); }
+    finally { await file.close(); }
+    const read = createReadTool(cwd);
+    const result = await read.execute(read.validate({ path: "sparse.txt" }), new AbortController().signal);
+    expect(result).toContain("of 536870912");
+    expect(result).toContain("Next offset: 65536");
+    expect((result as string).length).toBeLessThan(66000);
+  });
+
   test("reads a UTF-8 file", async () => {
     const cwd = await workspace();
     await writeFile(join(cwd, "notes.txt"), "hello\n");

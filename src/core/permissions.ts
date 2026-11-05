@@ -48,6 +48,7 @@ export type PermissionChecker = (
   tool: ToolPolicy,
   input: unknown,
   signal?: AbortSignal,
+  context?: { preApproved?: boolean },
 ) => Promise<PermissionDecision>;
 
 export type PermissionOptions = {
@@ -133,6 +134,11 @@ export function evaluatePermission(
     };
   }
 
+  const mode = resolvePermissionMode({ ...options, mode: options.getMode?.() ?? options.mode }).mode;
+  if (mode === "plan" && !tool.isReadOnly(input)) {
+    return { behavior: "deny", message: `${tool.name} is unavailable in plan mode` };
+  }
+
   const askedBy = findMatchingRule(options.rules?.ask, tool.name, content, "ask");
   if (askedBy) {
     return {
@@ -142,14 +148,13 @@ export function evaluatePermission(
     };
   }
 
-  const mode = options.getMode?.() ?? resolvePermissionMode(options).mode;
   const effectiveMode = mode;
   if (tool.requiresApproval?.(input)) {
     return { behavior: "ask", message: `${tool.name} requires approval` };
   }
   if (effectiveMode === "bypassPermissions") return { behavior: "allow" };
 
-  if (tool.isReadOnly(input) && effectiveMode !== "plan") {
+  if (tool.isReadOnly(input)) {
     return { behavior: "allow" };
   }
 
@@ -192,18 +197,22 @@ export function createPermissionChecker(
   options: PermissionOptions,
 ): PermissionChecker {
   const sessionAllowRules = options.sessionAllowRules ?? [];
-  return async (tool, input, signal) => {
+  return async (tool, input, signal, context) => {
     signal?.throwIfAborted();
     const result = evaluatePermission(options, tool, input);
     if (result.behavior === "allow") return { behavior: "allow" };
     if (result.behavior === "deny") {
       return { behavior: "deny", message: result.message };
     }
+    if (context?.preApproved && !result.rule && !tool.requiresApproval?.(input) &&
+      !isDangerousAutoEditPath(options, tool, input)) return { behavior: "allow" };
     const suggestedRule = result.rule || tool.requiresApproval?.(input)
       ? undefined
       : permissionRuleFor(tool, input);
     if (
       !result.rule &&
+      !tool.requiresApproval?.(input) &&
+      !isDangerousAutoEditPath(options, tool, input) &&
       sessionAllowRules.length > 0 &&
       findMatchingRule(
         sessionAllowRules,
@@ -221,13 +230,21 @@ export function createPermissionChecker(
       ...(result.rule ? { rule: result.rule } : {}),
       ...(suggestedRule ? { suggestedRule } : {}),
     };
+    const approve = (updatedInput?: unknown): PermissionDecision => {
+      const current = evaluatePermission(options, tool, updatedInput === undefined ? input : updatedInput);
+      if (current.behavior === "deny") return { behavior: "deny", message: current.message };
+      if (current.behavior === "ask" && current.rule && current.rule !== result.rule) {
+        return { behavior: "deny", message: "Updated authority requires a new approval" };
+      }
+      return { behavior: "allow", ...(updatedInput === undefined ? {} : { updatedInput }) };
+    };
     const hookDecision = await options.onPermissionRequest?.(
       request,
       signal,
     );
     signal?.throwIfAborted();
     if (hookDecision?.behavior === "allow" || hookDecision?.behavior === "deny") {
-      return hookDecision;
+      return hookDecision.behavior === "allow" ? approve(hookDecision.updatedInput) : hookDecision;
     }
     if (options.onAsk) {
       const answer = await options.onAsk(
@@ -235,6 +252,9 @@ export function createPermissionChecker(
         signal,
       );
       signal?.throwIfAborted();
+      if (answer === "deny") return { behavior: "deny", message: `User denied permission to use ${tool.name}` };
+      const approved = approve();
+      if (approved.behavior === "deny") return approved;
       if (answer === "allow-session" && suggestedRule) {
         sessionAllowRules.push(suggestedRule);
         return { behavior: "allow" };
@@ -244,11 +264,11 @@ export function createPermissionChecker(
           return { behavior: "deny", message: "Persistent permission updates are unavailable" };
         }
         await options.persistPermissionRule(suggestedRule);
+        signal?.throwIfAborted();
         sessionAllowRules.push(suggestedRule);
-        return { behavior: "allow" };
+        return approve();
       }
-      return answer === "allow"
-        ? { behavior: "allow" }
+      return answer === "allow" ? approved
         : { behavior: "deny", message: `User denied permission to use ${tool.name}` };
     }
     return {
