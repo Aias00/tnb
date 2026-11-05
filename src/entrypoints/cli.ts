@@ -195,6 +195,7 @@ import { createTerminalPermissionPrompt, createTerminalQuestionPrompt, runRepl }
 import { FileInputQueueStorage } from "../ui/input-queue";
 import { formatResumeHint, runTui } from "../ui/app";
 import { editPromptInExternalEditor } from "../ui/external-editor";
+import { CLI_COMMANDS, isUnknownCliCommand, SIMPLE_COMMAND_HELP } from "../services/cli/commands";
 import { loadKeybindings } from "../ui/keybindings";
 import { completeWorkspaceFiles } from "../ui/file-completion";
 import { renderTerminalImage } from "../ui/terminal-image";
@@ -928,6 +929,9 @@ export async function runModelsCli(options: ModelsCliOptions): Promise<number> {
 export async function runGoalLoopCli(options: CliOptions): Promise<number> {
   try {
     const configDir = options.configDir ?? options.env.TNB_HOME ?? join(homedir(), ".tnb");
+    if (options.argv[0] === "goal-loop-stop" && (options.argv.includes("--help") || options.argv.includes("-h"))) {
+      options.stdout.write("Usage: tnb goal-loop-stop [session-id]\nPause the active goal loop for a workspace session.\n"); return 0;
+    }
     if (options.argv[0] === "goal-loop-stop") {
       const sessionId = options.argv[1] ?? optionValue(options.argv, "--session-id") ??
         await SessionStore.latestSessionId({ configDir, cwd: options.cwd });
@@ -2272,7 +2276,7 @@ export type InteractiveCliOptions = Omit<CliOptions, "permissionPrompt" | "inter
 };
 
 export async function runInteractiveCli(options: InteractiveCliOptions): Promise<number> {
-  const parsed = parseArguments(["-p", "__interactive__", ...options.argv], options.env);
+  const parsed = parseArguments(["-p", "__interactive__", ...normalizeCliArguments(options.argv)], options.env);
   await loadPromptFiles(parsed, options.cwd);
   if (parsed.jsonSchema) throw new Error("--json-schema is only available in print mode");
   if (parsed.includeHookEvents || parsed.includePartialMessages) {
@@ -2527,7 +2531,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
   const unregisterCleanup = registerCleanup(cleanup);
   try {
     const parsed = parseArguments(
-      ["-p", "__interactive__", ...options.argv],
+      ["-p", "__interactive__", ...normalizeCliArguments(options.argv)],
       options.env,
       { allowBareResume: true },
     );
@@ -3482,6 +3486,7 @@ async function runInteractiveSlashCommand(
       "Shift+Up/Down  Transcript page aliases",
       "Ctrl+Home/End  Oldest/latest transcript output",
       "Ctrl+O         Toggle compact/full transcript and tool output",
+      "Ctrl+L         Redraw the terminal if its contents were disturbed",
       "Ctrl+F         Search the transcript; Enter/Up/Down move between matches",
       "Ctrl+R         Reverse-search prompt history; repeat for older matches",
       "Ctrl+G         Edit the current prompt in /editor, $VISUAL, or $EDITOR",
@@ -5311,11 +5316,20 @@ function policyForTool(tool: AgentTool): ToolPolicy {
   };
 }
 
+export function normalizeCliArguments(argv: string[]): string[] {
+  if ((CLI_COMMANDS as readonly string[]).includes(argv[0] ?? "") && argv[0] !== "resume" && argv[0] !== "continue" && (argv.includes("--help") || argv.includes("-h"))) return [argv[0]!, "--help"];
+  if (argv[0] === "continue") return argv.includes("--help") || argv.includes("-h") ? ["--help"] : ["--continue", ...argv.slice(1)];
+  if (argv[0] !== "resume") return argv;
+  if (argv.includes("--help") || argv.includes("-h")) return ["--help"];
+  return ["--resume", ...argv.slice(1)];
+}
+
 export function parseArguments(
   argv: string[],
   env: Record<string, string | undefined>,
   options: { allowBareResume?: boolean } = {},
 ): ParsedArguments {
+  argv = normalizeCliArguments(argv);
   const printIndex = argv.findIndex((argument) => argument === "-p" || argument === "--print");
   const prompt = printIndex >= 0 ? argv[printIndex + 1] : undefined;
   if (!prompt) throw new Error('print mode requires -p "<prompt>"');
@@ -6008,14 +6022,17 @@ function writeHookExecutionEvent(
 
 if (import.meta.main) {
   setupGracefulShutdown();
-  const suppliedArgv = Bun.argv.slice(2);
+  const suppliedArgv = normalizeCliArguments(Bun.argv.slice(2));
   const remoteControlSocket = suppliedArgv[0] === "remote-control"
     ? optionValue(suppliedArgv, "--socket")
     : undefined;
   const argv = suppliedArgv[0] === "remote-control" && !remoteControlSocket
     ? ["-p", "remote-control", "--input-format", "stream-json", "--output-format", "stream-json", ...suppliedArgv.slice(1)]
     : suppliedArgv;
-  if (argv.includes("--version") || argv.includes("-V")) {
+  if (isUnknownCliCommand(argv)) {
+    process.stderr.write(`tnb: Unknown command '${argv[0]}'. Run tnb --help for CLI commands; /commands such as /diff are entered inside tnb.\n`);
+    process.exitCode = 1;
+  } else if (argv.includes("--version") || argv.includes("-V")) {
     process.stdout.write(`${packageJson.version}\n`);
   } else if (argv[0] === "runtime") {
     const { runRuntimeCommand } = await import("./runtime");
@@ -6043,6 +6060,8 @@ if (import.meta.main) {
     }
   } else if (argv.length === 0 ? false : argv[0] === "--help" || argv[0] === "-h" || argv[0] === "help") {
     process.stdout.write(CLI_HELP);
+  } else if (argv[0] && SIMPLE_COMMAND_HELP[argv[0]] && (argv.includes("--help") || argv.includes("-h"))) {
+    process.stdout.write(`Usage: ${SIMPLE_COMMAND_HELP[argv[0]]}\n`);
   } else if (argv[0] === "config") {
     process.exitCode = await runConfigCommand({ argv, env: process.env, cwd: process.cwd(), stdout: process.stdout, stderr: process.stderr });
   } else if (argv[0] === "status") {

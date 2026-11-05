@@ -3,6 +3,7 @@ import { highlight, supportsLanguage } from "cli-highlight";
 import { Box, Text } from "./ink/index";
 import { marked, type Token, type Tokens } from "marked";
 
+import { stringWidth } from "./ink/stringWidth";
 import { useAccent, type AccentColor } from "./theme";
 
 type MarkdownProps = { children: string; streaming?: boolean };
@@ -38,10 +39,9 @@ function MarkdownBlock({ token }: { token: Token }): React.ReactNode {
     case "code": {
       const code = token as Tokens.Code;
       const language = code.lang?.split(/\s+/)[0];
-      const highlighted = highlight(code.text, {
-        ...(language && supportsLanguage(language) ? { language } : {}),
-        ignoreIllegals: true,
-      });
+      const highlighted = language && supportsLanguage(language)
+        ? highlight(code.text, { language, ignoreIllegals: true })
+        : code.text;
       return (
         <Box borderStyle="round" borderColor="gray" paddingX={1} flexDirection="column">
           {code.lang ? <Text dimColor>{code.lang}</Text> : null}
@@ -72,24 +72,39 @@ function MarkdownBlock({ token }: { token: Token }): React.ReactNode {
         </Box>
       );
     }
-    case "table": {
-      const table = token as Tokens.Table;
-      const rows = [table.header, ...table.rows];
-      return (
-        <Box flexDirection="column" borderStyle="single" borderColor="gray">
-          {rows.map((row, rowIndex) => (
-            <Text key={rowIndex} bold={rowIndex === 0}>
-              {row.map((cell) => cell.text.trim()).join(" │ ")}
-            </Text>
-          ))}
-        </Box>
-      );
-    }
+    case "table":
+      return <MarkdownTable table={token as Tokens.Table} accent={accent} />;
     case "hr":
       return <Text dimColor>{"─".repeat(40)}</Text>;
     default:
       return <Text>{token.raw.trim()}</Text>;
   }
+}
+
+function inlineText(tokens: Token[]): string {
+  return tokens.map(token => {
+    if (token.type === "link") { const link = token as Tokens.Link; return `${inlineText(link.tokens)} (${link.href})`; }
+    if ("tokens" in token && Array.isArray(token.tokens)) return inlineText(token.tokens);
+    return "text" in token && typeof token.text === "string" ? token.text : token.type === "br" ? "\n" : token.raw;
+  }).join("");
+}
+
+function MarkdownTable({ table, accent }: { table: Tokens.Table; accent: AccentColor }) {
+  const rows = [table.header, ...table.rows];
+  const widths = table.header.map((_, column) => Math.min(60, Math.max(1, ...rows.map(row => {
+    const tokens = row[column]?.tokens ?? [];
+    return Math.max(0, ...inlineText(tokens).split("\n").map(line => stringWidth(line)));
+  }))));
+  return <Box flexDirection="column" borderStyle="single" borderColor="gray" width="100%" flexShrink={0}>
+    {rows.map((row, rowIndex) => <Box key={rowIndex} flexDirection="row" alignItems="stretch" flexShrink={0}
+      borderStyle="single" borderColor="gray" borderTop={false} borderLeft={false} borderRight={false} borderBottom={rowIndex === 0}>
+      {table.header.map((_, column) => <Box key={column} width={widths[column]! + 3} minWidth={Math.min(widths[column]! + 3, 11)} flexGrow={1} flexShrink={1} paddingX={1}
+        borderStyle="single" borderColor="gray" borderTop={false} borderBottom={false} borderLeft={false} borderRight={column < table.header.length - 1}
+        justifyContent={table.align[column] === "right" ? "flex-end" : table.align[column] === "center" ? "center" : "flex-start"}>
+        <Text bold={rowIndex === 0} wrap="wrap">{inlineTokens(row[column]?.tokens ?? [], accent)}</Text>
+      </Box>)}
+    </Box>)}
+  </Box>;
 }
 
 function inlineTokens(tokens: Token[], accent: AccentColor): React.ReactNode[] {
