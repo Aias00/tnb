@@ -1,8 +1,9 @@
-import type { WorkerResources } from "../services/runtime/engine";
+import type { WorkerResources, RuntimeConfiguration } from "../services/runtime/engine-core";
 import type { DurableRun, DurableTask } from "../services/runtime/types";
 import type { JournalOutcome } from "../core/call-journal";
 import type { ToolUseBlock } from "../core/message";
 import type { AgentTool } from "../core/tool";
+import type { DelegationProposal } from "../services/runtime/delegation";
 import { digestJson, encodeJson, text } from "../services/runtime/json";
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
@@ -12,20 +13,36 @@ export type CapabilityGrant = { name: string; resources: string[]; mode: "read" 
 export type AdapterPluginIdentity = { name: string; version: string; fingerprint: string };
 export type DomainDescriptor = { id: string; version: string; config: JsonValue; resources: ResourceClaim[]; grants: CapabilityGrant[]; plugin?: AdapterPluginIdentity };
 export type PluginAdapterRegistration = { adapter: AgentDomainAdapter; plugin: AdapterPluginIdentity };
-export type DomainContext = { descriptor: DomainDescriptor; namespace: string; run: DurableRun; task: DurableTask; signal: AbortSignal };
+export type DomainContext = { descriptor: DomainDescriptor; namespace: string; run: DurableRun; task: DurableTask; signal: AbortSignal;
+  configuration: RuntimeConfiguration; stateRoot: string };
 export type DomainAcceptance = { checks: Array<{ command: string; output: string }>; evidence?: JsonValue };
+/** Trusted host policy. Plugins own resource admission and business configuration; the runtime owns state transitions. */
+export type DomainRuntimePolicy = {
+  normalize?(configuration: RuntimeConfiguration, stateRoot: string): Promise<void>;
+  legacyDescriptor?(configuration: RuntimeConfiguration): DomainDescriptor;
+  readOnly?(context: DomainContext): boolean;
+  inputLabel?: string;
+  delegationScopeLabel?: string;
+  instructions?(context: DomainContext): string;
+  contract?(context: DomainContext): { [key: string]: JsonValue };
+  digest?(snapshot: JsonValue): string;
+  acquire?(context: DomainContext): Promise<(() => void | Promise<void>) | undefined>;
+  delegate?(context: DomainContext, proposal: DelegationProposal): Promise<Partial<RuntimeConfiguration> & { workspace: string }>;
+  verification?: { minimumChecks: number; acceptance: string; total?(context: DomainContext): number };
+};
 export type DomainOperation = { operationId: string; call: ToolUseBlock; input: unknown };
 export type DomainReceipt = { operationId: string; name: string; input: unknown; result: string; truncated: boolean };
 
 export interface AgentDomainAdapter {
   readonly id: string;
   readonly version: string;
+  readonly runtime?: DomainRuntimePolicy;
   validate(config: JsonValue): void;
   createWorker(context: DomainContext): Promise<WorkerResources>;
   /** Host facts, not a model summary; must change when relevant inputs change. */
   snapshot(context: DomainContext): Promise<JsonValue>;
   /** Must be read-only/replay-safe. Throw to reject a candidate. */
-  accept(context: DomainContext, candidate: { report: string; inputDigest: string; receipts: DomainReceipt[] }): Promise<DomainAcceptance>;
+  accept(context: DomainContext, candidate: { report: string; inputDigest: string; receipts: DomainReceipt[] }, worker?: WorkerResources, progress?: (completed: number) => void): Promise<DomainAcceptance>;
   /** Query an external idempotency key/status; never redispatch the original effect. */
   reconcile?(context: DomainContext, operation: DomainOperation): Promise<JournalOutcome | undefined>;
 }
@@ -48,7 +65,6 @@ export function validateDomainDescriptor(descriptor: DomainDescriptor): DomainDe
     text(plugin.name, "plugin name", 64); text(plugin.version, "plugin version", 128);
     if (Object.keys(plugin).some(key => !["name", "version", "fingerprint"].includes(key)) || !/^[a-f0-9]{64}$/.test(plugin.fingerprint)) throw new Error("Invalid adapter plugin identity");
   }
-  if (descriptor.id === "coding") throw new Error("coding is a reserved adapter ID");
   if (!Array.isArray(descriptor.resources) || !descriptor.resources.length || descriptor.resources.length > 32) throw new Error("Adapter needs one to 32 resource claims");
   if (!Array.isArray(descriptor.grants) || descriptor.grants.length > 64) throw new Error("Invalid capability grants");
   const ids = new Set<string>();
@@ -68,22 +84,44 @@ export function validateDomainDescriptor(descriptor: DomainDescriptor): DomainDe
 
 export function bindDomainAdapter(adapter: AgentDomainAdapter): AgentDomainAdapter {
   text(adapter.id, "adapter ID", 128); text(adapter.version, "adapter version", 128);
-  if (adapter.id === "coding") throw new Error("Reserved adapter identity");
+  const policy = adapter.runtime;
+  const runtime = policy ? Object.freeze({ ...policy,
+    ...(policy.normalize ? { normalize: policy.normalize.bind(policy) } : {}),
+    ...(policy.legacyDescriptor ? { legacyDescriptor: policy.legacyDescriptor.bind(policy) } : {}),
+    ...(policy.readOnly ? { readOnly: policy.readOnly.bind(policy) } : {}),
+    ...(policy.instructions ? { instructions: policy.instructions.bind(policy) } : {}),
+    ...(policy.contract ? { contract: policy.contract.bind(policy) } : {}),
+    ...(policy.digest ? { digest: policy.digest.bind(policy) } : {}),
+    ...(policy.acquire ? { acquire: policy.acquire.bind(policy) } : {}),
+    ...(policy.delegate ? { delegate: policy.delegate.bind(policy) } : {}),
+    ...(policy.verification ? { verification: Object.freeze({ ...policy.verification }) } : {}),
+  }) : undefined;
   return Object.freeze({ id: adapter.id, version: adapter.version, validate: adapter.validate.bind(adapter), createWorker: adapter.createWorker.bind(adapter),
-    snapshot: adapter.snapshot.bind(adapter), accept: adapter.accept.bind(adapter), ...(adapter.reconcile ? { reconcile: adapter.reconcile.bind(adapter) } : {}) });
+    snapshot: adapter.snapshot.bind(adapter), accept: adapter.accept.bind(adapter), ...(adapter.reconcile ? { reconcile: adapter.reconcile.bind(adapter) } : {}),
+    ...(runtime ? { runtime } : {}) });
 }
 
 export class DomainRegistry {
   readonly #adapters = new Map<string, AgentDomainAdapter>();
   readonly #plugins = new Map<string, AdapterPluginIdentity>();
-  constructor(adapters: readonly AgentDomainAdapter[] = [], plugins: readonly PluginAdapterRegistration[] = []) {
+  readonly #legacy?: AgentDomainAdapter;
+  constructor(adapters: readonly AgentDomainAdapter[] = [], plugins: readonly PluginAdapterRegistration[] = [], legacyAdapterId?: string) {
     for (const { adapter, plugin } of [...adapters.map(adapter => ({ adapter, plugin: undefined })), ...plugins]) {
       text(adapter.id, "adapter ID", 128); text(adapter.version, "adapter version", 128);
       const key = digestJson({ id: adapter.id, version: adapter.version });
-      if (adapter.id === "coding" || this.#adapters.has(key)) throw new Error("Duplicate or reserved adapter identity");
+      if (this.#adapters.has(key)) throw new Error("Duplicate adapter identity");
       this.#adapters.set(key, bindDomainAdapter(adapter));
       if (plugin) this.#plugins.set(key, Object.freeze({ ...plugin }));
+      if (legacyAdapterId === adapter.id) {
+        if (this.#legacy || !adapter.runtime?.legacyDescriptor) throw new Error("Invalid or ambiguous legacy adapter");
+        this.#legacy = this.#adapters.get(key);
+      }
     }
+  }
+  descriptor(configuration: RuntimeConfiguration): DomainDescriptor {
+    if (configuration.domain) return configuration.domain;
+    if (!this.#legacy?.runtime?.legacyDescriptor) throw new Error("Legacy execution adapter unavailable; configure the original plugin explicitly");
+    return this.prepare(this.#legacy.runtime.legacyDescriptor(configuration));
   }
   /** Pin new submissions. Recovery must use resolve directly and cannot acquire a new identity. */
   prepare(descriptor: DomainDescriptor): DomainDescriptor {

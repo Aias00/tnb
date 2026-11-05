@@ -38,7 +38,7 @@
 }
 ```
 
-包版本必须符合既有 semver 校验。适配器版本是独立的合同版本。每包最多 32 项，每个适配器 `id/version` 唯一，`coding` 保留。入口必须位于包内，使用打包后的 `.mjs`；多个适配器可以共享一个入口，该入口只初始化一次。入口用默认 factory 导出：
+包版本必须符合既有 semver 校验。适配器版本是独立的合同版本。每包最多 32 项，每个适配器 `id/version` 唯一。Coding 现已作为领域插件接入，见 [Coding 插件架构](coding-plugin-architecture.md)。入口必须位于包内，使用打包后的 `.mjs`；多个适配器可以共享一个入口，该入口只初始化一次。入口用默认 factory 导出：
 
 ```ts
 import type { AdapterPluginFactory } from "tnb/agent/runtime";
@@ -97,6 +97,6 @@ await host.close(); // 应用退出时调用；提交本身不会等待任务完
 
 ## 当前边界与后续取舍
 
-Pi 的交互事件、命令、快捷键、渲染器 API 更完整，DSH 的作用域依赖与 preset 动态组合更完整。TNB 本轮只暴露 `registerAdapter/onDispose/identity`，不为“通用插件”开放任意 runtime 状态修改钩子。预算、授权、checkpoint、调度、回执与结果提交继续由原运行时负责。插件 inventory 为当前宿主内存视图；任务来源和恢复事实持久化在原 configuration/事件日志，不把 inventory 当作任务事实。
+Pi 的交互事件、命令、快捷键、渲染器 API 更完整，DSH 的作用域依赖与 preset 动态组合更完整。插件初始化暴露 `registerAdapter/onDispose/identity`，并可接收宿主状态目录及显式瞬时配置；适配器另提供受信 DomainRuntimePolicy，不为“通用插件”开放任意 runtime 状态修改钩子。预算、授权、checkpoint、调度、回执与结果提交继续由原运行时负责。插件 inventory 为当前宿主内存视图；任务来源和恢复事实持久化在原 configuration/事件日志，不把 inventory 当作任务事实。
 
 没有新增多 generation 热升级、历史包自动保留与垃圾回收、分布式 owner、任意不受信插件沙箱或自动任务迁移。若需要不停机升级，应先增加 generation 引用与历史包存储，解决活动任务如何 pin、旧包如何撤销和保留，再开放热替换；目前重启并明确暂停不匹配任务更容易核验。

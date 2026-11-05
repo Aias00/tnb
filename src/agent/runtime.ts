@@ -1,13 +1,13 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { lock } from "../utils/lockfile";
-import { DurableRuntime, type RuntimeWorkerFactory } from "../services/runtime/engine";
+import { DurableRuntime } from "../services/runtime/engine-core";
 import { RuntimeStore } from "../services/runtime/store";
 import { DomainRegistry, type AgentDomainAdapter } from "./domain";
 import { loadAdapterPlugins, type AgentPluginOptions } from "./plugins";
 
 /** Local Bun host. Acquire the owner lock before opening SQLite, including on recovery. */
-export async function openAgentRuntime(options: { directory: string; adapters?: readonly AgentDomainAdapter[]; plugins?: AgentPluginOptions; codingFactory?: RuntimeWorkerFactory }) {
+export async function openAgentRuntime(options: { directory: string; adapters?: readonly AgentDomainAdapter[]; plugins?: AgentPluginOptions; legacyAdapterId?: string }) {
   await mkdir(options.directory, { recursive: true, mode: 0o700 });
   const unlock = await lock(options.directory, { realpath: true, stale: 5000, update: 1000, retries: 0 });
   let released = false;
@@ -16,9 +16,9 @@ export async function openAgentRuntime(options: { directory: string; adapters?: 
   let plugins: Awaited<ReturnType<typeof loadAdapterPlugins>> | undefined;
   try {
     plugins = options.plugins ? await loadAdapterPlugins(options.plugins, options.adapters, join(options.directory, "plugin-snapshots")) : undefined;
-    const domains = new DomainRegistry(options.adapters, plugins?.registrations);
+    const domains = new DomainRegistry(options.adapters, plugins?.registrations, options.legacyAdapterId);
     store = new RuntimeStore(join(options.directory, "state.sqlite"));
-    const runtime = new DurableRuntime(store, options.directory, options.codingFactory ?? (async () => { throw new Error("Coding adapter is not configured in this host"); }), domains);
+    const runtime = new DurableRuntime(store, options.directory, domains);
     // The host retains ownership through plugin disposal and database close.
     await runtime.start(async () => {});
     let closing: Promise<void> | undefined;
@@ -33,8 +33,8 @@ export async function openAgentRuntime(options: { directory: string; adapters?: 
   }
 }
 export type AgentRuntimeHost = Awaited<ReturnType<typeof openAgentRuntime>>;
-export type { WorkerResources } from "../services/runtime/engine";
+export type { WorkerResources } from "../services/runtime/engine-core";
 export type { RuntimeEvent, DurableRun, DurableTask } from "../services/runtime/types";
 export { DomainRegistry } from "./domain";
-export type { AgentDomainAdapter, DomainDescriptor, DomainContext, DomainAcceptance, DomainOperation, JsonValue, ResourceClaim, CapabilityGrant, AdapterPluginIdentity } from "./domain";
-export type { AgentPluginOptions, AdapterPluginAPI, AdapterPluginFactory, AdapterPluginState } from "./plugins";
+export type { AgentDomainAdapter, DomainDescriptor, DomainContext, DomainAcceptance, DomainOperation, JsonValue, ResourceClaim, CapabilityGrant, AdapterPluginIdentity, DomainRuntimePolicy } from "./domain";
+export type { AgentPluginOptions, AdapterPluginAPI, AdapterPluginFactory, AdapterPluginState, BuiltinAdapterPlugin } from "./plugins";

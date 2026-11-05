@@ -330,7 +330,7 @@ function optionalAdapterContributions(value: unknown, path: string, root: string
     if (!isRecord(item)) throw new Error(`Invalid adapter contribution: ${path}`);
     const id = requiredIdentifier(item.id, `adapters[${index}].id`, path);
     const version = requiredString(item.version, `adapters[${index}].version`, path);
-    if (version.length > 128 || id === "coding" || seen.has(`${id}@${version}`)) throw new Error(`Duplicate or reserved adapter contribution: ${path}`);
+    if (version.length > 128 || seen.has(`${id}@${version}`)) throw new Error(`Duplicate adapter contribution: ${path}`);
     seen.add(`${id}@${version}`);
     const entry = requiredString(item.entry, `adapters[${index}].entry`, path);
     contributionPath(root, entry, "adapters.entry");

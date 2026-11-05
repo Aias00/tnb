@@ -1,4 +1,4 @@
-import type { DurableRuntime, RuntimeConfiguration } from "./engine";
+import type { DurableRuntime, RuntimeConfiguration } from "./engine-core";
 
 export const NOTICE_EVENTS = ["run.succeeded", "run.failed", "run.blocked", "run.paused", "run.pausing", "run.cancel_requested"] as const;
 export type RunNotice = { noticeId: string; runId: string; objective: string; kind: "succeeded" | "failed" | "blocked" | "paused" | "cancelled";

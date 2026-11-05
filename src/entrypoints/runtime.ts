@@ -9,7 +9,7 @@ import type { DurableRun } from "../services/runtime/types";
 import { registerCleanup } from "../utils/cleanup-registry";
 import { withOfflineRuntime, backupRuntime, restoreRuntime, pruneRuntime, runtimeStorageUsage } from "../services/runtime/maintenance";
 
-const HELP = `Usage: tnb runtime <submit|status|result|list|events|questions|answer|limits|pause|resume|cancel|reconcile|start|restart|serve|stop|backup|restore|prune|storage> [options]
+const HELP = `Usage: tnb runtime <submit|status|result|list|events|questions|answer|limits|pause|resume|cancel|reconcile|start|restart|serve|stop|backup|restore|prune|storage|plugins> [options]
 
 followup [run-id] --text "requirements" [--task ID] [--input-id ID]
   Select an unresolved input with --resolve-input ID --revision N and a run-id.
@@ -29,6 +29,7 @@ start / restart  Start or explicitly drain/restart the persistent service.
 stop   Drain and stop the service; accepted tasks remain recoverable.
 backup <directory> / restore <directory> / prune <run-id>  Offline maintenance; stop the service first.
 storage  Show state size and free disk space.
+plugins  Show the running host's built-in and installed domain plugin generations.
 
 All actions accept --config-dir PATH. Submitting starts a persistent local service;
 closing the client does not cancel accepted work. Checks are explicitly authorized
@@ -76,6 +77,7 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
     if (action === "submit" && !args.includes("--no-start")) await ensureRuntime(configDir, options.env);
     let result: unknown;
     if (action === "list") result = await runtimeRequest(configDir, "/runs");
+    else if (action === "plugins") result = await runtimeRequest(configDir, "/plugins");
     else if (action === "routing") {
       const query = new URLSearchParams({ workspace: await realpath(resolve(value("--cwd") ?? options.cwd)), pending: String(args.includes("--pending")) });
       if (value("--before-input")) query.set("beforeInput", value("--before-input")!);

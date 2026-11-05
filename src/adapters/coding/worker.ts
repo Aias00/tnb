@@ -13,7 +13,7 @@ import { ShellSessionManager } from "../../services/shell/manager";
 import { loadProjectInstructions } from "../../services/project-context";
 import { loadSettings } from "../../services/settings/load";
 import { digestJson } from "../../services/runtime/json";
-import type { RuntimeWorkerFactory } from "../../services/runtime/engine";
+import type { RuntimeWorkerFactory } from "../../services/runtime/engine-core";
 
 /** Compose existing tnb tools/providers; credentials stay on the host, outside model and shell environments. */
 export function createRuntimeWorkerFactory(options: { configDir: string; runtimeRoot: string; env: Record<string, string | undefined> }): RuntimeWorkerFactory {

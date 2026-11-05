@@ -1,4 +1,4 @@
-import type { DurableRuntime } from "./engine";
+import type { DurableRuntime } from "./engine-core";
 import type { DurableTask, RunStatus } from "./types";
 import type { TaskActivity } from "./activity";
 import type { TaskInput } from "./routing";

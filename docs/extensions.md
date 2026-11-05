@@ -3,7 +3,9 @@
 Domain adapters can also be distributed in the existing plugin package through
 `contributes.adapters`. Executable entries require an explicit trust store and
 are loaded by `openAgentRuntime({ plugins: ... })`; Coding CLI discovery does
-not execute these entries. Adapter contributions always require a host restart.
+not execute arbitrary domain entries. The durable daemon composes the built-in
+`tnb-coding` plugin by default and can use an explicitly installed, trusted
+package of the same name; see [Coding plugins](coding-plugin-architecture.md). Adapter contributions always require a host restart.
 See [domain plugins and the DSH/Pi comparison](agent-plugin-comparison.md) for
 the manifest, transactional registration, pinned package recovery and example.
 

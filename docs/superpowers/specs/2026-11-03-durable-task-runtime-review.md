@@ -536,3 +536,21 @@ Research 示例使用宿主资料客户端，完全不依赖项目目录、Git�
 新增 **14 项**回归，覆盖安装、信任、禁用、变更不导入、跨入口初始化回滚、逆序清理、独立插件失败隔离、实际工具证据与问答恢复、同版本代码变化拒绝及恢复原字节、并发排空关闭、双 owner、撤销信任、入口越界、符号链接、宿主注册冲突、代码副本隔离及清理期间持锁、清理异常与 inline/plugin 来源绑定。GitHub 重复检查发现模拟 transport 在写出启动事件后、注册取消监听前可能已收到 abort，已修复夹具并分别覆盖正常监听和强制先取消再订阅，未放宽超时或生产关闭协议。
 
 最终 macOS **926 pass / 2 skip / 0 fail**；Linux Ubuntu 24.04.4 ARM64 / Bun 1.3.14、`TNB_REQUIRE_NATIVE_SANDBOX=1` 下 **921 pass / 7 skip / 0 fail**，两端均 **928 tests / 143 files**。类型检查、构建、编译产物 help、插件示例与同目录重开通过。独立内核 bundle 未引入插件加载器、CLI、TUI、Coding 或 SQLite。没有外部模型调用，未新增 Windows 实机、热升级、数小时 soak 或不受信插件隔离验证。证据在 `/Volumes/data/tnb-review-2026-11-04/adapter-plugins/`；保留初始夹具安装参数和 macOS `/var` 规范路径失败记录，修正后通过。
+
+## 21 Coding 领域插件与 Dim 源码参考
+
+日期：2026-11-04。基线 `bd8f96f`。公共持久执行器移至 `engine-core.ts`，移除对 Coding 的运行时依赖；旧 engine.ts 保留历史 factory 构造兼容入口。Coding 与 Research 共用 DomainRegistry、能力筛选、调用日志、上下文、等待、委派和验收提交。旧 artifacts.ts 只作兼容转发，通用产物存储使用 artifact-store.ts，避免借快照兼容导出隐式加载 Coding 代码。
+
+Coding adapter 接管配置规范化、工作区快照、工具分类、额外工作区准入、子任务范围和验收；可信 DomainRuntimePolicy 只提供业务策略，不接管状态写入。公共精确资源租约必先获得，插件 acquire 只能追加约束；保留原前后台和重叠路径互斥，以及同 Run 多读取者最后离开才释放的物理工作区租约。Shell 继续原权限检查与原生沙箱，无命令只读报告标记 report-delivered，有验收命令则为 verification-commands。
+
+默认 Unix 服务在 owner 锁内加载内置 tnb-coding；独立包 dist/plugins/tnb-coding 经原安装/信任入口也可接管同一名称，未信任/失败/无效包不得回退内置。禁用在重启后生效；runtime plugins 命令展示真实后台 generation。内置指纹保守覆盖 src、依赖清单与锁、Bun 版本和平台架构，编译嵌入。进行中任务切换内置/独立包或更换指纹需显式迁移，当前不自动迁移。
+
+旧无 domain 配置按宿主明确选定的 legacy adapter 恢复，不批量改写原记录；保留原 snapshot digest、binding、checkpoint 与验收语义。命令重试可精确匹配历史创建输入并返回原回执，同一 commandId 更改业务输入仍拒绝。异步插件准备期间若宿主关闭，落库前再次检查，禁止退出后才确认新业务。插件额外资源清理失败也释放公共租约，记录 runtime.lastError 并停止派发，不泄漏后台拒绝 Promise；已故障注入验证。前台普通会话 Coding 工具组合仍在 CLI，未声称全部界面/短会话已插件化。
+
+新增参考 Dim `64f877286f2b5b078d5697cda7bd0c392030388f`：defaults.rs 的 profile 组合、workspace_tools 的业务工具边界和协调器所有权、registrations.rs 的 owner 注册释放、assembly.rs 的 Loader 分组。未引入 rutis、多语言桥接或替换 TNB 持久日志。完整源码链接、架构与使用见 [Coding 插件架构](../../coding-plugin-architecture.md)。
+
+新增 **10 项**集成回归：真实文件写入和验收、伪造能力拒绝、通用资源与工作区锁组合、禁用和指纹恢复、旧候选与创建回执兼容、独立安装包真实读取/模型协议/重开、bundle 依赖边界、准备期间关闭、默认 daemon 原生沙箱验收、安装包 trust/revoke 无回退。已有委派、未知写入、预算、上下文、问答及多终端互斥继续全量覆盖。
+
+最终 macOS **936 pass / 2 skip / 0 fail**，Linux Ubuntu 24.04.4 ARM64 / Bun 1.3.14、TNB_REQUIRE_NATIVE_SANDBOX=1 下 **931 pass / 7 skip / 0 fail**；均 **938 tests / 144 files**。类型检查、构建、编译后内置和独立包运行、Research 插件示例与同目录重开通过。初始同时全量运行时出现 PTY 问答和上下文恢复超时，隔离重跑及两端串行全量均通过，未放宽超时，失败日志保留。初始化关闭竞态的首版测试错误地先等待异步 rejects 匹配器而未释放屏障，已修正测试完成顺序并保留记录。最后消除未使用注册辅助方法及类型 import 后，完成针对性验证与交付构建。
+
+证据在 `/Volumes/data/tnb-review-2026-11-04/coding-plugin/`。没有付费或外部模型调用；真实 transport 使用本机 loopback。未新增 Windows 全量功能、热升级、历史包自动保留、跨平台进行中任务恢复、不受信插件隔离、分布式 owner 或数小时 soak 验证。GitHub CI 单独核对。

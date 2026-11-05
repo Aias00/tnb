@@ -1,4 +1,4 @@
-import type { DurableRuntime, RuntimeConfiguration } from "./engine";
+import type { DurableRuntime, RuntimeConfiguration } from "./engine-core";
 import type { InboxQuestion } from "./attention";
 import type { RoutingDecision } from "./routing";
 import { pendingRunNotices } from "./notices";

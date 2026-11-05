@@ -1,7 +1,7 @@
 import { realpath } from "node:fs/promises";
 import { resolve, relative, isAbsolute } from "node:path";
 import type { AgentTool } from "../../core/tool";
-import type { RuntimeConfiguration, WorkerResources } from "../../services/runtime/engine";
+import type { RuntimeConfiguration, WorkerResources } from "../../services/runtime/engine-core";
 import { workspaceManifest } from "./snapshot";
 
 export const codingDomain = {

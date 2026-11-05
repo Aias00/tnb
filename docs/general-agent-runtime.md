@@ -1,6 +1,6 @@
 # 通用 Agent 执行能力
 
-TNB 的执行内核可以嵌入非编码应用；持久任务运行时通过场景适配器接入资源、能力和验收。当前提供 Coding 兼容适配层，以及不依赖业务项目目录、Git 或 Shell 的 Research 适配器。仍为 Bun、本机 SQLite、单 owner，不是分布式工作流服务。仓库保持 private，没有发布新的 npm 包。
+TNB 的执行内核可以嵌入非编码应用；持久任务运行时通过场景适配器接入资源、能力和验收。Coding 与 Research 共用领域注册和插件装配；Coding 默认随后台交付，也可独立安装。Research 不依赖业务项目目录、Git 或 Shell。仍为 Bun、本机 SQLite、单 owner，不是分布式工作流服务。仓库保持 private，没有发布新的 npm 包。
 
 ## 模块与入口
 
@@ -10,11 +10,13 @@ TNB 的执行内核可以嵌入非编码应用；持久任务运行时通过场�
 | `tnb/agent/runtime` / `src/agent/runtime.ts` | 先获得 owner 锁再开 SQLite，注册适配器，提交持久任务和重启恢复 |
 | `src/agent/domain.ts` | 可序列化场景描述、资源声明、能力授权、适配器版本注册和宿主验收接口 |
 | `src/agent/plugins.ts` | 沿原插件系统发现和信任适配器包，事务注册、内容指纹绑定、当前宿主生命周期与清理 |
-| `src/services/runtime/` | 原 Run/Task、调度、等待、上下文、预算、回执、产物和恢复协议 |
-| `src/adapters/coding/` | 原编码 Worker 组合、文件摘要、编码提示词、工作区及 Shell 验收策略；旧 `runtime/worker.ts` 入口继续转发 |
+| `src/services/runtime/engine-core.ts` | 通用 Run/Task 调度、等待、上下文、预算、回执与恢复；engine.ts 为旧 Coding 工厂兼容装配 |
+| `tnb/adapters/coding` | Coding adapter、内置/独立插件入口、文件工具、快照、工作区租约与 Shell 验收 |
 | `tnb/adapters/research` | 版本化资料读取和报告引用验收；资料客户端由宿主注入 |
 
 `RuntimeConfiguration` 保留旧编码字段以兼容已有 Run 和调用方。通用调用方使用 `host.submit({ namespace, adapter, ... })`，无需填写项目目录、Shell 或编码验收参数。内部 `workspace = agent:NAMESPACE` 仅作为原路由存储的命名空间键，不对它调用 realpath、目录扫描或文件锁。普通 TNB CLI 和 Unix 服务仍默认装配 Coding；本轮通用入口是嵌入 API，不把 `/task` 默认改为研究任务。
+
+Coding 插件将通用提交映射为真实工作区合同；后台 `/task` 也走同一链路。`tnb runtime plugins` 查看实际加载状态，构建输出 `dist/plugins/tnb-coding` 可以安装。见 [Coding 插件与 Dim 源码比较](coding-plugin-architecture.md)。普通前台会话的 CLI 工具组合仍独立存在。
 
 ## 运行示例
 
@@ -62,7 +64,7 @@ await host.close();
 
 领域适配器也可以放入现有插件包的 `contributes.adapters`，由 `openAgentRuntime({ plugins: { roots, trustStorePath, enabled } })` 装配。它复用安装、启用、信任、兼容性检查；每包初始化成功才提交注册，关闭排空 Worker 后才释放插件。入口为打包 `.mjs`，本轮采用重启生效，保留直接 `adapters` 注入方式。源码比较、清单和恢复边界见 [领域插件与 DSH/Pi 比较](agent-plugin-comparison.md)；完整离线示例运行 `bun run agent:plugin-demo`。
 
-`snapshot` 必须从真实资源取得版本/摘要，不能使用模型总结；执行前/报告提交时和验收前后检查版本。`accept` 为可安全重放的只读验证，收到候选报告、输入摘要和最近最多 128 项成功工具回执。每项结果预览最多 16,000 字符并显式标记是否截断；缺少必要证据时拒绝，不能从截断内容推断完成。验收至少提供一项检查，最多 64 项，另可附 JSON 证据，整体仍受 1 MiB 产物上限约束。运行时提交 `domain-verified` 表示宿主检查已通过，具体语义由适配器声明。
+`snapshot` 必须从真实资源取得版本/摘要，不能使用模型总结；执行前/报告提交时和验收前后检查版本。`accept` 为可安全重放的只读验证，收到候选报告、输入摘要和最近最多 128 项成功工具回执。每项结果预览最多 16,000 字符并显式标记是否截断；缺少必要证据时拒绝，不能从截断内容推断完成。默认领域验收至少提供一项检查，最多 64 项；Coding 宿主策略允许无命令的只读报告，但标记为 report-delivered。另可附 JSON 证据，整体仍受 1 MiB 产物上限约束。运行时提交 `domain-verified` 表示宿主检查已通过，具体语义由适配器声明。
 
 Research 实际检查每个声明资料是否有成功读取回执和 `[source:ID]` 引用，版本摘要在验收前后保持一致。它不把“引用存在”当成所有论断语义正确的证明。资料客户端必须返回可靠版本和有界文本；模型只能接触其被授权的资料工具。
 
