@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createDurableCapabilityHost, validateCapabilitySelection } from "../../src/adapters/coding/capabilities";
@@ -8,6 +8,7 @@ import { createCodingAdapter } from "../../src/adapters/coding/adapter";
 import { DurableRuntime, type RuntimeConfiguration } from "../../src/services/runtime/engine";
 import { RuntimeStore } from "../../src/services/runtime/store";
 import type { ModelTransport } from "../../src/providers/types";
+import { pluginTrustStorePath, revokePluginTrust, trustPlugin } from "../../src/services/plugins/trust";
 
 const cleanup: (() => Promise<unknown>)[] = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -93,6 +94,38 @@ test("durable MCP list changes cannot replace the admitted tool generation", asy
   const mcp = worker.tools.find(tool => tool.name === "mcp__fixture__inspect")!;
   await mcp.execute({ notify: true }, signal());
   await expect(mcp.execute({}, signal())).rejects.toThrow("catalog changed");
+  expect((await readFile(f.log, "utf8")).trim().split("\n")).toHaveLength(1);
+});
+
+test("cached durable plugin skills and MCP calls recheck current block, enablement and trust without redispatch", async () => {
+  const f = await fixture(), pack = join(f.configDir, "plugins", "durable-pack");
+  await mkdir(join(pack, "skills"), { recursive: true }); await rename(f.skillDir, join(pack, "skills", "inspect"));
+  await rename(join(f.configDir, "mcp.json"), join(pack, "mcp.json"));
+  await writeFile(join(pack, "plugin.json"), JSON.stringify({ name: "durable-pack", mcpServers: "mcp.json" }));
+  const trustPath = pluginTrustStorePath(f.configDir), approved = await trustPlugin(trustPath, pack);
+  await f.host.prepare(f.config); const worker = await f.host.open(f.config, signal()); cleanup.push(worker.close);
+  const legacyCheck = await f.host.guardLegacy(f.config, signal());
+  const assembled = await f.factory({ run: { runId: "policy" }, task: { taskId: "policy" }, configuration: f.config, signal: signal() } as Parameters<typeof f.factory>[0]);
+  cleanup.push(async () => assembled.close?.());
+  const admittedSkill = assembled.tools.find(tool => tool.name === "skill")!;
+  expect((await assembled.authorize(admittedSkill, { name: "inspect" }, { toolUseId: "before-block" })).behavior).toBe("allow");
+  const skill = worker.tools.find(tool => tool.name === "skill")!, resource = worker.tools.find(tool => tool.name === "skill_resource")!, mcp = worker.tools.find(tool => tool.name === "mcp__fixture__inspect")!;
+  await mcp.execute({}, signal());
+  for (const settings of [{ blockedPluginFingerprints: [approved.fingerprint] }, { enabledPlugins: { "durable-pack": false } }]) {
+    await writeFile(join(f.configDir, "settings.json"), JSON.stringify(settings));
+    await expect(skill.execute(skill.validate({ name: "inspect" }), signal())).rejects.toThrow("unavailable");
+    await expect(resource.execute({ skill: "inspect", path: "checklist.txt" }, signal())).rejects.toThrow("unavailable");
+    await expect(mcp.execute({}, signal())).rejects.toThrow("unavailable");
+    await expect(f.host.prepare(f.config)).rejects.toThrow("skill unavailable");
+    await expect(legacyCheck()).rejects.toThrow("unavailable");
+    await expect(assembled.authorize(admittedSkill, { name: "inspect" }, { toolUseId: "after-block" })).rejects.toThrow("unavailable");
+    if ("blockedPluginFingerprints" in settings) {
+      const recoveredCheck = await f.host.guardLegacy(f.config, signal());
+      await expect(recoveredCheck()).rejects.toThrow("blocked");
+    }
+  }
+  await writeFile(join(f.configDir, "settings.json"), "{}"); await revokePluginTrust(trustPath, pack);
+  await expect(mcp.execute({}, signal())).rejects.toThrow("untrusted");
   expect((await readFile(f.log, "utf8")).trim().split("\n")).toHaveLength(1);
 });
 

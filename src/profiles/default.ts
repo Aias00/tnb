@@ -16,6 +16,7 @@ import { pluginGenerationReferences } from "../agent/plugin-generations";
 import { RuntimeStore } from "../services/runtime/store";
 import { builtinGenerationAuthority, builtinChannelGenerationAuthority } from "../agent/builtin-generations";
 import { migrateCollaborationChannels, collaborationChannelReferences } from "../services/collaboration/channels";
+import { createDurableCapabilityHost } from "../adapters/coding/capabilities";
 
 /** Product composition only; the generic plugin host knows neither Coding nor collaboration. */
 export async function loadDefaultProfile(options: { configDir: string; root: string; env: Record<string, string | undefined>; coding: boolean; runtime?: DurableRuntime }) {
@@ -25,13 +26,17 @@ export async function loadDefaultProfile(options: { configDir: string; root: str
   // Caller holds the owner lock; collect references before importing any plugin code.
   const config = await loadCollaborationConfig(configDir);
   const referenceStore = options.runtime?.store ?? new RuntimeStore(join(root, "state.sqlite"));
+  const capabilities = createDurableCapabilityHost({ configDir, env });
   let plugins;
   try {
     migrateCollaborationChannels(referenceStore);
     plugins = await loadHostPlugins({ roots: [{ directory: join(configDir, "plugins"), source: "user" }],
       trustStorePath: pluginTrustStorePath(configDir), enabled: settings.enabledPlugins, builtins, configuration, generationReferences: pluginGenerationReferences(referenceStore),
       builtinAuthority: builtinGenerationAuthority(referenceStore), builtinChannelAuthority: builtinChannelGenerationAuthority(referenceStore), channelReferences: collaborationChannelReferences(referenceStore, config),
-      blockedFingerprints: settings.blockedPluginFingerprints }, [], join(root, "plugin-snapshots"));
+      blockedFingerprints: settings.blockedPluginFingerprints,
+      workerGuard: async (context, generation) => generation.recoveryOnly && context.descriptor.id === "coding"
+        ? capabilities.guardLegacy(context.configuration, context.signal) : async () => {},
+    }, [], join(root, "plugin-snapshots"));
   } finally { if (!options.runtime) referenceStore.close(); }
   return { plugins, async start(runtime: DurableRuntime, signal?: AbortSignal) {
     await plugins.extensions.start({ store: runtime.store, signal, services: new Map<string, unknown>([

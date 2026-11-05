@@ -57,6 +57,28 @@ tnb runtime plugins
 
 包安装状态用 `tnb plugins list/show` 查看；后台中的贡献状态用 `tnb runtime plugins` 查看。禁用使用 `tnb plugins disable NAME`，重启后生效。没有对活跃 Agent 热替换插件代码；更新后的内容需要重新信任。显式安装的同名包不论禁用、未信任、损坏还是加载失败，都不会绕过它回退到内置实现。
 
+## 统一准入策略和撤权
+
+资源目录和可执行宿主共用包策略。`tnb plugins list --json`、`tnb plugins show NAME` 的 `policy` 表达准入结果，和内容 `trust`、运行状态分别记录。判断优先级如下：
+
+| policy.status | 含义 |
+| --- | --- |
+| blocked | 当前内容指纹在 `blockedPluginFingerprints` 中，即使已信任也不允许使用 |
+| disabled | `enabledPlugins` 明确禁用该包 |
+| untrusted / changed | 未批准当前内容，或内容相对信任记录发生变化 |
+| manual | 包要求手动激活，尚未明确启用 |
+| ready | 当前准入条件满足；不代表每项贡献已经启动或业务可用 |
+
+CLI、SDK stream CLI、交互资源刷新及 Coding 持久能力发现都传入当前阻止列表。被阻止的包不能仅因提供的是 Skill、Agent、命令、Hook、MCP 或外部工具，就绕过同包可执行入口的阻止决定。传入 CLI 的缓存目录也会在使用前重新应用启用和阻止策略。
+
+交互资源刷新遇到禁用、撤销信任或阻止时，会停止旧资源代际，不把撤权推迟到包的 `reload: restart` 更新时机；正常的受信任代码更新仍遵守原 reload 合同。已经停止的外部工具句柄不能重新启动该代际，关闭整个工具 runtime 后所有旧句柄均拒绝调用。只有宿主显式重新激活同一代际，才可恢复其调用。
+
+Coding 持久 Worker 记录选中 Skill/MCP 的包来源，在授权以及 Skill、资源读取、MCP 调用前复验当前启用、阻止和原指纹批准。只校验实际选中资源的所属包；与任务无关的包不影响该任务。Skill 内容仍使用本 Worker 的不可变快照，复验策略不会把它换成磁盘上的新指令，也不会改变持久能力摘要。
+
+历史 Coding 包可能尚无上述检查。默认 profile 通过宿主注入的 `workerGuard` 在历史 Worker 创建前、创建后、授权及工具执行时校验资源包策略；创建后检查失败会关闭 Worker。守卫不连接 MCP、不改写旧任务绑定。SDK 自建宿主可通过同一回调接入自己的领域策略；直接注册的 inline adapter 由宿主自身负责。
+
+这些机制不提供任意进程内代码的强制热撤销。已加载的交互 Hook、Skill 和 MCP 仍需资源刷新或重启；后台可执行包选择也在重启时更新。已发出的网络请求或子进程效果不能通过撤权回滚。HTTP 真实目的地约束、所有在途调用的强制排空和输出读取限额仍按[规范草案](../superpowers/specs/2026-11-05-plugin-specification.md)分阶段实现。
+
 默认产品 profile 在一个宿主内组合 `tnb-coding`、`tnb-channels`、`tnb-collaboration`、`tnb-web`。这些包也在构建产物的 dist/plugins 下提供可安装包，运行中的内置版本和安装版本走相同注册与生命周期。停用协作插件不会删除工单、通知或原 Run。
 
 领域包和渠道支持历史可执行代际留存，inventory 显示 current/retained 和引用数。安装包受安装、启用、信任和兼容性约束；默认 Coding/channels 使用嵌入包和宿主私有批准。任务和来源保留原指纹，不把历史实现作为默认回退。详见 [领域安装包](plugin-generations.md)、[默认 Coding](builtin-generations.md) 和 [渠道来源恢复](channel-generations.md)；自定义 inline factory 和历史应用/界面不在此恢复范围。

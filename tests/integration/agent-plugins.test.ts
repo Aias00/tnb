@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { openAgentRuntime, type AgentRuntimeHost } from "../../src/agent/runtime";
 import { loadAdapterPlugins, type HostPluginAPI } from "../../src/agent/plugins";
-import type { DomainDescriptor } from "../../src/agent/domain";
+import type { DomainContext, DomainDescriptor } from "../../src/agent/domain";
 import { loadPlugins } from "../../src/services/plugins/loader";
 import { installLocalPlugin } from "../../src/services/plugins/management";
 import { trustPlugin, computePluginTreeSha256, revokePluginTrust } from "../../src/services/plugins/trust";
@@ -71,6 +71,48 @@ test("portable installed generations retain bytes, pin SQLite references, enforc
   await loaded.close(); store.close();
   // Bun SQLite statement wrappers can retain native handles until collected on Windows.
   if (process.platform === "win32") Bun.gc(true);
+});
+
+test("host worker guard protects retained packages, bound calls and creation races without changing pins", async () => {
+  const f = await fixture(), entry = join(f.installedRoot, "index.mjs");
+  await writeFile(entry, (await readFile(entry, "utf8"))
+    .replace("async createWorker(context) {", 'async createWorker(context) { await log("worker-create");')
+    .replace('name: "lookup",', 'name: "lookup", bindExecution() { return this; },'));
+  await trustPlugin(f.trust, f.installedRoot);
+  const stateRoot = join(f.root, "guard-state"), snapshotRoot = join(stateRoot, "plugin-snapshots");
+  let loaded = await loadAdapterPlugins({ ...f.options, generationReferences: [] }, [], snapshotRoot); cleanup.push(() => loaded.close());
+  const pinned = new DomainRegistry([], loaded.registrations).prepare(descriptor());
+  const store = new RuntimeStore(join(stateRoot, "state.sqlite")); cleanup.push(async () => { store.close(); if (process.platform === "win32") Bun.gc(true); });
+  new RuntimeCommands(store).createRun({ commandId: "guard", objective: "Keep old code", configuration: { domain: pinned } });
+  await loaded.close(); await writeFile(entry, await readFile(entry, "utf8") + "\n// upgrade\n"); await trustPlugin(f.trust, f.installedRoot);
+  let allowed = false, checks = 0, failAt = -1;
+  const generations: boolean[] = [];
+  loaded = await loadAdapterPlugins({ ...f.options, generationReferences: pluginGenerationReferences(store), workerGuard: async (_context, generation) => {
+    generations.push(generation.recoveryOnly);
+    return async () => { checks++; if (!allowed || checks === failAt) throw new Error("host revoked"); };
+  } }, [], snapshotRoot); cleanup.push(() => loaded.close());
+  const registry = new DomainRegistry([], loaded.registrations), adapter = registry.resolve(pinned);
+  expect(registry.resolve(pinned).id).toBe("fixture"); expect(pinned.plugin).toBeDefined();
+  const context = { descriptor: pinned, signal: new AbortController().signal, configuration: {} } as DomainContext;
+  await expect(adapter.createWorker(context)).rejects.toThrow("host revoked");
+  expect(await f.events()).not.toContain("worker-create");
+  allowed = true;
+  const worker = await adapter.createWorker(context); cleanup.push(async () => worker.close?.());
+  const tool = worker.tools[0]!, bound = tool.bindExecution!();
+  expect(bound.capability).toEqual(tool.capability); expect(bound.effects).toEqual({ replay: "safe" });
+  expect((await worker.authorize(bound, {}, { toolUseId: "guarded" })).behavior).toBe("allow");
+  expect(await bound.execute({}, context.signal)).toBe("actual plugin fact");
+  allowed = false;
+  await expect(worker.authorize(bound, {}, { toolUseId: "revoked" })).rejects.toThrow("host revoked");
+  await expect(tool.execute({}, context.signal)).rejects.toThrow("host revoked");
+  await expect(bound.execute({}, context.signal)).rejects.toThrow("host revoked");
+  expect((await f.events()).filter(event => event === "tool")).toHaveLength(1);
+  allowed = true; failAt = checks + 2;
+  await expect(adapter.createWorker(context)).rejects.toThrow("host revoked");
+  expect((await f.events()).filter(event => event === "worker-close")).toHaveLength(1);
+  failAt = -1;
+  const current = await registry.resolve(registry.prepare(descriptor())).createWorker(context); await current.close?.();
+  expect(generations).toEqual([true, true, true, false]);
 });
 
 test("existing installation discovers adapters and forces restart lifecycle; untrusted/disabled code is never imported", async () => {

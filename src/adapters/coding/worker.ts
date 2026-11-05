@@ -89,6 +89,8 @@ export function createRuntimeWorkerFactory(options: { configDir: string; runtime
       authorize: async (tool, input, context) => {
         signal.throwIfAborted();
         if (["agent", "durable_wait", "durable_recall", "assess_delegation", "review_child_result", "complete_investigation"].includes(tool.name)) return { behavior: "allow" };
+        // Check plugin admission independently of executable tool dispatch.
+        await extra.assertCurrent(signal);
         if (tool.capability?.name === "skill.read" || tool.capability?.name === "mcp.call") return capabilityChecker({ ...tool, risk: tool.access }, input, signal, context);
         return checker({ ...tool, risk: tool.access }, input, signal, context);
       },

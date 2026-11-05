@@ -3,6 +3,7 @@ import { dirname } from "node:path";
 
 import type { LoadedPlugin } from "./loader";
 import type { PluginToolRuntimeManager } from "./tools";
+import { assertPluginActive, isPluginActive } from "./policy";
 
 export type PluginRuntimeState = {
   name: string;
@@ -35,7 +36,7 @@ export class PluginLifecycleManager {
 
   async start(plugins: readonly LoadedPlugin[]): Promise<void> {
     for (const plugin of plugins) {
-      if (!plugin.active) {
+      if (!isPluginActive(plugin)) {
         await this.#set(plugin, "loaded");
         continue;
       }
@@ -50,6 +51,7 @@ export class PluginLifecycleManager {
   }
 
   async activate(plugin: LoadedPlugin): Promise<void> {
+    assertPluginActive(plugin);
     try {
       await this.toolRuntime?.startEager([plugin]);
       await this.#set(plugin, "active");
@@ -65,7 +67,7 @@ export class PluginLifecycleManager {
   }
 
   isActive(plugin: LoadedPlugin): boolean {
-    return this.#states.get(plugin.name.toLowerCase())?.status === "active";
+    return isPluginActive(plugin) && this.#states.get(plugin.name.toLowerCase())?.status === "active";
   }
 
   async fail(plugin: LoadedPlugin, error: unknown): Promise<void> {
@@ -123,6 +125,12 @@ export function reconcilePluginCatalog(
     }
     previousByName.delete(oldPlugin.name.toLowerCase());
     discoveredByName.delete(oldPlugin.name.toLowerCase());
+    // Revocation is immediate on refresh, including packages whose code update needs restart.
+    if (!isPluginActive(nextPlugin)) {
+      if (isPluginActive(oldPlugin)) stop.push(oldPlugin);
+      plugins.push(nextPlugin);
+      continue;
+    }
     const policy = strictestReloadPolicy(oldPlugin, nextPlugin);
     if (pluginFingerprint(oldPlugin) === pluginFingerprint(nextPlugin) && !(forceRuntimeReload && policy === "runtime")) {
       plugins.push(nextPlugin);

@@ -174,6 +174,7 @@ import {
 import { pluginTrustStorePath } from "../services/plugins/trust";
 import { createExternalPluginTools, PluginToolRuntimeManager } from "../services/plugins/tools";
 import { PluginLifecycleManager, reconcilePluginCatalog } from "../services/plugins/lifecycle";
+import { applyPluginPolicy } from "../services/plugins/policy";
 import { configuredMarketplaceSources, loadPluginMarketplace } from "../services/plugins/marketplace";
 import { scanSecurity } from "../services/security/scanner";
 import {
@@ -414,7 +415,7 @@ export async function runStreamJsonCli(options: StreamJsonCliOptions): Promise<n
     }
     if (record.subtype === "plugin_reload") {
       const settings = await loadSettings({ configDir, cwd: options.cwd });
-      const plugins = await loadConfiguredPlugins(configDir, options.cwd, settings.enabledPlugins);
+      const plugins = await loadConfiguredPlugins(configDir, options.cwd, settings.enabledPlugins, settings.blockedPluginFingerprints);
       return {
         plugins: plugins.plugins.map((plugin) => ({
           name: plugin.name,
@@ -1036,8 +1037,8 @@ export async function runCli(options: CliOptions): Promise<number> {
       loadSettings({ configDir, cwd: options.cwd, ...(parsed.settingsInput ? { additional: parsed.settingsInput } : {}) }),
     ]);
     const pluginResult = options.pluginCatalog
-      ? { plugins: options.pluginCatalog, errors: [] }
-      : await loadConfiguredPlugins(configDir, options.cwd, settings.enabledPlugins);
+      ? { plugins: options.pluginCatalog.map(plugin => applyPluginPolicy(plugin, { enabled: settings.enabledPlugins, blockedFingerprints: settings.blockedPluginFingerprints })), errors: [] }
+      : await loadConfiguredPlugins(configDir, options.cwd, settings.enabledPlugins, settings.blockedPluginFingerprints);
     activePlugins = pluginResult.plugins;
     for (const error of pluginResult.errors) options.stderr.write(`tnb plugin: ${error.path}: ${error.error}\n`);
     for (const plugin of pluginResult.plugins.filter((item) => item.trust === "untrusted" || item.trust === "changed")) {
@@ -2301,7 +2302,7 @@ export async function runInteractiveCli(options: InteractiveCliOptions): Promise
     loadProviderCatalog({ configDir, env: options.env }),
     loadSettings({ configDir, cwd: options.cwd, ...(parsed.settingsInput ? { additional: parsed.settingsInput } : {}) }),
   ]);
-  const plugins = await loadConfiguredPlugins(configDir, options.cwd, settings.enabledPlugins);
+  const plugins = await loadConfiguredPlugins(configDir, options.cwd, settings.enabledPlugins, settings.blockedPluginFingerprints);
   for (const plugin of plugins.plugins.filter((item) => item.trust === "untrusted" || item.trust === "changed")) {
     options.stderr.write(`tnb plugin: ${plugin.name} is ${plugin.trust}; open /plugins to review and trust its current content.\n`);
   }
@@ -2548,8 +2549,8 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
     ]);
     const loadInteractiveResources = async (pluginOverride?: Awaited<ReturnType<typeof loadPlugins>>["plugins"]) => {
       const currentSettings = await loadSettings({ configDir, cwd: options.cwd, ...(parsed.settingsInput ? { additional: parsed.settingsInput } : {}) });
-      const discoveredPlugins = await loadConfiguredPlugins(configDir, options.cwd, currentSettings.enabledPlugins);
-      const plugins = pluginOverride ?? discoveredPlugins.plugins;
+      const discoveredPlugins = await loadConfiguredPlugins(configDir, options.cwd, currentSettings.enabledPlugins, currentSettings.blockedPluginFingerprints);
+      const plugins = pluginOverride ? pluginOverride.map(plugin => applyPluginPolicy(plugin, { enabled: currentSettings.enabledPlugins, blockedFingerprints: currentSettings.blockedPluginFingerprints })) : discoveredPlugins.plugins;
       const [agents, commands, skills] = await Promise.all([
         loadAgents([
           { directory: join(configDir, "agents"), source: "user" },
@@ -4049,7 +4050,7 @@ async function runInteractiveSlashCommand(
       return { message: "Reloaded Skills, Agents, commands, and Plugin contributions." };
     }
     const settings = await loadSettings({ configDir: context.configDir, cwd: context.cwd });
-    const plugins = await loadConfiguredPlugins(context.configDir, context.cwd, settings.enabledPlugins);
+    const plugins = await loadConfiguredPlugins(context.configDir, context.cwd, settings.enabledPlugins, settings.blockedPluginFingerprints);
     const skills = await loadSkills([
       { directory: join(context.configDir, "skills"), source: "user" },
       { directory: join(context.cwd, ".tnb", "skills"), source: "project" },
@@ -4089,7 +4090,7 @@ async function runInteractiveSlashCommand(
     if (action === "enable" || action === "disable" || action === "update" || action === "remove" || action === "trust" || action === "untrust") {
       if (!name) throw new Error(`Usage: /plugins ${action} <name>`);
       const settings = await loadSettings({ configDir: context.configDir, cwd: context.cwd });
-      const all = await loadConfiguredPlugins(context.configDir, context.cwd, {});
+      const all = await loadConfiguredPlugins(context.configDir, context.cwd, {}, settings.blockedPluginFingerprints);
       const plugin = all.plugins.find((item) => item.name.toLowerCase() === name.toLowerCase());
       if (!plugin) throw new Error(`Unknown plugin: ${name}`);
       let output = "";
@@ -4113,7 +4114,7 @@ async function runInteractiveSlashCommand(
     }
     if (action) throw new Error("Usage: /plugins [enable|disable|trust|untrust|update|remove <name>|reload]");
     const settings = await loadSettings({ configDir: context.configDir, cwd: context.cwd });
-    const all = await loadConfiguredPlugins(context.configDir, context.cwd, {});
+    const all = await loadConfiguredPlugins(context.configDir, context.cwd, {}, settings.blockedPluginFingerprints);
     return { management: {
       kind: "plugins",
       title: "Plugins",
@@ -4273,7 +4274,7 @@ async function runInteractiveSlashCommand(
   }
   if (command.name === "hooks") {
     const settings = await loadSettings({ configDir: context.configDir, cwd: context.cwd });
-    const plugins = await loadConfiguredPlugins(context.configDir, context.cwd, settings.enabledPlugins);
+    const plugins = await loadConfiguredPlugins(context.configDir, context.cwd, settings.enabledPlugins, settings.blockedPluginFingerprints);
     const hooks = mergePluginHooks(settings.hooks, await loadPluginHooks(plugins.plugins));
     const rows = Object.entries(hooks).flatMap(([event, groups]) => (groups ?? []).flatMap((group, groupIndex) =>
       group.hooks.map((hook, hookIndex) => ({ event, group, groupIndex, hook, hookIndex }))
@@ -6293,9 +6294,10 @@ function loadConfiguredPlugins(
   configDir: string,
   cwd: string,
   enabled: Record<string, boolean> | undefined,
+  blockedFingerprints?: readonly string[],
 ) {
   return loadPlugins([
     { directory: join(configDir, "plugins"), source: "user" },
     { directory: join(cwd, ".tnb", "plugins"), source: "project" },
-  ], enabled, { trustStorePath: pluginTrustStorePath(configDir) });
+  ], enabled, { trustStorePath: pluginTrustStorePath(configDir), blockedFingerprints });
 }

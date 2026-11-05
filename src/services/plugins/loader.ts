@@ -9,6 +9,7 @@ import type { HooksConfig, HookEvent } from "../hooks/runner";
 import { HOOK_EVENTS } from "../hooks/runner";
 import { loadMcpConfig, type McpConfig } from "../mcp/config";
 import { computePluginTreeSha256, pluginTrustState, type PluginTrustState } from "./trust";
+import { isPluginActive, resolvePluginPolicy, type PluginPolicy } from "./policy";
 
 const BUILT_IN_PLUGIN_TOOLS = new Map<string, {
   toolName: string;
@@ -133,6 +134,7 @@ export type LoadedPlugin = {
   source: "user" | "project";
   explicitlyEnabled: boolean;
   active: boolean;
+  policy?: PluginPolicy;
   fingerprint?: string;
   trust: PluginTrustState | "not-required";
   skillsDir: string;
@@ -167,7 +169,7 @@ export type PluginLoadResult = {
 export async function loadPlugins(
   roots: Array<{ directory: string; source: LoadedPlugin["source"] }>,
   enabled: Record<string, boolean> = {},
-  options: { trustStorePath?: string; includeDisabled?: boolean } = {},
+  options: { trustStorePath?: string; includeDisabled?: boolean; blockedFingerprints?: readonly string[] } = {},
 ): Promise<PluginLoadResult> {
   const plugins = new Map<string, LoadedPlugin>();
   const errors: PluginLoadResult["errors"] = [];
@@ -196,17 +198,18 @@ export async function loadPlugins(
         const commandsDir = join(root, "commands");
         const hooksPath = manifest.hooks ? contributionPath(root, manifest.hooks, "hooks") : undefined;
         const mcpPath = manifest.mcpServers ? contributionPath(root, manifest.mcpServers, "mcpServers") : undefined;
-        const fingerprint = options.trustStorePath ? await computePluginTreeSha256(root) : undefined;
+        const fingerprint = options.trustStorePath || options.blockedFingerprints?.length ? await computePluginTreeSha256(root) : undefined;
         const trust = options.trustStorePath && fingerprint
           ? await pluginTrustState(options.trustStorePath, root, fingerprint)
           : "not-required";
-        const requestedActive = manifest.lifecycle.activation === "auto" || explicitlyEnabled;
+        const policy = resolvePluginPolicy({ ...manifest, fingerprint, trust }, { enabled, blockedFingerprints: options.blockedFingerprints });
         plugins.set(key, {
           ...manifest,
           root,
           source: source.source,
           explicitlyEnabled,
-          active: !disabled && requestedActive && (trust === "trusted" || trust === "not-required"),
+          active: policy.status === "ready",
+          policy,
           ...(fingerprint ? { fingerprint } : {}),
           trust,
           skillsDir,
@@ -619,7 +622,7 @@ function contributionValue(
 export async function loadPluginHooks(plugins: readonly LoadedPlugin[]): Promise<HooksConfig> {
   const merged: HooksConfig = {};
   for (const plugin of plugins) {
-    if (!plugin.active || !plugin.hooksPath) continue;
+    if (!isPluginActive(plugin) || !plugin.hooksPath) continue;
     let value: unknown;
     try {
       value = JSON.parse(await readFile(await assertPluginContributionPath(plugin, plugin.hooksPath), "utf8"));
@@ -641,14 +644,16 @@ export async function loadPluginHooks(plugins: readonly LoadedPlugin[]): Promise
 export async function loadPluginMcpConfig(
   plugins: readonly LoadedPlugin[],
   env: Record<string, string | undefined>,
+  onServer?: (name: string, plugin: LoadedPlugin) => void,
 ): Promise<McpConfig> {
   const mcpServers: McpConfig["mcpServers"] = {};
   for (const plugin of plugins) {
-    if (!plugin.active || !plugin.mcpPath) continue;
+    if (!isPluginActive(plugin) || !plugin.mcpPath) continue;
     const contribution = await loadMcpConfig(await assertPluginContributionPath(plugin, plugin.mcpPath), env);
     for (const [name, server] of Object.entries(contribution.mcpServers)) {
       if (mcpServers[name]) throw new Error(`Duplicate plugin MCP server ${name} contributed by ${plugin.name}`);
       mcpServers[name] = server;
+      onServer?.(name, plugin);
     }
   }
   return { mcpServers };

@@ -815,7 +815,7 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
       const plugins = await loadPlugins([
         { directory: join(configDir, "plugins"), source: "user" },
         { directory: join(options.cwd, ".tnb", "plugins"), source: "project" },
-      ], settings.enabledPlugins, { trustStorePath: pluginTrustStorePath(configDir) });
+      ], settings.enabledPlugins, { trustStorePath: pluginTrustStorePath(configDir), blockedFingerprints: settings.blockedPluginFingerprints });
       const skills = await loadSkills([
         { directory: join(configDir, "skills"), source: "user" },
         { directory: join(options.cwd, ".tnb", "skills"), source: "project" },
@@ -840,10 +840,11 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
         const result = await loadPluginMarketplace(sources);
         const query = (action === "search" ? options.argv[2] : undefined)?.toLowerCase();
         const runtimeCache = await loadPluginRuntimeCache(join(configDir, "plugins", ".runtime"));
+        const settings = await loadSettings({ configDir, cwd: options.cwd });
         const installed = await loadPlugins([
           { directory: join(configDir, "plugins"), source: "user" },
           { directory: join(options.cwd, ".tnb", "plugins"), source: "project" },
-        ], {}, { trustStorePath: pluginTrustStorePath(configDir) });
+        ], settings.enabledPlugins, { trustStorePath: pluginTrustStorePath(configDir), includeDisabled: true, blockedFingerprints: settings.blockedPluginFingerprints });
         const rows = query
           ? result.plugins.filter((plugin) =>
             `${plugin.name} ${plugin.description ?? ""} ${plugin.tags?.join(" ") ?? ""} ${plugin.capabilities?.join(" ") ?? ""}`.toLowerCase().includes(query)
@@ -875,7 +876,7 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
           const result = await loadPlugins([
             { directory: join(configDir, "plugins"), source: "user" },
             { directory: join(options.cwd, ".tnb", "plugins"), source: "project" },
-          ], settings.enabledPlugins, { trustStorePath: pluginTrustStorePath(configDir) });
+          ], settings.enabledPlugins, { trustStorePath: pluginTrustStorePath(configDir), includeDisabled: true, blockedFingerprints: settings.blockedPluginFingerprints });
           const plugin = result.plugins.find(({ name }) => name.toLowerCase() === sourceOrName.toLowerCase());
           if (!plugin) throw new Error(`Plugin not found: ${sourceOrName}`);
           if (action === "trust") {
@@ -947,7 +948,7 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
         const result = await loadPlugins([
           { directory: join(configDir, "plugins"), source: "user" },
           { directory: join(options.cwd, ".tnb", "plugins"), source: "project" },
-        ], settings.enabledPlugins, { trustStorePath: pluginTrustStorePath(configDir) });
+        ], settings.enabledPlugins, { trustStorePath: pluginTrustStorePath(configDir), includeDisabled: true, blockedFingerprints: settings.blockedPluginFingerprints });
         const plugin = result.plugins.find(({ name }) => name.toLowerCase() === requested.toLowerCase());
         if (!plugin) throw new Error(`Plugin not found: ${requested}`);
         const configured = settings.enabledPlugins?.[plugin.name] ?? settings.enabledPlugins?.[plugin.name.toLowerCase()];
@@ -964,6 +965,7 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
           enabled: configured !== false,
           explicitlyEnabled: plugin.explicitlyEnabled,
           active: plugin.active,
+          policy: plugin.policy,
           trust: plugin.trust,
           fingerprint: plugin.fingerprint ?? null,
           lifecycle: plugin.lifecycle,
@@ -988,7 +990,7 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
       const result = await loadPlugins([
         { directory: join(configDir, "plugins"), source: "user" },
         { directory: join(options.cwd, ".tnb", "plugins"), source: "project" },
-      ], settings.enabledPlugins, { trustStorePath: pluginTrustStorePath(configDir) });
+      ], settings.enabledPlugins, { trustStorePath: pluginTrustStorePath(configDir), includeDisabled: true, blockedFingerprints: settings.blockedPluginFingerprints });
       const runtimeCache = await loadPluginRuntimeCache(join(configDir, "plugins", ".runtime"));
       const rows = result.plugins.map((plugin) => ({
         name: plugin.name,
@@ -1001,6 +1003,7 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
         reload: plugin.lifecycle.reload,
         runtimeStatus: runtimeCache.get(plugin.name.toLowerCase())?.latest.status ?? null,
         trust: plugin.trust,
+        policy: plugin.policy,
         manifestPath: plugin.manifestPath ?? null,
         description: plugin.description ?? plugin.root,
       }));

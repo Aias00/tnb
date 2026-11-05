@@ -6,12 +6,14 @@ import { loadPlugins, assertPluginContributionPath, type LoadedPlugin } from "..
 import { computePluginTreeSha256, pluginGenerationTrusted, pluginTrustState } from "../services/plugins/trust";
 import { ExtensionHost } from "./extension-host";
 import type { ExtensionDeclaration, ExtensionRegistration, PluginApplication, PluginInterface, PluginChannel, ExtensionState } from "./extensions";
-import { bindDomainAdapter, DomainRegistry, type AgentDomainAdapter, type AdapterPluginIdentity, type PluginAdapterRegistration } from "./domain";
+import { bindDomainAdapter, DomainRegistry, type AgentDomainAdapter, type AdapterPluginIdentity, type DomainContext, type PluginAdapterRegistration } from "./domain";
+import type { AgentTool } from "../core/tool";
 import { collectPluginGenerations, pluginGenerationKey, readRetainedPlugin, retainPluginGeneration, type PluginGenerationReference } from "./plugin-generations";
 import { unpackPlugin, type PackedPlugin } from "./packed-plugin";
 import type { BuiltinGenerationAuthority } from "./builtin-generations";
 import type { ChannelGenerationReference } from "./channel-bindings";
 import { digestJson } from "../services/runtime/json";
+import { isPluginFingerprintBlocked } from "../services/plugins/policy";
 
 /** Trusted in-process code. This API does not confer sandbox isolation. */
 export type AdapterPluginAPI = {
@@ -45,6 +47,8 @@ export type AgentPluginOptions = {
   builtinChannelAuthority?: BuiltinGenerationAuthority;
   channelReferences?: readonly ChannelGenerationReference[];
   blockedFingerprints?: readonly string[];
+  /** Current host policy, applied outside the loaded implementation, including historical packages. */
+  workerGuard?(context: DomainContext, generation: { plugin: AdapterPluginIdentity; recoveryOnly: boolean }): Promise<() => Promise<void>>;
 };
 export type AdapterPluginState = {
   name: string;
@@ -65,7 +69,7 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
   if (!options.trustStorePath?.trim()) throw new Error("Adapter plugins require a trust store");
   // The host supplies a private directory only after acquiring its owner lock.
   if (snapshotRoot) { await rm(snapshotRoot, { recursive: true, force: true }); await mkdir(snapshotRoot, { recursive: true, mode: 0o700 }); }
-  const discovered = await loadPlugins(options.roots, options.enabled, { trustStorePath: options.trustStorePath, includeDisabled: true });
+  const discovered = await loadPlugins(options.roots, options.enabled, { trustStorePath: options.trustStorePath, includeDisabled: true, blockedFingerprints: options.blockedFingerprints });
   const states: AdapterPluginState[] = discovered.errors.map(error => ({ name: error.path, root: error.path, enabled: false, trust: "untrusted", status: "failed", error: error.error }));
   const registrations: PluginAdapterRegistration[] = [];
   const extensionRegistrations: ExtensionRegistration[] = [];
@@ -76,7 +80,7 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
   const historyRoot = stateDirectory ? join(stateDirectory, "plugin-generations") : undefined;
   const references = [...(options.generationReferences ?? []), ...(options.channelReferences ?? [])];
   const referenceCount = (identity: AdapterPluginIdentity) => references.filter(ref => pluginGenerationKey(ref.plugin) === pluginGenerationKey(identity)).length;
-  const blocked = (fingerprint: string) => options.blockedFingerprints?.includes(fingerprint) === true;
+  const blocked = (fingerprint: string) => isPluginFingerprintBlocked(fingerprint, options.blockedFingerprints);
   type Candidate = { plugin: LoadedPlugin; recoveryOnly?: boolean; origin?: string; builtin?: boolean; state?: AdapterPluginState; sourceSnapshot?: string; configuration?: unknown };
   const candidates: Candidate[] = [];
   for (const builtin of options.builtins ?? []) {
@@ -112,6 +116,7 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
     try {
       const declarations: EntryDeclaration[] = [...(builtin.adapters ?? []).map(adapter => ({ ...adapter, kind: "adapter" as const })), ...("extensions" in builtin ? builtin.extensions ?? [] : [])];
       const staged = await initializeEntry(builtin.setup, declarations, identity, callbacks, stateDirectory, options.configuration?.[identity.name] ?? builtin.configuration);
+      staged.adapters = staged.adapters.map(row => ({ ...row, adapter: guardAdapter(row.adapter, identity, false, options.workerGuard) }));
       new DomainRegistry(inline, [...registrations, ...staged.adapters]);
       new ExtensionHost([...extensionRegistrations, ...staged.extensions], registrations, stateDirectory);
       registrations.push(...staged.adapters); extensionRegistrations.push(...staged.extensions); state.status = "active";
@@ -203,7 +208,8 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
         const loaded: { default?: unknown } = await import(pathToFileURL(path).href);
         if (typeof loaded.default !== "function") throw new Error("Adapter module must export a default factory");
         const entryResult = await initializeEntry(loaded.default as HostPluginFactory, expected, identity, callbacks, stateDirectory, options.configuration?.[plugin.name] ?? configuration);
-        staged.push(...entryResult.adapters.filter(row => !recoveryOnly || requested({ kind: "adapter", id: row.adapter.id, version: row.adapter.version })).map(registration => ({ ...registration, ...(recoveryOnly ? { recoveryOnly: true } : {}) })));
+        staged.push(...entryResult.adapters.filter(row => !recoveryOnly || requested({ kind: "adapter", id: row.adapter.id, version: row.adapter.version })).map(registration => ({ ...registration,
+          adapter: guardAdapter(registration.adapter, identity, recoveryOnly === true, options.workerGuard), ...(recoveryOnly ? { recoveryOnly: true } : {}) })));
         stagedExtensions.push(...entryResult.extensions.filter(row => !recoveryOnly || row.declaration.kind === "channel" && requested(row.declaration)).map(row => ({ ...row, ...(recoveryOnly ? { recoveryOnly: true } : {}) })));
       }
       if (await computePluginTreeSha256(target) !== fingerprint
@@ -259,6 +265,20 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
 export type HostPluginOptions = AgentPluginOptions;
 export type HostPluginState = AdapterPluginState;
 export const loadAdapterPlugins = loadHostPlugins;
+function guardAdapter(adapter: AgentDomainAdapter, plugin: AdapterPluginIdentity, recoveryOnly: boolean, guard: AgentPluginOptions["workerGuard"]): AgentDomainAdapter {
+  if (!guard) return adapter;
+  return bindDomainAdapter({ ...adapter, async createWorker(context) {
+    const check = await guard(context, { plugin, recoveryOnly }); await check();
+    const worker = await adapter.createWorker(context);
+    try {
+      await check();
+      const protect = (tool: AgentTool): AgentTool => ({ ...tool,
+        ...(tool.bindExecution ? { bindExecution: identity => protect(tool.bindExecution!(identity)) } : {}),
+        async execute(input, signal, progress, identity) { await check(); signal.throwIfAborted(); return tool.execute(input, signal, progress, identity); } });
+      return { ...worker, tools: worker.tools.map(protect), async authorize(tool, input, identity) { await check(); return worker.authorize(tool, input, identity); } };
+    } catch (error) { await worker.close?.(); throw error; }
+  } });
+}
 type EntryDeclaration = { kind: "adapter"; id: string; version: string } | ExtensionDeclaration;
 async function initializeEntry(factory: HostPluginFactory, expected: EntryDeclaration[], identity: Readonly<AdapterPluginIdentity>,
   callbacks: Array<() => void | Promise<void>>, stateDirectory?: string, configuration?: unknown): Promise<{ adapters: PluginAdapterRegistration[]; extensions: ExtensionRegistration[] }> {

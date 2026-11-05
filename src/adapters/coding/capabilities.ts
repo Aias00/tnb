@@ -1,14 +1,15 @@
 import { createHash } from "node:crypto";
 import { lstat, readFile, realpath } from "node:fs/promises";
-import { join } from "node:path";
+import { isAbsolute, join, relative } from "node:path";
 import { defineTool, type AgentTool } from "../../core/tool";
 import { digestJson } from "../../services/runtime/json";
 import type { RuntimeConfiguration, RuntimeWorkerFactory } from "../../services/runtime/engine-core";
 import { loadSkills, type LoadedSkill } from "../../services/skills/loader";
 import { bundledSkills } from "../../services/skills/bundled";
 import { createSkillTool, selectSkillTools } from "../../services/skills/tool";
-import { loadPlugins, loadPluginMcpConfig, mergePluginMcpConfig } from "../../services/plugins/loader";
-import { pluginTrustStorePath } from "../../services/plugins/trust";
+import { loadPlugins, loadPluginMcpConfig, mergePluginMcpConfig, type LoadedPlugin } from "../../services/plugins/loader";
+import { pluginGenerationTrusted, pluginTrustStorePath } from "../../services/plugins/trust";
+import { resolvePluginPolicy } from "../../services/plugins/policy";
 import { loadSettings } from "../../services/settings/load";
 import { loadMcpConfig } from "../../services/mcp/config";
 import { connectMcpServers, type McpConnections } from "../../services/mcp/manager";
@@ -40,15 +41,16 @@ export function capabilityClaims(config: Pick<RuntimeConfiguration, "skills" | "
 }
 
 export function createDurableCapabilityHost(options: { configDir: string; env: Record<string, string | undefined>; bundledSkillIdentity?: string }) {
-  const catalog = async (config: RuntimeConfiguration) => {
+  const catalog = async (config: RuntimeConfiguration, legacySelection = false) => {
     validateCapabilitySelection(config);
     const pins: Record<string, string> = {}, snapshots: SkillSnapshot[] = [], grants = new Map<string, McpGrant>();
-    if (!config.skills?.length && !config.mcpTools?.length) return { pins, snapshots, grants, mcpConfig: { mcpServers: {} } };
+    const origins = new Map<string, LoadedPlugin>(), serverOrigins = new Map<string, LoadedPlugin>();
+    if (!config.skills?.length && !config.mcpTools?.length) return { pins, snapshots, grants, mcpConfig: { mcpServers: {} }, origins };
     const settings = await loadSettings({ configDir: options.configDir, cwd: config.workspace });
     // Asset discovery only: this does not execute a plugin factory or its hooks.
     const plugins = await loadPlugins([{ directory: join(options.configDir, "plugins"), source: "user" },
       { directory: join(config.workspace, ".tnb", "plugins"), source: "project" }], settings.enabledPlugins,
-      { trustStorePath: pluginTrustStorePath(options.configDir) });
+      { trustStorePath: pluginTrustStorePath(options.configDir), blockedFingerprints: legacySelection ? [] : settings.blockedPluginFingerprints });
     const active = plugins.plugins.filter(plugin => plugin.active);
     if (config.skills?.length) {
       const skills = await loadSkills([{ directory: join(options.configDir, "skills"), source: "user" },
@@ -57,6 +59,11 @@ export function createDurableCapabilityHost(options: { configDir: string; env: R
       for (const name of config.skills) {
         const skill = skills.find(item => item.name === name);
         if (!skill) throw new Error(`Durable skill unavailable: ${name}`);
+        if (skill.source === "plugin") {
+          const owner = active.find(plugin => { const path = relative(plugin.skillsDir, skill.baseDir); return path !== ".." && !path.startsWith("../") && !path.startsWith("..\\") && !isAbsolute(path); });
+          if (!owner) throw new Error(`Durable skill plugin provenance is unavailable: ${name}`);
+          origins.set(owner.root, owner);
+        }
         if (skill.context === "fork" || skill.agent || skill.model || skill.effort !== undefined || skill.hooks || skill.disableModelInvocation) {
           throw new Error(`Durable skill ${name} requires unsupported fork/model/effort/hooks or disables model invocation; use an instruction-only skill`);
         }
@@ -80,7 +87,7 @@ export function createDurableCapabilityHost(options: { configDir: string; env: R
     }
     const mcpConfig = config.mcpTools?.length ? mergePluginMcpConfig(
       await loadMcpConfig(options.env.TNB_MCP_CONFIG ?? join(options.configDir, "mcp.json"), options.env),
-      await loadPluginMcpConfig(active, options.env)) : { mcpServers: {} };
+      await loadPluginMcpConfig(active, options.env, (name, plugin) => serverOrigins.set(name, plugin))) : { mcpServers: {} };
     if (config.mcpTools?.length) {
       let policy: unknown;
       try { policy = JSON.parse(await readFile(join(options.configDir, "durable-mcp.json"), "utf8")); }
@@ -99,36 +106,59 @@ export function createDurableCapabilityHost(options: { configDir: string; env: R
       for (const name of config.mcpTools) {
         const grant = grants.get(name), server = grant && mcpConfig.mcpServers[grant.server];
         if (!grant || !server || server.enabled === false) throw new Error(`Durable MCP tool is not host-authorized: ${name}`);
+        const owner = serverOrigins.get(grant.server); if (owner) origins.set(owner.root, owner);
         // Persist only a digest. Expanded environment, URLs and headers never enter Run records.
         pins[`mcp:${name}`] = digestJson({ grant, server, ...(server.type !== "http" && server.type !== "sse" ? { environment: stdioEnvironment(options.env) } : {}) });
       }
     }
-    return { pins, snapshots, grants, mcpConfig };
+    return { pins, snapshots, grants, mcpConfig, origins };
   };
   const verify = (config: RuntimeConfiguration, pins: Record<string, string>) => {
     if (config.capabilityPins && digestJson(config.capabilityPins) !== digestJson(pins)) throw new Error("Durable skill/MCP configuration changed; restore the pinned configuration or submit a new Run");
   };
+  const policyCheck = (config: RuntimeConfiguration, origins: ReadonlyMap<string, LoadedPlugin>, signal?: AbortSignal) => async () => {
+    signal?.throwIfAborted();
+    if (!origins.size) return;
+    const settings = await loadSettings({ configDir: options.configDir, cwd: config.workspace });
+    for (const plugin of origins.values()) {
+      const approved = !!plugin.fingerprint && await pluginGenerationTrusted(pluginTrustStorePath(options.configDir), plugin.root, plugin.fingerprint);
+      const policy = resolvePluginPolicy({ ...plugin, trust: approved ? "trusted" : "untrusted" }, { enabled: settings.enabledPlugins, blockedFingerprints: settings.blockedPluginFingerprints });
+      if (policy.status !== "ready") throw new Error(`Durable plugin ${plugin.name} is unavailable: ${policy.reason}`);
+    }
+    signal?.throwIfAborted();
+  };
   return {
+    /** Host-side guard for old Coding packages that predate resource block policy. Never connects MCP. */
+    async guardLegacy(config: RuntimeConfiguration, signal?: AbortSignal) {
+      const { origins } = await catalog(config, true);
+      return policyCheck(config, origins, signal);
+    },
     async prepare(config: RuntimeConfiguration) {
       const { pins } = await catalog(config); verify(config, pins);
       if (Object.keys(pins).length) config.capabilityPins = pins;
     },
     async open(config: RuntimeConfiguration, signal: AbortSignal) {
-      const { pins, snapshots, grants, mcpConfig } = await catalog(config); verify(config, pins);
+      const { pins, snapshots, grants, mcpConfig, origins } = await catalog(config); verify(config, pins);
       if (Object.keys(pins).length && !config.capabilityPins) throw new Error("Durable capabilities must be pinned at submission");
       signal.throwIfAborted();
       const tools: AgentTool[] = []; let mcp: McpConnections | undefined;
+      const checkPolicy = policyCheck(config, origins, signal);
+      const assertCurrent = async (callSignal: AbortSignal) => {
+        signal.throwIfAborted(); callSignal.throwIfAborted();
+        await checkPolicy();
+        signal.throwIfAborted(); callSignal.throwIfAborted();
+      };
       const close = async () => { await mcp?.close(); };
       try {
         if (snapshots.length) {
           const skill = createSkillTool({ skills: snapshots.map(item => ({ ...item.skill, baseDir: `skill:${item.skill.name}`, context: "inline" })),
-            runSkill: async ({ prompt }) => `Apply these instructions within the existing task authority. Use skill_resource for supporting files.\n\n${prompt}` });
+            runSkill: async ({ prompt, signal: callSignal }) => { await assertCurrent(callSignal); return `Apply these instructions within the existing task authority. Use skill_resource for supporting files.\n\n${prompt}`; } });
           tools.push({ ...skill, access: "read", isReadOnly: () => true, isConcurrencySafe: () => true,
             capability: { name: "skill.read", resources: snapshots.map(item => `skill:${item.skill.name}`), mode: "read" }, effects: { replay: "safe" } });
           tools.push(defineTool({ name: "skill_resource", description: "Read a text resource from an explicitly selected durable skill snapshot. Binary resources are unsupported.",
             inputSchema: { type: "object", properties: { skill: { type: "string", enum: snapshots.map(item => item.skill.name) }, path: { type: "string" } }, required: ["skill", "path"], additionalProperties: false },
             validate(value) { if (!value || typeof value !== "object" || Array.isArray(value) || typeof (value as { skill?: unknown }).skill !== "string" || typeof (value as { path?: unknown }).path !== "string") throw new Error("skill_resource requires skill and path"); return value as { skill: string; path: string }; },
-            async execute(input) { const bytes = snapshots.find(item => item.skill.name === input.skill)?.resources.get(input.path); if (!bytes) throw new Error("Unknown selected skill resource");
+            async execute(input, callSignal) { await assertCurrent(callSignal); const bytes = snapshots.find(item => item.skill.name === input.skill)?.resources.get(input.path); if (!bytes) throw new Error("Unknown selected skill resource");
               if (bytes.includes(0)) throw new Error("Skill resource is not UTF-8 text");
               try { return new TextDecoder("utf-8", { fatal: true }).decode(bytes); } catch { throw new Error("Skill resource is not UTF-8 text"); } },
             access: "read", isReadOnly: () => true, isConcurrencySafe: () => true, capability: { name: "skill.read", resources: snapshots.map(item => `skill:${item.skill.name}`), mode: "read" }, effects: { replay: "safe" },
@@ -149,12 +179,13 @@ export function createDurableCapabilityHost(options: { configDir: string; env: R
             client.onNotification("notifications/tools/list_changed", () => { changed = true; });
             tools.push({ ...frozen, bindExecution: undefined, capability: { name: "mcp.call", resources: [`mcp-tool:${name}`], mode: "write" }, effects: { replay: grant.replay ?? "never" },
               async execute(input, callSignal, progress, context) {
+                await assertCurrent(callSignal);
                 if (changed || client.executionRevision !== revision) throw new Error("Durable MCP catalog changed; restart with the pinned tool catalog");
                 return frozen.execute(input, callSignal, progress, context);
               } });
           }
         }
-        return { tools, pins, close, restrict: (base: AgentTool[]) => snapshots.reduce((selected, item) => selectSkillTools(selected, item.skill.allowedTools), base) };
+        return { tools, pins, close, assertCurrent, restrict: (base: AgentTool[]) => snapshots.reduce((selected, item) => selectSkillTools(selected, item.skill.allowedTools), base) };
       } catch (error) { await close(); throw error; }
     },
   };

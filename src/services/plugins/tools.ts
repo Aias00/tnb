@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { assertPluginActive, isPluginActive } from "./policy";
 
 import { defineTool, type AgentTool } from "../../core/tool";
 import {
@@ -22,11 +23,16 @@ type StdioRuntime = {
 
 export class PluginToolRuntimeManager {
   private readonly processes = new Map<string, StdioRuntime>();
+  private readonly retired = new Set<string>();
+  private closed = false;
 
   constructor(private readonly env: Record<string, string | undefined>) {}
 
   async startEager(plugins: readonly LoadedPlugin[]): Promise<void> {
+    if (this.closed) throw new Error("Plugin tool runtime is closed");
     for (const plugin of plugins) {
+      if (!isPluginActive(plugin)) continue;
+      this.retired.delete(this.generation(plugin));
       for (const contribution of plugin.toolContributions) {
         if (
           contribution.type === "external" && contribution.lifecycle.transport === "stdio" &&
@@ -42,6 +48,9 @@ export class PluginToolRuntimeManager {
     input: Record<string, unknown>,
     signal: AbortSignal,
   ): Promise<string> {
+    assertPluginActive(plugin);
+    if (this.closed || this.retired.has(this.generation(plugin))) throw new Error(`Plugin ${plugin.name} tool generation is stopped`);
+    signal.throwIfAborted();
     if (contribution.lifecycle.transport === "oneshot") {
       return runOneShotTool(plugin, contribution, input, this.env, signal);
     }
@@ -53,6 +62,9 @@ export class PluginToolRuntimeManager {
     }
     signal.throwIfAborted();
     const runtime = await this.ensureStdio(plugin, contribution);
+    assertPluginActive(plugin);
+    if (this.closed || this.retired.has(this.generation(plugin)) || this.processes.get(`${plugin.root}\0${contribution.id}`) !== runtime) throw new Error(`Plugin ${plugin.name} tool generation is stopped`);
+    signal.throwIfAborted();
     const id = `${process.pid}-${runtime.nextId++}`;
     return await new Promise<string>((resolve, reject) => {
       const abort = () => {
@@ -81,16 +93,20 @@ export class PluginToolRuntimeManager {
   }
 
   async close(): Promise<void> {
+    this.closed = true;
     const runtimes = [...this.processes.values()];
     this.processes.clear();
     await Promise.all(runtimes.map((runtime) => stopRuntime(runtime)));
   }
 
   async stopPlugin(plugin: LoadedPlugin): Promise<void> {
+    this.retired.add(this.generation(plugin));
     const entries = [...this.processes.entries()].filter(([key]) => key.startsWith(`${plugin.root}\0`));
     for (const [key] of entries) this.processes.delete(key);
     await Promise.all(entries.map(([, runtime]) => stopRuntime(runtime)));
   }
+
+  private generation(plugin: LoadedPlugin): string { return JSON.stringify([plugin.root, plugin.fingerprint ?? null]); }
 
   private async ensureStdio(
     plugin: LoadedPlugin,
@@ -110,7 +126,7 @@ export class PluginToolRuntimeManager {
     this.processes.set(key, runtime);
     void consumeLines(child.stdout, (line) => this.handleLine(plugin, contribution, runtime, line));
     void child.exited.then(async (exitCode) => {
-      this.processes.delete(key);
+      if (this.processes.get(key) === runtime) this.processes.delete(key);
       const stderr = await new Response(child.stderr).text();
       const error = new Error(
         `Plugin ${plugin.name} tool runtime ${contribution.id} exited with code ${exitCode}${stderr.trim() ? `: ${truncate(stderr.trim())}` : ""}`,
@@ -189,6 +205,7 @@ export async function createExternalPluginTools(
   const tools: AgentTool[] = [];
   const names = new Set<string>();
   for (const plugin of plugins) {
+    if (!isPluginActive(plugin)) continue;
     for (const contribution of plugin.toolContributions) {
       if (contribution.type !== "external") continue;
       const name = externalToolName(plugin.name, contribution.id);
