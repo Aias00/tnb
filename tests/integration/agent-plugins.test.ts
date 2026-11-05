@@ -21,7 +21,7 @@ const cleanup: Array<() => Promise<unknown>> = [];
 const ownerTest = test.skipIf(process.platform === "win32");
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
 async function fixture(settings: Record<string, unknown> = {}) {
-  const root = await mkdtemp(join(tmpdir(), "tnb-plugin-agent-")); cleanup.push(() => rm(root, { recursive: true, force: true }));
+  const root = await mkdtemp(join(tmpdir(), "tnb-plugin-agent-")); cleanup.push(() => rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   const plugins = join(root, "plugins"), source = join(root, "source"), trace = join(root, "trace"), trust = join(root, "trust.json");
   await mkdir(source); await mkdir(plugins);
   const manifest = { name: "fixture-plugin", version: "1.0.0", manifestVersion: 2, apiVersion: "tnb.plugin/v1",
