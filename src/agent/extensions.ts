@@ -42,5 +42,5 @@ export type PluginChannel = { id: string; version: string; connect(configuration
 export type ChannelDescriptor = { id: string; version: string; plugin?: AdapterPluginIdentity };
 export type ChannelConnection = { descriptor: ChannelDescriptor; port: ChannelPort; close(): Promise<void> };
 export type ChannelRegistry = { descriptor(input: ChannelDescriptor): ChannelDescriptor; connect(input: ChannelDescriptor, configuration: JsonValue): Promise<ChannelConnection> };
-export type ExtensionRegistration = { declaration: ExtensionDeclaration; plugin: AdapterPluginIdentity; definition: PluginApplication | PluginChannel };
+export type ExtensionRegistration = { declaration: ExtensionDeclaration; plugin: AdapterPluginIdentity; definition: PluginApplication | PluginChannel; recoveryOnly?: boolean };
 export type ExtensionHostOptions = { signal?: AbortSignal; store: RuntimeStore; services?: ReadonlyMap<string, unknown>; grants?: Record<string, string[]> };

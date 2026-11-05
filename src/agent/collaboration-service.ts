@@ -3,6 +3,7 @@ import type { DurableRun } from "../services/runtime/types";
 import type { WaitView } from "../services/runtime/waits";
 import type { ApplicationRecord, ApplicationQuery } from "../services/runtime/store";
 import type { CollaborationConfig, IncomingEvent, Source } from "../services/collaboration/types";
+import type { ChannelDescriptor } from "./extensions";
 
 export const COLLABORATION_SERVICE = "tnb.collaboration/v1";
 export type CollaborationStateTransaction = {
@@ -20,6 +21,7 @@ export type CollaborationServiceFactory = { open(signal: AbortSignal): Collabora
 export type CollaborationService = {
   close(): void;
   configuration(): CollaborationConfig;
+  channel(sourceId: string): ChannelDescriptor;
   readonly state: CollaborationState;
   readonly tasks: {
     admit(sourceId: string, incoming: IncomingEvent): Promise<{ configuration?: RuntimeConfiguration; mode?: Source["mode"] }>;

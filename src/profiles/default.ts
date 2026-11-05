@@ -14,7 +14,8 @@ import { createCollaborationService } from "../services/collaboration/runtime-se
 import { createTaskService } from "../services/workbench/tasks";
 import { pluginGenerationReferences } from "../agent/plugin-generations";
 import { RuntimeStore } from "../services/runtime/store";
-import { builtinGenerationAuthority } from "../agent/builtin-generations";
+import { builtinGenerationAuthority, builtinChannelGenerationAuthority } from "../agent/builtin-generations";
+import { migrateCollaborationChannels, collaborationChannelReferences } from "../services/collaboration/channels";
 
 /** Product composition only; the generic plugin host knows neither Coding nor collaboration. */
 export async function loadDefaultProfile(options: { configDir: string; root: string; env: Record<string, string | undefined>; coding: boolean; runtime?: DurableRuntime }) {
@@ -22,15 +23,17 @@ export async function loadDefaultProfile(options: { configDir: string; root: str
   const configuration = { "tnb-coding": { configDir, env }, "tnb-channels": { env } };
   const builtins = [ ...(options.coding ? [await createCodingPlugin({ configDir, runtimeRoot: root, env })] : []), await createChannelsPlugin(env), await createCollaborationPlugin(), await createWebPlugin() ];
   // Caller holds the owner lock; collect references before importing any plugin code.
+  const config = await loadCollaborationConfig(configDir);
   const referenceStore = options.runtime?.store ?? new RuntimeStore(join(root, "state.sqlite"));
   let plugins;
   try {
+    migrateCollaborationChannels(referenceStore);
     plugins = await loadHostPlugins({ roots: [{ directory: join(configDir, "plugins"), source: "user" }],
       trustStorePath: pluginTrustStorePath(configDir), enabled: settings.enabledPlugins, builtins, configuration, generationReferences: pluginGenerationReferences(referenceStore),
-      builtinAuthority: builtinGenerationAuthority(referenceStore), blockedFingerprints: settings.blockedPluginFingerprints }, [], join(root, "plugin-snapshots"));
+      builtinAuthority: builtinGenerationAuthority(referenceStore), builtinChannelAuthority: builtinChannelGenerationAuthority(referenceStore), channelReferences: collaborationChannelReferences(referenceStore, config),
+      blockedFingerprints: settings.blockedPluginFingerprints }, [], join(root, "plugin-snapshots"));
   } finally { if (!options.runtime) referenceStore.close(); }
   return { plugins, async start(runtime: DurableRuntime, signal?: AbortSignal) {
-    const config = await loadCollaborationConfig(configDir);
     await plugins.extensions.start({ store: runtime.store, signal, services: new Map<string, unknown>([
       [COLLABORATION_SERVICE, createCollaborationService(runtime, config, plugins.extensions.channels, signal)], [CHANNEL_SERVICE, plugins.extensions.channels],
       [TASK_SERVICE, createTaskService({ runtime, configDir, env, coding: runtime.domains.has("coding", "1") })],

@@ -9,6 +9,7 @@
 `context.service(COLLABORATION_SERVICE).open(context.signal)` 打开一个应用生命周期内的服务，包含：
 
 - `configuration()`：返回宿主 Source 配置副本，不能通过修改副本更改宿主 actor、工作目录、模型、预算或权限。
+- `channel(sourceId)`：返回该来源由宿主固定的渠道 descriptor，旧来源恢复原代码，新来源默认选择当前渠道；改变传输身份或显式改绑会被拒绝。
 - `state`：只访问六个旧协作命名空间，支持事务与版本校验。看不到其他插件、宿主准入/归属凭据或 Runtime 的配置/账本/执行状态；不能写入 run.* 或 wait.answer 等核心命令回执。
 - `tasks.admit(sourceId, incoming)`：使用宿主 Source 冻结原始请求和准入合同；应用不能提交自己构造的替代执行配置。
 - `tasks.create(eventId)` / `tasks.apply(eventId, ticketId)`：从已有准入事实产生或控制任务，沿用原事件命令 ID、actor/controller 与 Source/thread 校验。
@@ -31,4 +32,4 @@
 
 SDK 宿主可以使用 `createCollaborationService` 的同等宿主实现提供此合同；泛用业务仍优先使用受限 TaskService 与插件状态合同，不应把本协作专用服务复制为另一个全局 Runtime 入口。
 
-这些是宿主 API 边界。插件仍是受信任的进程内代码；明确授予渠道注册表后，它具有相应渠道能力，并不获得 OS 沙箱隔离。本轮不自动迁移领域/渠道可执行代码的代际，也未把现有终端 TUI 整体插件化。
+这些是宿主 API 边界。插件仍是受信任的进程内代码；明确授予渠道注册表后，它具有相应渠道能力，并不获得 OS 沙箱隔离。后续领域与渠道已增加原字节留存及精确恢复，见 [渠道来源恢复](channel-generations.md)；这不等于自动迁移任意旧代码或 ABI，也未把现有终端 TUI 整体插件化。

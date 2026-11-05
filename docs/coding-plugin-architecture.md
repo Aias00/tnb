@@ -75,4 +75,4 @@ Coding 使用原同用户工作区协调器，保留父子路径互斥、前后�
 - [`registrations.rs`](https://github.com/arcships/dim/blob/64f877286f2b5b078d5697cda7bd0c392030388f/crates/dim-agent-runtime/src/registrations.rs)：贡献归 owner 并随其退出撤销；TNB 沿现有初始化事务与 disposer，固定一代任务代码。
 - [`assembly.rs`](https://github.com/arcships/dim/blob/64f877286f2b5b078d5697cda7bd0c392030388f/crates/dim-agent-runtime/src/assembly.rs)：Agent/Session/Branch Loader 分组。TNB 没有照搬多级插件实例树，也没有把持久回执改成 Timeline。
 
-当前没有多 generation 热升级、历史包自动保留、跨平台进行中任务迁移、不受信插件隔离、分布式 owner 或数小时 soak 承诺。
+后续已补齐按引用保留领域/渠道代码和精确历史恢复，详见 [默认 Coding 代际](guides/builtin-generations.md) 与 [渠道代际](guides/channel-generations.md)。仍没有热升级、跨平台进行中任务迁移、不受信插件隔离、分布式 owner 或数小时 soak 承诺。

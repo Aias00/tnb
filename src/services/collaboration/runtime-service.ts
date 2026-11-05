@@ -8,6 +8,7 @@ import { digestJson, integer, text } from "../runtime/json";
 import { sourceIdentity } from "./config";
 import { NS, eventId, ticketId as expectedTicketId, parseAction } from "./protocol";
 import type { Action, CollaborationConfig, IncomingEvent, IntakeEvent, Source, Ticket } from "./types";
+import { migrateCollaborationChannels, resolveCollaborationChannel } from "./channels";
 
 type Admission = { sourceId: string; incoming: IncomingEvent; digest: string; identity: string; action: Action; configuration?: RuntimeConfiguration; mode?: Source["mode"] };
 type Ownership = { eventId: string; sourceId: string; identity: string; actor: string; thread: string };
@@ -25,12 +26,13 @@ function creation(id: string, admission: Admission) {
 /** The only host-owned bridge: no Runtime/Store/transaction object crosses the plugin boundary. */
 export function createCollaborationService(runtime: DurableRuntime, configuration: CollaborationConfig, channels?: ChannelRegistry, ownerSignal?: AbortSignal): CollaborationServiceFactory {
   const store = runtime.store;
+  migrateCollaborationChannels(store);
   const hostLive = () => ownerSignal?.throwIfAborted();
   const currentSource = (id: string): Source => {
     const source = configuration.enabled && configuration.sources.find(item => item.id === id);
     if (!source) throw new Error("Collaboration Source is not enabled");
     const value = structuredClone(source);
-    if (value.type === "plugin" && channels) value.channel = channels.descriptor(value.channel!);
+    if (value.type === "plugin" && channels) value.channel = resolveCollaborationChannel(store, configuration, channels, id);
     return value;
   };
   const saveOwner = (runId: string, id: string, admission: Admission) => {
@@ -215,6 +217,7 @@ export function createCollaborationService(runtime: DurableRuntime, configuratio
         return summaries;
       },
     });
-    return Object.freeze({ configuration: () => { taskLive(); return { ...structuredClone(configuration), sources: configuration.enabled ? configuration.sources.map(source => currentSource(source.id)) : structuredClone(configuration.sources) }; }, state, tasks, close: () => { closed = true; } });
+    return Object.freeze({ configuration: () => { taskLive(); return structuredClone(configuration); },
+      channel: (sourceId: string) => { taskLive(); if (!channels) throw new Error("Channel registry is unavailable"); return resolveCollaborationChannel(store, configuration, channels, sourceId); }, state, tasks, close: () => { closed = true; } });
   } };
 }

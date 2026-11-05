@@ -1,9 +1,13 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseCollaborationConfig, loadCollaborationConfig, sourceIdentity } from "../../src/services/collaboration/config";
 import { authenticate, GitHubSource, notificationBody, signature, TimerSource, WebhookSource } from "../../src/services/collaboration/sources";
+import { channelsRecoveryPackage } from "../../src/plugins/channels/recovery-package";
+import { unpackPlugin } from "../../src/agent/packed-plugin";
+import { installLocalPlugin } from "../../src/services/plugins/management";
+import { pluginTrustStorePath, trustPlugin } from "../../src/services/plugins/trust";
 import { createCollaborationService } from "../../src/services/collaboration/runtime-service";
 import { CollaborationHost } from "../../src/services/collaboration/host";
 import { NS } from "../../src/services/collaboration/engine";
@@ -150,3 +154,62 @@ test("an independently installed collaboration application runs with the scoped 
   expect((await runtimeRequest(configDir, "/plugins") as Array<{ name: string; root: string }>).find(item => item.name === "tnb-collaboration")?.root).toBe(installed.root);
   expect(store.runs()).toHaveLength(0);
 });
+
+test.skipIf(process.platform === "win32")("a real channel package upgrade preserves Source questions and unknown receipts while new Sources use new code", async () => {
+  const f = await fixture(), delivered: Array<{ text: string; thread: string; notificationId: string; generation: string | null }> = [];
+  const outbound = listen(async request => {
+    const body = await request.json() as { text: string; thread: string; notificationId: string }; delivered.push({ ...body, generation: request.headers.get("x-channel-generation") });
+    return Response.json({ notificationId: body.notificationId, receipt: body.text.includes("/tnb answer") ? "" : `receipt:${body.notificationId}` });
+  });
+  const reserved = listen(() => new Response("reserved")); f.raw.listen.port = reserved.port!; await reserved.stop(true);
+  f.raw.sources[0]!.webhook.outboundUrl = `${outbound.url}notify`;
+  const configDir = join(f.root, "upgrade-settings"), packageDir = join(f.root, "channel-package"); await mkdir(configDir);
+  await unpackPlugin(await channelsRecoveryPackage(), packageDir);
+  const installed = await installLocalPlugin({ source: packageDir, targetRoot: join(configDir, "plugins"), sourceType: "user" });
+  await trustPlugin(pluginTrustStorePath(configDir), installed.root);
+  await writeFile(join(configDir, "collaboration.json"), JSON.stringify(f.raw));
+  const state = join(configDir, "runtime"), database = join(state, "state.sqlite"); let calls = 0;
+  const factory = async () => ({ transport: { async *stream() {
+    if (++calls === 1) {
+      yield { type: "tool-start" as const, index: 0, id: "question", name: "durable_wait" };
+      yield { type: "tool-input" as const, index: 0, json: JSON.stringify({ kind: "question", key: "choice", question: "Which database?", options: ["SQLite", "Other"], about: "Waiting before final report" }) };
+      yield { type: "response-end" as const, reason: "tool-use" as const };
+    } else { yield { type: "text" as const, index: 0, text: "Channel upgrade report delivered" }; yield { type: "response-end" as const, reason: "end-turn" as const }; }
+  } }, model: "fixture", tools: [], authorize: async () => ({ behavior: "allow" as const }), route: { provider: "fixture", model: "fixture" }, maxOutputTokens: 128 });
+  async function start() {
+    const store = new RuntimeStore(database); stores.push(store); const runtime = new DurableRuntime(store, state, factory), controller = new AbortController(), ready = Promise.withResolvers<void>();
+    const done = serveDurableRuntime({ configDir, runtime, env, signal: controller.signal, ready: () => ready.resolve() }); cleanups.push(async () => { controller.abort(); await done; });
+    await Promise.race([ready.promise, done]); return { store, runtime, controller, done };
+  }
+  async function until(predicate: () => boolean) { const end = Date.now() + 10000; while (!predicate()) { if (Date.now() > end) throw new Error("Channel upgrade timed out"); await Bun.sleep(10); } }
+  async function send(sourceId: string, externalId: string, text: string) {
+    const body = JSON.stringify({ externalId, actor: "alice", thread: sourceId, text }), timestamp = String(Date.now());
+    const response = await fetch(`http://127.0.0.1:${f.raw.listen.port}/sources/${sourceId}/events`, { method: "POST", body, headers: { "x-tnb-timestamp": timestamp, "x-tnb-signature": signature(secret, timestamp, body) } });
+    expect(response.status).toBe(202); return await response.json() as { state: string };
+  }
+  let owner = await start(); await send("bridge", "request", "/tnb run Inspect and ask");
+  await until(() => delivered.some(item => item.text.includes("/tnb answer")));
+  const runId = owner.store.runs()[0]!.runId, question = owner.runtime.waits.questions(runId)[0]!;
+  const ticket = owner.store.applicationRecords<{ id: string }>("collaboration.tickets")[0]!.value;
+  const notice = delivered.find(item => item.text.includes("/tnb answer"))!;
+  await until(() => owner.store.applicationRecord<{ state: string }>("collaboration.outbox", notice.notificationId)?.value.state === "unknown");
+  owner.controller.abort(); await owner.done;
+  const entry = join(installed.root, "index.mjs"), original = await readFile(entry, "utf8"), changed = original.replaceAll('"idempotency-key": notification.id,', '"x-channel-generation": "new", "idempotency-key": notification.id,');
+  expect(changed).not.toBe(original); await writeFile(entry, changed); await trustPlugin(pluginTrustStorePath(configDir), installed.root);
+  f.raw.sources.push({ ...f.raw.sources[0]!, id: "fresh" }); await writeFile(join(configDir, "collaboration.json"), JSON.stringify(f.raw));
+  owner = await start(); expect(owner.runtime.waits.questions(runId)[0]!.waitId).toBe(question.waitId);
+  await send("bridge", "request", "/tnb run Inspect and ask");
+  await send("bridge", "answer", `/tnb answer ${ticket.id} ${question.waitId} ${question.version} SQLite`);
+  await until(() => delivered.some(item => item.thread === "bridge" && item.text.includes("Channel upgrade report")));
+  await send("fresh", "request", "/tnb run Use the new channel");
+  await until(() => delivered.some(item => item.thread === "fresh" && item.text.includes("Channel upgrade report")));
+  expect(delivered.filter(item => item.thread === "bridge").every(item => item.generation === null)).toBe(true);
+  expect(delivered.filter(item => item.thread === "fresh").every(item => item.generation === "new")).toBe(true);
+  expect(delivered.filter(item => item.notificationId === notice.notificationId)).toHaveLength(1);
+  expect(owner.store.applicationRecord<{ state: string }>("collaboration.outbox", notice.notificationId)?.value.state).toBe("unknown");
+  expect(owner.store.runs()).toHaveLength(2); expect(calls).toBe(3);
+  owner.controller.abort(); await owner.done;
+  f.raw.sources[0]!.actors = []; f.raw.sources[0]!.controllers = []; await writeFile(join(configDir, "collaboration.json"), JSON.stringify(f.raw));
+  owner = await start(); expect((await send("bridge", "revoked", "/tnb run Must be rejected")).state).toBe("rejected");
+  expect(owner.store.runs()).toHaveLength(2); expect(calls).toBe(3);
+}, 20000);

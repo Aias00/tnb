@@ -94,7 +94,8 @@ export class CollaborationEngine {
   inScope(ticket: Ticket, event: IntakeEvent): boolean { return ticket.sourceId === event.sourceId && ticket.thread === event.incoming.thread && ticket.identity === event.identity; }
   mayContribute(source: Source, ticket: Ticket, actor: string): boolean { return source.controllers.includes(actor) || source.actors.includes(actor) && ticket.actor === actor; }
   async process(signal: AbortSignal): Promise<void> {
-    for (const record of this.store.applicationRecords<IntakeEvent>(NS.events, "", 100, { state: "pending" }).sort((a, b) => a.value.receivedAt - b.value.receivedAt).slice(0, 100)) {
+    const pending = this.config.sources.flatMap(source => this.store.applicationRecords<IntakeEvent>(NS.events, "", 100, { state: "pending", sourceId: source.id }));
+    for (const record of pending.sort((a, b) => a.value.receivedAt - b.value.receivedAt).slice(0, 100)) {
       if (signal.aborted) return;
       try { await this.execute(record.id, signal); }
       catch (error) {
@@ -203,6 +204,7 @@ export class CollaborationEngine {
     if (inspectPR) await this.inspectPullRequests(signal);
     for (const record of this.records<Ticket>(NS.tickets, { state: "watching" })) {
       if (signal.aborted) return;
+      if (!this.config.sources.some(source => source.id === record.value.sourceId)) continue;
       const ticket = record.value, run = this.service.tasks.run(ticket.runId), pr = ticket.pr;
       const terminal = ["succeeded", "failed", "cancelled"].includes(run.status);
       const delivery: Ticket["delivery"] = pr?.merged ? "merged" : pr?.state === "closed" ? "closed" : !terminal ? "executing" : pr ? "awaiting-pr" : "completed";
@@ -253,7 +255,8 @@ export class CollaborationEngine {
   async deliver(signal: AbortSignal): Promise<void> {
     const targets = new Set<string>();
     const selected: ApplicationRecord<Notification>[] = [];
-    for (const row of this.store.applicationRecords<Notification>(NS.outbox, "", 256, { state: "pending", orderBySequence: true })) {
+    const pending = this.config.sources.flatMap(source => this.store.applicationRecords<Notification>(NS.outbox, "", 256, { state: "pending", sourceId: source.id, orderBySequence: true }));
+    for (const row of pending.sort((a, b) => a.value.sequence - b.value.sequence)) {
       const key = digestJson({ source: row.value.sourceId, thread: row.value.thread });
       if (!targets.has(key)) { targets.add(key); selected.push(row); }
       if (selected.length >= 16) break;

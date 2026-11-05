@@ -59,7 +59,7 @@ tnb runtime plugins
 
 默认产品 profile 在一个宿主内组合 `tnb-coding`、`tnb-channels`、`tnb-collaboration`、`tnb-web`。这些包也在构建产物的 dist/plugins 下提供可安装包，运行中的内置版本和安装版本走相同注册与生命周期。停用协作插件不会删除工单、通知或原 Run。
 
-领域包支持历史可执行代际留存：新任务使用当前实现，旧任务按原指纹恢复；inventory 显示 current/retained 和引用数。安装包受安装、启用、信任和兼容性约束；默认 Coding 使用嵌入代码包与宿主私有批准。终态任务也保留引用，明确 prune 后才在后续启动回收。详见 [安装包代际](plugin-generations.md) 和 [默认 Coding 代际](builtin-generations.md)；自定义 inline factory 和历史应用/渠道不在此恢复范围。
+领域包和渠道支持历史可执行代际留存，inventory 显示 current/retained 和引用数。安装包受安装、启用、信任和兼容性约束；默认 Coding/channels 使用嵌入包和宿主私有批准。任务和来源保留原指纹，不把历史实现作为默认回退。详见 [领域安装包](plugin-generations.md)、[默认 Coding](builtin-generations.md) 和 [渠道来源恢复](channel-generations.md)；自定义 inline factory 和历史应用/界面不在此恢复范围。
 
 ## 服务、状态和依赖
 
@@ -102,7 +102,7 @@ tnb runtime plugins
 
 示例 local-notes 渠道只在本机按固定命令产生一个事件，通知回执保存在插件独立状态中，不发送实际社交消息。其他外部渠道应由各自适配器验证来源身份。接收来源配置中的 actor 是准入名单，不能把模型正文当成身份。
 
-应用保存每个 Source 的渠道包 provenance；恢复需要相同渠道代际。包或内置构建指纹改变时，不能用新实现静默接管旧 Source；保留原包，或为明确的新接入使用新 Source ID。旧业务事实留存，不丢弃旧通知身份。跨代际状态迁移、历史多代际并存尚未提供自动化工具。
+宿主保存每个 Source 的渠道 provenance 和传输身份，协作应用按原绑定恢复。新旧渠道可并存且私有状态分开；缺少原包的来源显示不可用，其余来源和内核继续运行。旧通知身份与 unknown 状态不因升级重置。旧版没有归档的默认渠道仍需原版本或明确配置新来源；历史渠道的贡献依赖闭包和自动业务迁移尚未提供。
 
 ## 宿主请求和关闭
 

@@ -10,6 +10,8 @@ import { bindDomainAdapter, DomainRegistry, type AgentDomainAdapter, type Adapte
 import { collectPluginGenerations, pluginGenerationKey, readRetainedPlugin, retainPluginGeneration, type PluginGenerationReference } from "./plugin-generations";
 import { unpackPlugin, type PackedPlugin } from "./packed-plugin";
 import type { BuiltinGenerationAuthority } from "./builtin-generations";
+import type { ChannelGenerationReference } from "./channel-bindings";
+import { digestJson } from "../services/runtime/json";
 
 /** Trusted in-process code. This API does not confer sandbox isolation. */
 export type AdapterPluginAPI = {
@@ -40,6 +42,8 @@ export type AgentPluginOptions = {
   generationReferences?: readonly PluginGenerationReference[];
   /** Owner-held host approval table. Never exposed through the plugin API. */
   builtinAuthority?: BuiltinGenerationAuthority;
+  builtinChannelAuthority?: BuiltinGenerationAuthority;
+  channelReferences?: readonly ChannelGenerationReference[];
   blockedFingerprints?: readonly string[];
 };
 export type AdapterPluginState = {
@@ -70,7 +74,7 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
   new DomainRegistry(inline);
   const stateDirectory = snapshotRoot ? resolve(snapshotRoot, "..") : undefined;
   const historyRoot = stateDirectory ? join(stateDirectory, "plugin-generations") : undefined;
-  const references = options.generationReferences ?? [];
+  const references = [...(options.generationReferences ?? []), ...(options.channelReferences ?? [])];
   const referenceCount = (identity: AdapterPluginIdentity) => references.filter(ref => pluginGenerationKey(ref.plugin) === pluginGenerationKey(identity)).length;
   const blocked = (fingerprint: string) => options.blockedFingerprints?.includes(fingerprint) === true;
   type Candidate = { plugin: LoadedPlugin; recoveryOnly?: boolean; origin?: string; builtin?: boolean; state?: AdapterPluginState; sourceSnapshot?: string; configuration?: unknown };
@@ -86,14 +90,17 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
     if (builtin.package) {
       let sourceSnapshot: string | undefined;
       try {
-        if (!historyRoot || !options.builtinAuthority) throw new Error("Packaged builtin requires a private history root and host approval authority");
+        if (!historyRoot || builtin.adapters?.length && !options.builtinAuthority
+          || "extensions" in builtin && builtin.extensions?.some(item => item.kind === "channel") && !options.builtinChannelAuthority) throw new Error("Packaged builtin requires a private history root and host approval authority");
         if (builtin.package.fingerprint !== identity.fingerprint) throw new Error("Builtin package identity does not match its bytes");
         sourceSnapshot = await mkdtemp(join(snapshotRoot!, "tnb-builtin-"));
         await unpackPlugin(builtin.package, join(sourceSnapshot, "package"));
         const loaded = await loadPlugins([{ directory: sourceSnapshot, source: "user" }]);
         const plugin = loaded.plugins[0];
-        if (!plugin || plugin.name !== identity.name || plugin.version !== identity.version || plugin.extensionContributions?.length
-          || JSON.stringify(plugin.adapterContributions?.map(({ id, version }) => ({ id, version }))) !== JSON.stringify(builtin.adapters)) throw new Error(loaded.errors[0]?.error ?? "Builtin package declarations do not match its host registration");
+        const actualExtensions = plugin?.extensionContributions ?? [], expectedExtensions = "extensions" in builtin ? builtin.extensions ?? [] : [];
+        if (!plugin || plugin.name !== identity.name || plugin.version !== identity.version || actualExtensions.some(item => item.kind !== "channel")
+          || digestJson(actualExtensions) !== digestJson(expectedExtensions)
+          || digestJson(plugin.adapterContributions?.map(({ id, version }) => ({ id, version })) ?? []) !== digestJson(builtin.adapters ?? [])) throw new Error(loaded.errors[0]?.error ?? "Builtin package declarations do not match its host registration");
         candidates.push({ plugin: { ...plugin, trust: "trusted", fingerprint: identity.fingerprint }, builtin: true, state, sourceSnapshot, configuration: builtin.configuration });
       } catch (error) {
         state.status = "failed"; state.error = String(error);
@@ -129,7 +136,8 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
         if (installed || discovered.errors.some(error => basename(error.path).toLowerCase() === identity.name.toLowerCase())) throw new Error("Installed plugin selection blocks historical builtin recovery");
         const selected = options.builtins?.find(item => item.identity.name === identity.name);
         if (!selected?.package || options.enabled?.[identity.name] === false || options.enabled?.[identity.name.toLowerCase()] === false) throw new Error("Historical builtin is disabled or not selected by this host");
-        if (!options.builtinAuthority?.approved(identity)) throw new Error("Historical builtin has no matching host approval or recovery ABI");
+        if (references.some(ref => "adapter" in ref && pluginGenerationKey(ref.plugin) === pluginGenerationKey(identity)) && !options.builtinAuthority?.approved(identity)
+          || references.some(ref => "channel" in ref && pluginGenerationKey(ref.plugin) === pluginGenerationKey(identity)) && !options.builtinChannelAuthority?.approved(identity)) throw new Error("Historical builtin has no matching host approval or recovery ABI");
       } else {
         if (!installed || !installed.active) throw new Error("Historical recovery requires the original plugin installation to remain enabled and trusted");
         if (!await pluginGenerationTrusted(options.trustStorePath, installed.root, identity.fingerprint)) throw new Error("Retained plugin generation is no longer trusted");
@@ -165,7 +173,8 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
     try {
       const fingerprint = plugin.fingerprint!;
       const identity = Object.freeze({ name: plugin.name, version: plugin.version!, fingerprint });
-      const authorized = async () => builtin ? !recoveryOnly || options.builtinAuthority?.approved(identity) === true : recoveryOnly ? await pluginGenerationTrusted(options.trustStorePath, origin!, fingerprint)
+      const authorized = async () => builtin ? !recoveryOnly || (!references.some(ref => ref.load && "adapter" in ref && pluginGenerationKey(ref.plugin) === pluginGenerationKey(identity)) || options.builtinAuthority?.approved(identity) === true)
+        && (!references.some(ref => ref.load && "channel" in ref && pluginGenerationKey(ref.plugin) === pluginGenerationKey(identity)) || options.builtinChannelAuthority?.approved(identity) === true) : recoveryOnly ? await pluginGenerationTrusted(options.trustStorePath, origin!, fingerprint)
         && await pluginTrustState(options.trustStorePath, origin!, await computePluginTreeSha256(origin!)) === "trusted"
         : await pluginTrustState(options.trustStorePath, plugin.root, fingerprint) === "trusted";
       if (await computePluginTreeSha256(plugin.root) !== fingerprint
@@ -185,23 +194,29 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
         byEntry.set(key, [...(byEntry.get(key) ?? []), contribution]);
       }
       for (const [entry, expected] of byEntry) {
-        if (recoveryOnly && !expected.some(item => item.kind === "adapter")) continue;
+        const requested = (item: EntryDeclaration) => references.some(ref => ref.load && pluginGenerationKey(ref.plugin) === pluginGenerationKey(identity)
+          && (item.kind === "adapter" && "adapter" in ref && ref.adapter.id === item.id && ref.adapter.version === item.version
+            || item.kind === "channel" && "channel" in ref && ref.channel.id === item.id && ref.channel.version === item.version));
+        if (recoveryOnly && !expected.some(requested)) continue;
+        if (recoveryOnly && expected.some(item => item.kind === "channel" && requested(item) && item.requires.length)) throw new Error("Retained channels must be self-contained and have no contribution dependencies");
         const path = await assertPluginContributionPath({ ...plugin, root: target }, entry);
         const loaded: { default?: unknown } = await import(pathToFileURL(path).href);
         if (typeof loaded.default !== "function") throw new Error("Adapter module must export a default factory");
         const entryResult = await initializeEntry(loaded.default as HostPluginFactory, expected, identity, callbacks, stateDirectory, options.configuration?.[plugin.name] ?? configuration);
-        staged.push(...entryResult.adapters.map(registration => ({ ...registration, ...(recoveryOnly ? { recoveryOnly: true } : {}) })));
-        if (!recoveryOnly) stagedExtensions.push(...entryResult.extensions);
+        staged.push(...entryResult.adapters.filter(row => !recoveryOnly || requested({ kind: "adapter", id: row.adapter.id, version: row.adapter.version })).map(registration => ({ ...registration, ...(recoveryOnly ? { recoveryOnly: true } : {}) })));
+        stagedExtensions.push(...entryResult.extensions.filter(row => !recoveryOnly || row.declaration.kind === "channel" && requested(row.declaration)).map(row => ({ ...row, ...(recoveryOnly ? { recoveryOnly: true } : {}) })));
       }
       if (await computePluginTreeSha256(target) !== fingerprint
         || !await authorized()) throw new Error("Plugin content/trust changed during activation");
       if (recoveryOnly && references.filter(ref => ref.load && pluginGenerationKey(ref.plugin) === pluginGenerationKey(identity))
-        .some(ref => !staged.some(row => row.adapter.id === ref.adapter.id && row.adapter.version === ref.adapter.version))) throw new Error("Retained plugin does not provide the pinned adapter");
+        .some(ref => "adapter" in ref ? !staged.some(row => row.adapter.id === ref.adapter.id && row.adapter.version === ref.adapter.version)
+          : !stagedExtensions.some(row => row.declaration.kind === "channel" && row.declaration.id === ref.channel.id && row.declaration.version === ref.channel.version))) throw new Error("Retained plugin does not provide the pinned contribution");
       new DomainRegistry(inline, [...registrations, ...staged]);
       new ExtensionHost([...extensionRegistrations, ...stagedExtensions], registrations, stateDirectory);
-      if (!recoveryOnly && historyRoot && staged.length) {
+      if (!recoveryOnly && historyRoot && (staged.length || stagedExtensions.some(row => row.declaration.kind === "channel"))) {
         await retainPluginGeneration(historyRoot, identity, builtin ? `builtin:${identity.name}` : plugin.root, target);
-        if (builtin) options.builtinAuthority!.approve(identity);
+        if (builtin && staged.length) options.builtinAuthority!.approve(identity);
+        if (builtin && stagedExtensions.some(row => row.declaration.kind === "channel")) options.builtinChannelAuthority!.approve(identity);
       }
       registrations.push(...staged); extensionRegistrations.push(...stagedExtensions); // Commit only after all entries and identities validate.
       state.status = "active";
@@ -219,7 +234,7 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
     try { await collectPluginGenerations(historyRoot, keep); }
     catch (error) { states.push({ name: "plugin-generations", root: historyRoot, enabled: false, trust: "untrusted", status: "failed", error: `Historical collection failed: ${String(error)}` }); }
   }
-  const extensions = new ExtensionHost(extensionRegistrations, [...registrations, ...inline.map(adapter => ({ adapter }))], stateDirectory);
+  const extensions = new ExtensionHost(extensionRegistrations, [...registrations.filter(row => !row.recoveryOnly), ...inline.map(adapter => ({ adapter }))], stateDirectory, options.channelReferences);
   let closing: Promise<void> | undefined;
   return { registrations, extensions,
     list: () => structuredClone(states.map(state => {

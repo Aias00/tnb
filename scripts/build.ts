@@ -4,6 +4,7 @@ import { join, resolve } from "node:path";
 import { codingPluginFingerprint } from "../src/adapters/coding/identity";
 import { buildCodingRecoveryPackage } from "../src/adapters/coding/recovery-package";
 import { unpackPlugin } from "../src/agent/packed-plugin";
+import { buildChannelsRecoveryPackage } from "../src/plugins/channels/recovery-package";
 
 const root = resolve(import.meta.dir, "..");
 const outputDirectory = join(root, "dist");
@@ -21,8 +22,9 @@ const nativeLibrary = join(nativePackage, "lib");
 
 await mkdir(outputDirectory, { recursive: true });
 const codingPackage = await buildCodingRecoveryPackage(root);
+const channelsPackage = await buildChannelsRecoveryPackage(root);
 const build = await Bun.build({ entrypoints: [join(root, "src/entrypoints/cli.ts")], target: "bun", compile: { outfile: join(outputDirectory, cliName) },
-  define: { TNB_BUILD_SOURCE_SHA256: JSON.stringify(await codingPluginFingerprint(root)), TNB_CODING_PACKAGE: JSON.stringify(codingPackage) } });
+  define: { TNB_BUILD_SOURCE_SHA256: JSON.stringify(await codingPluginFingerprint(root)), TNB_CODING_PACKAGE: JSON.stringify(codingPackage), TNB_CHANNELS_PACKAGE: JSON.stringify(channelsPackage) } });
 if (!build.success) throw new AggregateError(build.logs, "CLI compilation failed");
 const pluginRoot = join(outputDirectory, "plugins", "tnb-coding");
 await mkdir(pluginRoot, { recursive: true });
@@ -30,7 +32,9 @@ await mkdir(pluginRoot, { recursive: true });
 await rm(pluginRoot, { recursive: true, force: true });
 await unpackPlugin(codingPackage, pluginRoot);
 
-for (const name of ["channels", "collaboration", "web"]) {
+const channelsRoot = join(outputDirectory, "plugins", "tnb-channels"); await rm(channelsRoot, { recursive: true, force: true });
+await unpackPlugin(channelsPackage, channelsRoot);
+for (const name of ["collaboration", "web"]) {
   const target = join(outputDirectory, "plugins", `tnb-${name}`); await mkdir(target, { recursive: true });
   const result = await Bun.build({ entrypoints: [join(root, "src/plugins", name, "plugin.ts")], target: "bun", outdir: target, naming: "index.mjs" });
   if (!result.success) throw new AggregateError(result.logs, `${name} plugin bundle failed`);

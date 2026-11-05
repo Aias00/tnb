@@ -8,7 +8,7 @@ import { RuntimeStore } from "../../src/services/runtime/store";
 import { createCollaborationService } from "../../src/services/collaboration/runtime-service";
 import { CollaborationHost } from "../../src/services/collaboration/host";
 import { CollaborationEngine, eventId, NS, ticketId } from "../../src/services/collaboration/engine";
-import { parseCollaborationConfig } from "../../src/services/collaboration/config";
+import { parseCollaborationConfig, sourceIdentity } from "../../src/services/collaboration/config";
 import type { CollaborationConfig, IncomingEvent, IntakeEvent, Notification, SourcePort, Ticket } from "../../src/services/collaboration/types";
 import type { ModelTransport } from "../../src/providers/types";
 
@@ -34,6 +34,30 @@ async function fixture(transport: ModelTransport = { async *stream() { yield* re
   return { root, state, database, store, runtime, factory, config, ports, engine, delivered, incoming, ticket };
 }
 async function until(runtime: DurableRuntime, predicate: () => boolean) { const end = Date.now() + 8000; while (!predicate()) { if (Date.now() > end) throw new Error(`timeout: ${runtime.lastError}`); await runtime.tick(); await Bun.sleep(5); } }
+
+test("unavailable Source backlogs cannot starve healthy intake or notifications and keep their original states", async () => {
+  const f = await fixture();
+  f.store.command("blocked-backlogs", {}, Date.now(), tx => {
+    for (let index = 0; index < 300; index++) {
+      const id = String(index).padStart(4, "0");
+      tx.saveApplicationRecord({ namespace: NS.events, id: `000-blocked-${id}`, value: { id, sourceId: "blocked", receivedAt: 0, state: "pending" } }, 0);
+      tx.saveApplicationRecord({ namespace: NS.outbox, id: `000-blocked-${id}`, value: { id, sourceId: "blocked", identity: "old", thread: "blocked", text: "blocked", state: "pending", createdAt: 0, sequence: index } }, 0);
+    }
+    tx.saveApplicationRecord({ namespace: NS.outbox, id: "healthy", value: { id: "healthy", sourceId: "chat", identity: sourceIdentity(f.config.sources[0]!), thread: "healthy", text: "Healthy notice", state: "pending", createdAt: Date.now(), sequence: 1000 } }, 0); return true;
+  });
+  await f.engine.ingest("chat", [f.incoming("healthy")]); await f.engine.process(signal());
+  expect(f.ticket("healthy").runId).toBeDefined(); expect(f.store.runs()).toHaveLength(1);
+  await f.engine.deliver(signal()); expect(f.delivered.some(item => item.text === "Healthy notice")).toBe(true);
+  expect(f.store.applicationRecord<IntakeEvent>(NS.events, "000-blocked-0000")!.value.state).toBe("pending");
+  expect(f.store.applicationRecord<Notification>(NS.outbox, "000-blocked-0000")!.value.state).toBe("pending");
+});
+
+test("unavailable Source ingress returns retryable 503 without admitting or acknowledging an event", async () => {
+  const f = await fixture(), host = new CollaborationHost(createCollaborationService(f.runtime, f.config).open(signal()), f.config, f.ports, new Map([["chat", "Missing pinned channel"]]));
+  const response = await host.receive(new Request("http://localhost/sources/chat/events", { method: "POST", body: JSON.stringify(f.incoming("blocked")) }));
+  expect(response.status).toBe(503); expect(f.store.applicationRecords(NS.events)).toHaveLength(0); expect(f.store.runs()).toHaveLength(0);
+  await host.close();
+});
 
 test("intake authenticates actors, rejects conflicting identities atomically, and pins original authority", async () => {
   const f = await fixture();

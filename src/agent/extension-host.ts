@@ -2,9 +2,11 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { digestJson, encodeJson, text } from "../services/runtime/json";
 import type { PluginAdapterRegistration } from "./domain";
+import type { ChannelGenerationReference } from "./channel-bindings";
 import type { ActiveExtension, ChannelConnection, ChannelDescriptor, ChannelPort, ChannelRegistry, ContributionReference, ExtensionContext, ExtensionHostOptions, ExtensionRegistration, ExtensionState, PluginApplication, PluginChannel, PluginStateStore } from "./extensions";
 
 const key = (ref: ContributionReference) => digestJson({ kind: ref.kind, id: ref.id, version: ref.version });
+const generationKey = (ref: ContributionReference, plugin: ChannelDescriptor["plugin"]) => digestJson({ contribution: key(ref), plugin });
 export class ExtensionHost {
   readonly #states = new Map<string, ExtensionState>();
   readonly #registrations = new Map<string, ExtensionRegistration>();
@@ -20,10 +22,11 @@ export class ExtensionHost {
   #starting?: Promise<void>;
   #removeAbortListener?: () => void;
   readonly channels: ChannelRegistry = Object.freeze({ descriptor: (input: ChannelDescriptor) => this.channelDescriptor(input), connect: (input: ChannelDescriptor, config: Parameters<ChannelRegistry["connect"]>[1]) => this.connect(input, config) });
-  constructor(registrations: readonly ExtensionRegistration[], readonly adapters: readonly Pick<PluginAdapterRegistration, "adapter">[], readonly root?: string) {
+  constructor(registrations: readonly ExtensionRegistration[], readonly adapters: readonly Pick<PluginAdapterRegistration, "adapter">[], readonly root?: string, readonly channelReferences: readonly ChannelGenerationReference[] = []) {
     if (registrations.length > 512) throw new Error("Host extension capacity exceeded");
     for (const registration of registrations) {
-      const id = key(registration.declaration);
+      if (registration.recoveryOnly && (registration.declaration.kind !== "channel" || registration.declaration.requires.length)) throw new Error("Retained channels must be self-contained and have no contribution dependencies");
+      const id = registration.recoveryOnly ? generationKey(registration.declaration, registration.plugin) : key(registration.declaration);
       if (this.#registrations.has(id)) throw new Error("Duplicate host contribution");
       this.#registrations.set(id, registration);
       this.#states.set(id, { kind: registration.declaration.kind, id: registration.declaration.id, version: registration.declaration.version, plugin: registration.plugin, status: "registered" });
@@ -115,13 +118,18 @@ export class ExtensionHost {
     return JSON.parse(encodeJson(status, 128 * 1024));
   }
   channelDescriptor(input: ChannelDescriptor): ChannelDescriptor {
-    const ref = { kind: "channel" as const, id: input.id, version: input.version }; this.assertActive(ref);
-    const plugin = this.#registrations.get(key(ref))!.plugin;
-    if (input.plugin && digestJson(input.plugin) !== digestJson(plugin)) throw new Error("Channel plugin generation is unavailable; do not replace persisted provenance");
+    const { registration } = this.selectChannel(input), plugin = registration.plugin;
     return { id: input.id, version: input.version, plugin: { ...plugin } };
   }
+  private selectChannel(input: ChannelDescriptor) {
+    const ref = { kind: "channel" as const, id: input.id, version: input.version }, current = this.#registrations.get(key(ref));
+    const id = input.plugin && (!current || digestJson(current.plugin) !== digestJson(input.plugin)) ? generationKey(ref, input.plugin) : key(ref);
+    const registration = this.#registrations.get(id);
+    if (this.#closed || !registration || this.#states.get(id)?.status !== "active") throw new Error("Channel plugin generation is unavailable; do not replace persisted provenance");
+    return { id, registration };
+  }
   private async connect(input: ChannelDescriptor, configuration: Parameters<ChannelRegistry["connect"]>[1]): Promise<ChannelConnection> {
-    const descriptor = this.channelDescriptor(input), id = key({ kind: "channel", ...descriptor });
+    const descriptor = this.channelDescriptor(input), { id } = this.selectChannel(descriptor);
     encodeJson(configuration, 128 * 1024);
     const context = await this.context(id), controller = new AbortController();
     let port: ChannelPort | undefined;
@@ -163,8 +171,22 @@ export class ExtensionHost {
   private async context(id: string): Promise<ExtensionContext> {
     const registration = this.#registrations.get(id)!;
     if (!this.#contexts.has(id)) this.#contexts.set(id, { controller: new AbortController(), callbacks: [], accepting: true, finished: false });
-    const lifetime = this.#contexts.get(id)!, namespace = `plugin:${digestJson({ plugin: registration.plugin.name, kind: registration.declaration.kind, id: registration.declaration.id, version: registration.declaration.version }).slice(0, 48)}`;
-    const stateDirectory = this.root ? join(this.root, "plugin-state", digestJson({ plugin: registration.plugin.name, kind: registration.declaration.kind, id: registration.declaration.id, version: registration.declaration.version })) : undefined;
+    const lifetime = this.#contexts.get(id)!;
+    const identity = { plugin: registration.plugin.name, kind: registration.declaration.kind, id: registration.declaration.id, version: registration.declaration.version };
+    let stateKey = digestJson(identity);
+    if (registration.declaration.kind === "channel") {
+      const store = this.#options!.store, namespace = "host.channel-state", previous = store.applicationRecord<{ plugin: typeof registration.plugin }>(namespace, stateKey);
+      let owner = previous?.value.plugin;
+      if (!owner) {
+        const referenced = this.channelReferences.filter(ref => ref.channel.id === registration.declaration.id && ref.channel.version === registration.declaration.version && ref.plugin.name === registration.plugin.name);
+        if (new Set(referenced.map(ref => digestJson(ref.plugin))).size > 1) throw new Error("Legacy channel state owner is ambiguous; explicit migration is required");
+        owner = referenced[0]?.plugin ?? registration.plugin;
+        const value = { plugin: owner }; store.command(`channel-state:${stateKey}`, value, Date.now(), tx => tx.saveApplicationRecord({ namespace, id: stateKey, value }, 0));
+      }
+      if (digestJson(owner) !== digestJson(registration.plugin)) stateKey = digestJson({ ...identity, generation: registration.plugin });
+    }
+    const namespace = `plugin:${stateKey.slice(0, 48)}`;
+    const stateDirectory = this.root ? join(this.root, "plugin-state", stateKey) : undefined;
     if (stateDirectory) await mkdir(stateDirectory, { recursive: true, mode: 0o700 });
     const store = this.#options!.store;
     const assertLive = () => { if (this.#closed || !lifetime.accepting || lifetime.controller.signal.aborted) throw new Error("Plugin contribution lifetime ended"); };

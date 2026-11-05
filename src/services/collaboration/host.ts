@@ -17,7 +17,7 @@ export class CollaborationHost {
   readonly #requests = new Set<Promise<Response>>();
   #lastPR = 0;
   #lastPoll = new Map<string, number>();
-  constructor(readonly service: CollaborationService, readonly config: CollaborationConfig, ports: Map<string, SourcePort>) {
+  constructor(readonly service: CollaborationService, readonly config: CollaborationConfig, ports: Map<string, SourcePort>, readonly unavailableSources: ReadonlyMap<string, string> = new Map()) {
     this.engine = new CollaborationEngine(service, config, ports);
   }
   static async open(service: CollaborationService, ports: Map<string, SourcePort>): Promise<CollaborationHost | undefined> {
@@ -90,6 +90,7 @@ export class CollaborationHost {
     try {
       const match = /^\/sources\/([A-Za-z0-9_-]+)\/events$/.exec(new URL(request.url).pathname);
       if (request.method !== "POST" || !match) return Response.json({ error: "Not found" }, { status: 404 });
+      if (this.unavailableSources.has(match[1]!)) return Response.json({ error: "Source channel is temporarily unavailable" }, { status: 503 });
       const source = this.engine.source(match[1]!);
       const port = this.engine.ports.get(source.id);
       if (!port?.receive) return Response.json({ error: "Source channel does not accept incoming requests" }, { status: 403 });

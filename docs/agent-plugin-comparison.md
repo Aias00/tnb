@@ -4,7 +4,7 @@
 
 后续进展（2026-11-05）：以下比较保留最初实现的约束；已安装领域包现已增加历史字节留存、多代际精确解析、宿主引用与回收，不热替换、不覆盖内置 factory 或历史渠道。当前使用与范围以 [历史代际指南](guides/plugin-generations.md) 为准。
 
-默认 Coding 后续也已改为嵌入的独立可执行包，增加宿主批准和固定恢复 ABI，见 [内置代际指南](guides/builtin-generations.md)。自定义 inline factory 及历史渠道仍未覆盖。
+默认 Coding 后续也已改为嵌入的独立可执行包，增加宿主批准和固定恢复 ABI，见 [内置代际指南](guides/builtin-generations.md)。渠道后续增加了来源绑定和历史代码恢复，见 [渠道代际指南](guides/channel-generations.md)；自定义 inline factory 及历史应用/界面仍未覆盖。
 
 ## 比较结论
 

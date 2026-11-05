@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { openAgentRuntime, type AgentRuntimeHost } from "../../src/agent/runtime";
-import { loadAdapterPlugins } from "../../src/agent/plugins";
+import { loadAdapterPlugins, type HostPluginAPI } from "../../src/agent/plugins";
 import type { DomainDescriptor } from "../../src/agent/domain";
 import { loadPlugins } from "../../src/services/plugins/loader";
 import { installLocalPlugin } from "../../src/services/plugins/management";
@@ -153,6 +153,19 @@ ownerTest("upgrading identical package/adapter versions restores the old waiting
   const newResult = await host.runtime.artifacts.get<{ report: string }>(host.store.getTask(current.tasks[0]!.taskId)!.resultRef!);
   expect(oldResult.report).toContain("actual plugin fact"); expect(newResult.report).toContain("updated plugin fact");
   expect((await f.events()).filter(event => event === "tool")).toHaveLength(2);
+});
+
+ownerTest("a current channel dependency cannot be satisfied by an adapter loaded only for old task recovery", async () => {
+  const f = await fixture(); await trustPlugin(f.trust, f.installedRoot); let host = await f.open();
+  const { run, tasks } = await host.submit({ commandId: "old-domain", objective: "Wait", namespace: "fixture", adapter: descriptor({ wait: true }) });
+  await until(host, () => host.store.getTask(tasks[0]!.taskId)?.status === "waiting"); await host.close();
+  await writeFile(join(f.installedRoot, "index.mjs"), "export default () => { throw new Error('current adapter unavailable'); };"); await trustPlugin(f.trust, f.installedRoot);
+  host = await openAgentRuntime({ directory: join(f.root, "runtime"), plugins: { ...f.options, builtins: [{ identity: { name: "channel-consumer", version: "1.0.0", fingerprint: "c".repeat(64) },
+    extensions: [{ kind: "channel", id: "consumer", version: "1", entry: "index.mjs", services: [], requires: [{ kind: "adapter", id: "fixture", version: "1" }] }],
+    setup(api: HostPluginAPI) { api.registerChannel({ id: "consumer", version: "1", connect() { return { async send() { return "unused"; } }; } }); } }] } }); cleanup.push(() => host.close());
+  expect(host.store.getRun(run.runId)?.status).toBe("active");
+  expect(host.plugins.extensions().find(item => item.id === "consumer")).toMatchObject({ status: "failed", error: expect.stringContaining("Missing adapter dependency") });
+  expect(host.runtime.domains.has("fixture", "1")).toBe(false);
 });
 
 ownerTest("history collection retains terminal Run references and task overrides, then collects only after explicit pruning", async () => {
