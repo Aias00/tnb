@@ -15,7 +15,7 @@ export async function probeSandboxRuntime(runtime: SandboxRuntime, cwd: string, 
     const timer = setTimeout(() => {
       failure = new Error(`Sandbox launch probe timed out (${runtime.command})`);
       child.kill("SIGKILL");
-    }, process.platform === "win32" ? 15_000 : 5_000); // PowerShell's cold C# job-object harness needs startup time.
+    }, process.platform === "win32" ? 30_000 : 5_000); // Hosted Windows runners can exceed 15s compiling the cold C# job-object harness.
     const abort = () => { failure = signal?.reason ?? new Error("Sandbox probe cancelled"); child.kill("SIGKILL"); };
     signal?.addEventListener("abort", abort, { once: true });
     if (signal?.aborted) abort();
