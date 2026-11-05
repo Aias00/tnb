@@ -195,8 +195,8 @@ export class PluginToolRuntimeManager {
     if (!id) return;
     const pending = runtime.pending.get(id);
     if (!pending) return;
-    runtime.pending.delete(id);
     const result = record.error !== undefined ? formatProtocolValue(record.error) : normalizeProtocolResult(record.result);
+    runtime.pending.delete(id);
     if (Buffer.byteLength(result) > this.limits.maxOutputBytes) pending.reject(new Error(`Plugin tool result exceeds ${this.limits.maxOutputBytes} byte limit`));
     else if (record.error !== undefined) pending.reject(new Error(`Plugin ${plugin.name} tool ${contribution.id}: ${truncate(result)}`));
     else pending.resolve(truncate(result));
@@ -313,6 +313,7 @@ async function runHttpTool(plugin: LoadedPlugin, contribution: ExternalPluginToo
 }
 
 function normalizeProtocolResult(value: unknown): string {
+  if (value === undefined) throw new Error("Plugin tool protocol response is missing result");
   if (typeof value === "string") return value;
   if (value && typeof value === "object" && !Array.isArray(value)) {
     const record = value as Record<string, unknown>;

@@ -92,6 +92,7 @@ test("stdio rejects an overlong unfinished frame, oversized result and cumulativ
     { source: `import {createInterface} from 'node:readline';createInterface({input:process.stdin}).on('line',line=>{const {id}=JSON.parse(line);console.log(JSON.stringify({id,result:'x'.repeat(2048)}));});`, limits: { maxOutputBytes: 1024 }, error: "result exceeds" },
     { source: `import {createInterface} from 'node:readline';createInterface({input:process.stdin}).on('line',line=>{const {id}=JSON.parse(line);console.log(JSON.stringify({id,error:'x'.repeat(2048)}));});`, limits: { maxOutputBytes: 1024 }, error: "result exceeds" },
     { source: `setInterval(()=>process.stdout.write(('{}\\n').repeat(512)),1);`, limits: { maxStdioBytes: 1024 }, error: "stdio output exceeds" },
+    { source: `import {createInterface} from 'node:readline';createInterface({input:process.stdin}).on('line',line=>console.log(JSON.stringify({id:JSON.parse(line).id})));`, limits: {}, error: "missing result" },
   ];
   for (const item of cases) {
     const f = await fixture(item.source), runtime = new PluginToolRuntimeManager({}, { ...item.limits, timeoutMs: 1500, killGraceMs: 20 }); cleanup.push(() => runtime.close());
@@ -231,9 +232,11 @@ test("a newer stop request supersedes an activation waiting for old cleanup", as
   await expect(f.runtime.call(f.plugin, f.contribution, {}, signal())).rejects.toThrow("stopped");
 });
 
-test("HTTP refuses compressed bodies instead of bypassing decoded output budgets", async () => {
+test("HTTP refuses compressed and malformed bodies instead of returning incomplete success", async () => {
   const f = await fixture();
   const endpoint = listen(() => new Response(Bun.gzipSync('x'.repeat(32768)), { headers: { "content-encoding": "gzip" } }));
   const contribution = { ...f.contribution, command: endpoint.url.href, args: [], lifecycle: { ...f.contribution.lifecycle, transport: "http" as const } };
   await expect(f.runtime.call(f.plugin, contribution, {}, signal())).rejects.toThrow("compressed responses");
+  const malformed = listen(() => Response.json({ jsonrpc: "2.0", id: "missing-result" }));
+  await expect(f.runtime.call(f.plugin, { ...contribution, command: malformed.url.href }, {}, signal())).rejects.toThrow("missing result");
 });
