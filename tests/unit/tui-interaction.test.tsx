@@ -3,7 +3,7 @@ import React from "react";
 import chalk from "chalk";
 import { Terminal } from "@xterm/headless";
 import { PassThrough, Writable } from "node:stream";
-import { render } from "../../src/ui/ink/index";
+import { render, AlternateScreen } from "../../src/ui/ink/index";
 import { TuiApp, type TuiTurn } from "../../src/ui/app";
 
 async function until(check: () => boolean) {
@@ -17,7 +17,7 @@ async function until(check: () => boolean) {
 test("queues prompts without losing drafts and navigates slash commands", async () => {
   const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode() {}, ref() {}, unref() {} });
   const terminal = new Terminal({ cols: 120, rows: 30, allowProposedApi: true });
-  const screen = () => Array.from({ length: terminal.rows }, (_, i) => terminal.buffer.active.getLine(i)?.translateToString(true) ?? "").join("\n");
+  const screen = () => Array.from({ length: terminal.rows }, (_, i) => terminal.buffer.active.getLine(terminal.buffer.active.baseY + i)?.translateToString(true) ?? "").join("\n");
   const stdout = Object.assign(new Writable({ write(chunk, _encoding, done) { terminal.write(chunk.toString(), done); } }), { isTTY: true, columns: 120, rows: 30 });
   const turns: TuiTurn[] = [];
   const commands: string[] = [];
@@ -70,14 +70,16 @@ async function interactive(options: Partial<import("../../src/ui/app").TuiAppOpt
   const stdin = Object.assign(new PassThrough(), { isTTY: true, setRawMode() {}, ref() {}, unref() {} });
   const terminal = new Terminal({ cols: 120, rows: 34, allowProposedApi: true });
   const stdout = Object.assign(new Writable({ write(chunk, _encoding, done) { terminal.write(chunk.toString(), done); } }), { isTTY: true, columns: 120, rows: 34 });
-  const app = await render(<TuiApp model="test" permissionMode="default" sessionIdFactory={() => "interaction"} runTurn={async () => {}} {...options} stdout={stdout as unknown as NodeJS.WriteStream} />, { stdin: stdin as unknown as NodeJS.ReadStream, stdout: stdout as unknown as NodeJS.WriteStream, patchConsole: false, exitOnCtrlC: false });
+  const app = await render(<AlternateScreen><TuiApp model="test" permissionMode="default" sessionIdFactory={() => "interaction"} runTurn={async () => {}} {...options} stdout={stdout as unknown as NodeJS.WriteStream} /></AlternateScreen>, { stdin: stdin as unknown as NodeJS.ReadStream, stdout: stdout as unknown as NodeJS.WriteStream, patchConsole: false, exitOnCtrlC: false });
   return {
     async send(value: string) { stdin.write(value); await Bun.sleep(40); },
+    async corruptDisplay() { stdout.write("\u001b[1;1HSTALE_GHOST_ROW"); await Bun.sleep(30); },
+    async repaint() { const { default: instances } = await import("../../src/ui/ink/instances"); instances.get(stdout as unknown as NodeJS.WriteStream)?.forceRedraw(); await Bun.sleep(50); },
     async resize(columns: number, rows: number) { stdout.columns = columns; stdout.rows = rows; terminal.resize(columns, rows); stdout.emit("resize"); await Bun.sleep(60); },
-    screen: () => Array.from({ length: terminal.rows }, (_, i) => terminal.buffer.active.getLine(i)?.translateToString(true) ?? "").join("\n"),
+    screen: () => Array.from({ length: terminal.rows }, (_, i) => terminal.buffer.active.getLine(terminal.buffer.active.baseY + i)?.translateToString(true) ?? "").join("\n"),
     colorOf(text: string) {
       for (let row = 0; row < terminal.rows; row++) {
-        const line = terminal.buffer.active.getLine(row);
+        const line = terminal.buffer.active.getLine(terminal.buffer.active.baseY + row);
         const index = line?.translateToString(true).indexOf(text) ?? -1;
         if (index >= 0) return line?.getCell(index)?.getFgColor();
       }
@@ -219,6 +221,10 @@ test("activity shows waiting, thinking, tool execution, elapsed time and cancell
     expect(ui.screen()).toContain("Requesting model");
     turn!.onModelEvent({ type: "thinking", index: 0, thinking: "reasoning" });
     await until(() => ui.screen().includes("Thinking"));
+    turn!.onModelEvent({ type: "tool-start", index: 0, id: "r", name: "read" });
+    await until(() => ui.screen().includes("Preparing read"));
+    turn!.onModelEvent({ type: "tool-input", index: 0, json: '{"path":"test"}' });
+    await until(() => ui.screen().includes("Preparing read arguments"));
     turn!.onToolEvent({ type: "tool-execution-start", id: "r", name: "read", input: {}, startedAt: Date.now() });
     await until(() => ui.screen().includes("Running read"));
     expect(ui.screen()).toMatch(/· \d+s/);
@@ -337,4 +343,41 @@ test("change review browses files and opens full detail without invoking a model
     await ui.send("\r");
     expect(ui.screen()).toContain("+new-two");
   } finally { ui.close(); }
+});
+
+test("theme changes, clear and a new waiting turn do not leave stale prompt/footer rows", async () => {
+  const { createTranscriptEntry } = await import("../../src/ui/transcript/model");
+  let finish = () => {};
+  const ui = await interactive({ initialTranscript: [createTranscriptEntry(0, { kind: "assistant", text: "| 层面 | 技术 |\n|---|---|\n| runtime | Bun and TypeScript |", streaming: false })],
+    runCommand: async request => request.name === "theme" ? { theme: "magenta", message: "Theme changed to magenta." } : { resetSession: true, message: "Started new session." },
+    runTurn: () => new Promise<void>(resolve => { finish = resolve; }),
+  });
+  try {
+    await ui.resize(60, 14);
+    await ui.send("/theme magenta"); await ui.send("\r");
+    await until(() => ui.screen().includes("Theme changed"));
+    await ui.send("/clear"); await ui.send("\r");
+    await until(() => ui.screen().includes("Started new session"));
+    expect(ui.screen()).not.toContain("Bun and TypeScript");
+    await ui.send("clear"); await ui.send("\r");
+    await until(() => ui.screen().includes("Requesting model"));
+    await Bun.sleep(250);
+    expect(ui.screen().match(/enter queue/g)).toHaveLength(1);
+    expect(ui.screen().match(/Requesting model/g)).toHaveLength(1);
+    expect(ui.screen().match(/╭/g)).toHaveLength(1);
+    expect(ui.screen().match(/╰/g)).toHaveLength(1);
+    expect(ui.screen().split("\n").at(-1)).toContain("test");
+    await ui.resize(100, 24);
+    expect(ui.screen().match(/enter queue/g)).toHaveLength(1);
+    expect(ui.screen().match(/╰/g)).toHaveLength(1);
+    const normalize = (value: string) => value.replace(/[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/g, "*").replace(/· \d+s/g, "· Ns").split("\n").map(line => line.trimEnd()).join("\n");
+    const incremental = normalize(ui.screen());
+    await ui.repaint();
+    expect(normalize(ui.screen())).toBe(incremental);
+    await ui.corruptDisplay();
+    expect(ui.screen()).toContain("STALE_GHOST_ROW");
+    await ui.send("\u000c");
+    expect(ui.screen()).not.toContain("STALE_GHOST_ROW");
+    expect(ui.screen().match(/enter queue/g)).toHaveLength(1);
+  } finally { finish(); ui.close(); }
 });

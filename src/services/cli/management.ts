@@ -113,6 +113,8 @@ Commands:
                                  Inspect or edit settings
   status                         Show effective local configuration
   doctor                         Validate local runtime and configuration
+  resume [session-id]            Open the session picker or restore a session
+  continue                       Continue the latest workspace session
   sessions                       List workspace sessions
   jobs                           List and remove local worktree jobs
   rm <job-id>                    Remove a local worktree job
@@ -186,7 +188,7 @@ export async function runJobsCommand(options: ManagementCommandOptions): Promise
     const directRemove = options.argv[0] === "rm";
     const requestedAction = options.argv[1];
     const action = directRemove ? "rm" : !requestedAction || requestedAction.startsWith("-") ? "list" : requestedAction;
-    if (action === "--help" || action === "-h" || action === "help") {
+    if (options.argv.includes("--help") || options.argv.includes("-h") || action === "help") {
       options.stdout.write(`Usage: tnb jobs [list|show <id>|rm <id>] [options]
        tnb rm <id> --yes [--discard-changes]
 

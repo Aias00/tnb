@@ -1,7 +1,9 @@
 import React, {
   useCallback,
+  useContext,
   useEffect,
   useMemo,
+  useLayoutEffect,
   useReducer,
   useRef,
   useState,
@@ -14,6 +16,8 @@ import type { PermissionMode, PermissionPromptDecision } from "../core/permissio
 import type { ModelEvent } from "../providers/types";
 import { applyInputKey, createInputBuffer, searchInputHistory, type InputBuffer, type InputHistorySearch } from "./input-buffer";
 import { promptContentColumns } from "./input/prompt-layout";
+import { TerminalSizeContext } from "./ink/components/TerminalSizeContext";
+import inkInstances from "./ink/instances";
 import { workspaceCompletionToken, completionLabel, completionCursor } from "./file-completion";
 import { filterSessionView } from "./session-filter";
 import { PromptInputController } from "./prompt-input/PromptInput";
@@ -255,10 +259,7 @@ export function TuiApp(options: TuiAppOptions) {
   const [vimInsert, setVimInsert] = useState(!options.vimMode);
   const [promptMouse, setPromptMouse] = useState<{ row: number; column: number; nonce: number; maxVisibleLines?: number } | undefined>();
   const bufferRef = useRef(buffer);
-  const [terminalSize, setTerminalSize] = useState(() => ({
-    columns: stdout.columns || 80,
-    rows: stdout.rows || 24,
-  }));
+  const terminalSize = useContext(TerminalSizeContext) ?? { columns: stdout.columns || 80, rows: stdout.rows || 24 };
   const abortController = useRef<AbortController | undefined>(undefined);
   const editorActive = useRef(false);
   const lastCtrlCPress = useRef(0);
@@ -346,20 +347,16 @@ export function TuiApp(options: TuiAppOptions) {
     questionUiMounted.current = true;
     return () => { questionUiMounted.current = false; activeDurableQuestion.current?.controller.abort(); };
   }, []);
+  const preparingTool = useRef<string | undefined>(undefined);
+
+  // Structural transitions move the prompt/footer; never reuse their old pixels.
+  useLayoutEffect(() => {
+    inkInstances.get(stdout)?.invalidatePrevFrame();
+  }, [stdout, state.busy, theme, management, queuePanel, shellPanel, permission, question]);
 
   useEffect(() => { setSessionFilter(""); setSessionFilterEditing(false); setManagementSelection(0); setManagementDetailOnly(false); }, [management]);
   useEffect(() => { if (!state.busy) { setCancelling(false); setTurnStartedAt(undefined); } }, [state.busy]);
 
-  useEffect(() => {
-    const updateSize = () => setTerminalSize({
-      columns: stdout.columns || 80,
-      rows: stdout.rows || 24,
-    });
-    stdout.on("resize", updateSize);
-    return () => {
-      stdout.off("resize", updateSize);
-    };
-  }, [stdout]);
 
   useEffect(() => () => {
     abortController.current?.abort();
@@ -532,6 +529,7 @@ export function TuiApp(options: TuiAppOptions) {
     setCancelling(false);
     setTurnStartedAt(Date.now());
     setPhase("Requesting model");
+    preparingTool.current = undefined;
     dispatch({ type: "submit", text: structured.display });
     const controller = new AbortController();
     abortController.current = controller;
@@ -543,6 +541,8 @@ export function TuiApp(options: TuiAppOptions) {
       onModelEvent(event) {
         if (event.type === "text") setPhase("Writing response");
         if (event.type === "thinking") setPhase("Thinking");
+        if (event.type === "tool-start") { preparingTool.current = event.name; setPhase(`Preparing ${event.name}`); }
+        if (event.type === "tool-input") setPhase(preparingTool.current ? `Preparing ${preparingTool.current} arguments` : "Preparing tool arguments");
         if (event.type === "response-end") setPhase(event.reason === "tool-use" ? "Preparing tools" : "Finishing response");
         dispatch({ type: "model-event", event });
       },
@@ -1050,6 +1050,9 @@ export function TuiApp(options: TuiAppOptions) {
     if (inputSending) return;
     if (key.escape && inputTarget) { event.stopImmediatePropagation(); setInputTarget(undefined); setCompletionNotice("已返回普通对话，草稿保留。"); return; }
     if (key.escape && state.busy) { event.stopImmediatePropagation(); setCancelling(true); abortController.current?.abort(); return; }
+    if (matchesKeybinding(keybindings, "redraw", input, key) && !matchesKeybinding(keybindings, "externalEditor", input, key) && !matchesKeybinding(keybindings, "pasteImage", input, key)) {
+      inkInstances.get(stdout)?.forceRedraw(); return;
+    }
     if (matchesKeybinding(keybindings, "promptQueue", input, key)) {
       setConfirmation(undefined); setCompletionNotice(undefined); setQueueSelection(0); setQueuePanel(true); return;
     }

@@ -3,14 +3,13 @@ import React, {
   useContext,
   useInsertionEffect,
 } from 'react'
-import instances from '../instances.js'
 import {
   DISABLE_MOUSE_TRACKING,
   ENABLE_MOUSE_TRACKING,
   ENTER_ALT_SCREEN,
   EXIT_ALT_SCREEN,
 } from '../termio/dec.js'
-import { TerminalWriteContext } from '../useTerminalNotification.js'
+import { TerminalWriteContext, TerminalScreenContext } from '../useTerminalNotification.js'
 import Box from './Box.js'
 import { TerminalSizeContext } from './TerminalSizeContext.js'
 
@@ -45,6 +44,7 @@ export function AlternateScreen({
 }: Props): React.ReactNode {
   const size = useContext(TerminalSizeContext)
   const writeRaw = useContext(TerminalWriteContext)
+  const ink = useContext(TerminalScreenContext)
 
   // useInsertionEffect (not useLayoutEffect): react-reconciler calls
   // resetAfterCommit between the mutation and layout commit phases, and
@@ -57,7 +57,6 @@ export function AlternateScreen({
   // Cleanup timing is unchanged: both insertion and layout effect cleanup
   // run in the mutation phase on unmount, before resetAfterCommit.
   useInsertionEffect(() => {
-    const ink = instances.get(process.stdout)
     if (!writeRaw) return
 
     writeRaw(
@@ -72,7 +71,7 @@ export function AlternateScreen({
       ink?.clearTextSelection()
       writeRaw((mouseTracking ? DISABLE_MOUSE_TRACKING : '') + EXIT_ALT_SCREEN)
     }
-  }, [writeRaw, mouseTracking])
+  }, [writeRaw, mouseTracking, ink])
 
   return (
     <Box
