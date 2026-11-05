@@ -179,12 +179,26 @@ writes one JSON object to stdin, and accepts plain stdout or
 JSON-RPC `tools/call` requests by id; eager processes start during activation
 and lazy processes start on first use. `http` sends the same envelope with POST
 and requires declared loopback or egress access.
+Loopback permits only numeric loopback addresses or `localhost` pinned to
+127.0.0.1. HTTP calls use direct owned connections, reject URL credentials and
+redirects, and do not inherit environment proxies. HTTP command arguments and
+external `in_process` contributions fail discovery instead of being ignored.
 Descriptors are validated with resolved command/schema paths and declared
 security metadata (`access`, workspace reach, network reach, shell usage, and
 approval policy). Manual plugins remain loaded without registering tools,
 Hooks, MCP servers, Skills, Agents, or commands until explicitly enabled.
 Session shutdown rejects pending requests and terminates owned
-processes. Unknown identifiers, unsupported transports, and escaping paths fail
+direct processes, cancels HTTP/oneshot calls and waits for managed cleanup.
+Repeated shutdown awaits the same completion. Calls have a 120-second deadline;
+raw input/result and stdio frame limits are 1 MiB, stderr is 256 KiB, and a
+stdio process has an 8 MiB lifetime stdout budget. The runtime admits at most
+32 concurrent calls and 16 persistent stdio processes. Excess output fails
+while reading; it is not accepted as a complete result. Cancelling a stdio call
+terminates its shared process and fails other pending requests without retrying.
+These controls do not provide OS confinement or descendant process containment;
+subprocess workspace/network/shell metadata remains declarative. See the
+[external tool runtime contract](guides/plugin-tool-runtime.md) for scope and
+host override rules. Unknown identifiers, unsupported transports, and escaping paths fail
 startup instead of being silently ignored.
 
 Interactive REPL and Ink sessions own one shared plugin runtime, so `stdio`

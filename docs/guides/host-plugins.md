@@ -77,7 +77,7 @@ Coding 持久 Worker 记录选中 Skill/MCP 的包来源，在授权以及 Skill
 
 历史 Coding 包可能尚无上述检查。默认 profile 通过宿主注入的 `workerGuard` 在历史 Worker 创建前、创建后、授权及工具执行时校验资源包策略；创建后检查失败会关闭 Worker。守卫不连接 MCP、不改写旧任务绑定。SDK 自建宿主可通过同一回调接入自己的领域策略；直接注册的 inline adapter 由宿主自身负责。
 
-这些机制不提供任意进程内代码的强制热撤销。已加载的交互 Hook、Skill 和 MCP 仍需资源刷新或重启；后台可执行包选择也在重启时更新。已发出的网络请求或子进程效果不能通过撤权回滚。HTTP 真实目的地约束、所有在途调用的强制排空和输出读取限额仍按[规范草案](../superpowers/specs/2026-11-05-plugin-specification.md)分阶段实现。
+这些机制不提供任意进程内代码的强制热撤销。已加载的交互 Hook、Skill 和 MCP 仍需资源刷新或重启；后台可执行包选择也在重启时更新。已发出的网络请求或子进程效果不能通过撤权回滚。外部插件工具现有 HTTP 目标约束、调用取消/排空和读取限额见[运行合同](plugin-tool-runtime.md)；其保证不自动延伸到任意进程内代码或其他 MCP/Channel 传输。
 
 默认产品 profile 在一个宿主内组合 `tnb-coding`、`tnb-channels`、`tnb-collaboration`、`tnb-web`。这些包也在构建产物的 dist/plugins 下提供可安装包，运行中的内置版本和安装版本走相同注册与生命周期。停用协作插件不会删除工单、通知或原 Run。
 

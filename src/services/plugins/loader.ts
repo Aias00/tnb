@@ -10,6 +10,7 @@ import { HOOK_EVENTS } from "../hooks/runner";
 import { loadMcpConfig, type McpConfig } from "../mcp/config";
 import { computePluginTreeSha256, pluginTrustState, type PluginTrustState } from "./trust";
 import { isPluginActive, resolvePluginPolicy, type PluginPolicy } from "./policy";
+import { pluginHttpTarget } from "./network";
 
 const BUILT_IN_PLUGIN_TOOLS = new Map<string, {
   toolName: string;
@@ -449,6 +450,7 @@ function externalToolContribution(
   const id = requiredIdentifier(value.id, `tools[${index}].id`, path);
   const description = requiredString(value.description, `tools[${index}].description`, path);
   const lifecycle = optionalExternalToolLifecycle(value.lifecycle, path, index) ?? DEFAULT_EXTERNAL_TOOL_LIFECYCLE;
+  if (lifecycle.transport === "in_process") throw new Error(`Plugin external tools[${index}] cannot use in_process transport: ${path}`);
   const commandValue = requiredString(value.command, `tools[${index}].command`, path);
   const command = lifecycle.transport === "http"
     ? validatedHttpUrl(commandValue, `tools[${index}].command`, path)
@@ -456,6 +458,10 @@ function externalToolContribution(
   const args = optionalStringArray(value.args, `tools[${index}].args`, path) ?? [];
   const inputSchema = optionalSchema(value.inputSchema, `tools[${index}].inputSchema`, path);
   const security = optionalExternalToolSecurity(value.security, path, index) ?? DEFAULT_EXTERNAL_TOOL_SECURITY;
+  if (lifecycle.transport === "http") {
+    pluginHttpTarget(command, security.network);
+    if (args.length) throw new Error(`Plugin HTTP tools[${index}] cannot use command args: ${path}`);
+  }
   return {
     id,
     type: "external",
