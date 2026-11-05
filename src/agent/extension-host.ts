@@ -17,6 +17,8 @@ export class ExtensionHost {
   #closed = false;
   #started = false;
   #closing?: Promise<void>;
+  #starting?: Promise<void>;
+  #removeAbortListener?: () => void;
   readonly channels: ChannelRegistry = Object.freeze({ descriptor: (input: ChannelDescriptor) => this.channelDescriptor(input), connect: (input: ChannelDescriptor, config: Parameters<ChannelRegistry["connect"]>[1]) => this.connect(input, config) });
   constructor(registrations: readonly ExtensionRegistration[], readonly adapters: readonly Pick<PluginAdapterRegistration, "adapter">[], readonly root?: string) {
     if (registrations.length > 512) throw new Error("Host extension capacity exceeded");
@@ -28,9 +30,21 @@ export class ExtensionHost {
     }
   }
   list(): ExtensionState[] { return structuredClone([...this.#states.values()]); }
-  async start(options: ExtensionHostOptions): Promise<void> {
-    if (this.#started || this.#closed) throw new Error("Plugin extensions already started or closed");
-    this.#started = true; this.#options = { store: options.store, services: new Map(options.services), grants: structuredClone(options.grants ?? {}) };
+  start(options: ExtensionHostOptions): Promise<void> {
+    if (this.#started || this.#closed) return Promise.reject(new Error("Plugin extensions already started or closed"));
+    this.#started = true;
+    this.#starting = Promise.resolve().then(() => this.startContributions(options));
+    return this.#starting;
+  }
+  private async startContributions(options: ExtensionHostOptions): Promise<void> {
+    if (this.#closed) throw new Error("Plugin startup cancelled");
+    if (options.signal) {
+      const abort = () => { void this.stop().catch(() => undefined); };
+      options.signal.addEventListener("abort", abort, { once: true });
+      this.#removeAbortListener = () => options.signal!.removeEventListener("abort", abort);
+      if (options.signal.aborted) { abort(); throw new Error("Plugin startup cancelled"); }
+    }
+    this.#options = { store: options.store, services: new Map(options.services), grants: structuredClone(options.grants ?? {}) };
     const visiting = new Set<string>(), visited = new Set<string>(), ordered: string[] = [];
     const visit = (id: string) => {
       if (visited.has(id)) return;
@@ -56,6 +70,7 @@ export class ExtensionHost {
       try { visit(id); } catch { /* Validation failure is visible and does not disable independent contributions. */ }
     }
     for (const id of ordered) {
+      if (this.#closed) throw new Error("Plugin startup cancelled");
       const registration = this.#registrations.get(id)!, state = this.#states.get(id)!;
       if (state.status === "failed") continue;
       try {
@@ -65,10 +80,12 @@ export class ExtensionHost {
         if (unavailable) throw new Error(`Plugin service is not granted or unavailable: ${unavailable}`);
         state.status = "starting";
         const context = await this.context(id);
-        this.#order.push(id); // Include partially started resources in reverse cleanup.
+        this.#order.push(id);
+        context.signal.throwIfAborted(); // Include partially started resources in reverse cleanup.
         if (registration.declaration.kind !== "channel") {
           const active = await (registration.definition as PluginApplication).start(context);
           if (active && (typeof active !== "object" || active.handle !== undefined && typeof active.handle !== "function" || active.status !== undefined && typeof active.status !== "function")) throw new Error("Invalid active plugin interface");
+          context.signal.throwIfAborted();
           this.#active.set(id, Object.freeze({ ...(active?.handle ? { handle: active.handle.bind(active) } : {}), ...(active?.status ? { status: active.status.bind(active) } : {}) }));
         }
         state.status = "active";
@@ -77,6 +94,7 @@ export class ExtensionHost {
         try { await this.dispose(id); } catch (cleanup) { state.error += `; ${message(cleanup)}`; }
       }
     }
+    if (this.#closed) throw new Error("Plugin startup cancelled");
   }
   assertActive(ref: ContributionReference): void {
     if (this.#closed || this.#states.get(key(ref))?.status !== "active") throw new Error(`Plugin contribution unavailable: ${ref.kind}:${ref.id}@${ref.version}`);
@@ -187,20 +205,28 @@ export class ExtensionHost {
     if (errors.length) throw new AggregateError(errors, "Plugin contribution cleanup failed");
   }
   stop(): Promise<void> {
-    return this.#closing ??= (async () => {
-      this.#closed = true; for (const context of this.#contexts.values()) context.controller.abort();
-      const errors: unknown[] = [];
-      for (const id of [...this.#order].reverse()) {
-        const state = this.#states.get(id)!; if (state.status === "failed") continue;
-        state.status = "draining";
-        if (state.kind === "channel") for (const [connection, provider] of this.#connections) if (provider === id) { try { await connection.close(); } catch (error) { errors.push(error); } }
-        try { await this.dispose(id, true); state.status = "stopped"; } catch (error) { state.status = "failed"; state.error = message(error); errors.push(error); }
-      }
-      await Promise.allSettled([...this.#inFlight]);
-      for (const connection of [...this.#connections.keys()]) { try { await connection.close(); } catch (error) { errors.push(error); } }
-      for (const context of this.#contexts.values()) context.finished = true;
-      if (errors.length) throw new AggregateError(errors, "Plugin extension shutdown failed");
-    })();
+    if (this.#closing) return this.#closing;
+    const closing = Promise.withResolvers<void>(); this.#closing = closing.promise;
+    void this.stopContributions().then(closing.resolve, closing.reject); return closing.promise;
   }
+  private async stopContributions(): Promise<void> {
+    this.#closed = true; this.#removeAbortListener?.();
+    for (const context of this.#contexts.values()) context.controller.abort();
+    // Startup callbacks observe cancellation and finish before their resources are disposed.
+    await this.#starting?.catch(() => undefined);
+    const errors: unknown[] = [];
+    for (const id of [...this.#order].reverse()) {
+      const state = this.#states.get(id)!; if (state.status === "failed") continue;
+      state.status = "draining";
+      if (state.kind === "channel") for (const [connection, provider] of this.#connections) if (provider === id) { try { await connection.close(); } catch (error) { errors.push(error); } }
+      try { await this.dispose(id, true); state.status = "stopped"; } catch (error) { state.status = "failed"; state.error = message(error); errors.push(error); }
+    }
+    await Promise.allSettled([...this.#inFlight]);
+    for (const connection of [...this.#connections.keys()]) { try { await connection.close(); } catch (error) { errors.push(error); } }
+    for (const context of this.#contexts.values()) context.finished = true;
+    for (const state of this.#states.values()) if (state.status === "registered") state.status = "stopped";
+    if (errors.length) throw new AggregateError(errors, "Plugin extension shutdown failed");
+  }
+
 }
 function message(error: unknown): string { return error instanceof Error ? `${error.message}${error instanceof AggregateError ? `: ${error.errors.map(String).join("; ")}` : ""}` : String(error); }

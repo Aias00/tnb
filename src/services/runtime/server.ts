@@ -44,6 +44,8 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
   let closing = false;
   let ready = false;
   const stopped = Promise.withResolvers<void>();
+  const stopping = new AbortController();
+  const lifetime = AbortSignal.any([options.signal, stopping.signal]);
   let started = false;
   let commandTail = Promise.resolve();
   async function serialCommand<T>(apply: () => Promise<T>): Promise<T> {
@@ -130,7 +132,7 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
           return await serialCommand(async () => {
             if (typeof input.commandId !== "string" || !input.commandId) throw new Error("commandId is required");
             if (input.expectedRevision !== undefined && (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1)) throw new Error("Invalid expected Run revision");
-            if (input.action === "stop") { setTimeout(() => stopped.resolve(), 20); return Response.json({ stopping: true }); }
+            if (input.action === "stop") { closing = true; setTimeout(() => { stopping.abort(); stopped.resolve(); }, 20); return Response.json({ stopping: true }); }
             if (input.action === "route-control") {
               if (!input.source || await realpath(input.source.workspace) !== input.source.workspace) throw new Error("Canonical input source is required");
               return Response.json(runtime.router.clarifyControl({ commandId: input.commandId, source: input.source, action: input.routeAction! }));
@@ -196,7 +198,7 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
       },
     });
     await chmod(paths.socket, 0o600);
-    await profile.start(runtime);
+    await profile.start(runtime, lifetime);
     ready = true;
     options.ready?.(paths.socket);
     if (!options.signal.aborted) await Promise.race([stopped.promise, new Promise<void>((done) => options.signal.addEventListener("abort", () => done(), { once: true }))]);

@@ -15,8 +15,8 @@ export async function loadDefaultProfile(options: { configDir: string; root: str
   const builtins = [ ...(options.coding ? [await createCodingPlugin({ configDir, runtimeRoot: root, env })] : []), await createChannelsPlugin(env), await createCollaborationPlugin({ configDir, env }) ];
   const plugins = await loadHostPlugins({ roots: [{ directory: join(configDir, "plugins"), source: "user" }],
     trustStorePath: pluginTrustStorePath(configDir), enabled: settings.enabledPlugins, builtins, configuration }, [], join(root, "plugin-snapshots"));
-  return { plugins, async start(runtime: DurableRuntime) {
-    await plugins.extensions.start({ store: runtime.store, services: new Map<string, unknown>([
+  return { plugins, async start(runtime: DurableRuntime, signal?: AbortSignal) {
+    await plugins.extensions.start({ store: runtime.store, signal, services: new Map<string, unknown>([
       [INTERNAL_RUNTIME_SERVICE, runtime], [CHANNEL_SERVICE, plugins.extensions.channels],
       ["tnb.runtime.read/v1", Object.freeze({ runs: () => runtime.store.runs(), status: (runId: string) => ({ run: runtime.store.getRun(runId), tasks: runtime.store.tasks(runId) }), configuration: (runId: string) => runtime.configuration(runId) })],
     ]), grants: { "tnb-collaboration": [INTERNAL_RUNTIME_SERVICE, CHANNEL_SERVICE], ...settings.pluginServices } });

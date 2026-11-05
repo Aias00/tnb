@@ -43,4 +43,4 @@ export type ChannelDescriptor = { id: string; version: string; plugin?: AdapterP
 export type ChannelConnection = { descriptor: ChannelDescriptor; port: ChannelPort; close(): Promise<void> };
 export type ChannelRegistry = { descriptor(input: ChannelDescriptor): ChannelDescriptor; connect(input: ChannelDescriptor, configuration: JsonValue): Promise<ChannelConnection> };
 export type ExtensionRegistration = { declaration: ExtensionDeclaration; plugin: AdapterPluginIdentity; definition: PluginApplication | PluginChannel };
-export type ExtensionHostOptions = { store: RuntimeStore; services?: ReadonlyMap<string, unknown>; grants?: Record<string, string[]> };
+export type ExtensionHostOptions = { signal?: AbortSignal; store: RuntimeStore; services?: ReadonlyMap<string, unknown>; grants?: Record<string, string[]> };

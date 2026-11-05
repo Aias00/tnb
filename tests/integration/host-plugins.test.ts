@@ -161,3 +161,21 @@ test("channel startup failure closes partial resources and closing a connection 
   await channel.close(); expect(await pending).toBe("receipt"); expect(events.slice(1)).toEqual(["send-drained", "port-close", "connection-dispose"]);
   await expect(plugins.extensions.channels.connect({ ...channel.descriptor, plugin: { ...channel.descriptor.plugin!, fingerprint: "d".repeat(64) } }, {})).rejects.toThrow("generation");
 });
+
+test("cancellation during plugin startup joins partial initialization before disposal and releases the runtime owner", async () => {
+  const f = await fixture(), entered = Promise.withResolvers<void>(), controller = new AbortController(), events: string[] = [];
+  const builtin: BuiltinHostPlugin = { identity: { name: "startup-cancel", version: "1.0.0", fingerprint: "e".repeat(64) }, extensions: [{ kind: "application", id: "startup-cancel", version: "1", entry: "index.mjs", services: [], requires: [] }], setup(api) {
+    api.registerApplication({ id: "startup-cancel", version: "1", async start(context) {
+      context.onDispose(() => { events.push("disposed"); }); entered.resolve();
+      await new Promise<void>(resolve => context.signal.addEventListener("abort", () => resolve(), { once: true }));
+      events.push("initialization-drained");
+    } });
+  } };
+  const opening = openAgentRuntime({ directory: join(f.root, "runtime"), signal: controller.signal, plugins: { roots: [], trustStorePath: f.trust, builtins: [builtin] } });
+  // Attach before cancellation so the expected rejection never becomes an unhandled promise.
+  const rejected = opening.then(() => { throw new Error("Startup unexpectedly succeeded"); }, error => error);
+  await entered.promise; controller.abort();
+  expect(String(await rejected)).toContain("cancelled");
+  expect(events).toEqual(["initialization-drained", "disposed"]);
+  const next = await openAgentRuntime({ directory: join(f.root, "runtime") }); await next.close();
+});

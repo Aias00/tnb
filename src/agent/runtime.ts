@@ -8,7 +8,8 @@ import type { ExtensionHostOptions, ContributionReference } from "./extensions";
 import { loadAdapterPlugins, type AgentPluginOptions } from "./plugins";
 
 /** Local Bun host. Acquire the owner lock before opening SQLite, including on recovery. */
-export async function openAgentRuntime(options: { directory: string; adapters?: readonly AgentDomainAdapter[]; plugins?: AgentPluginOptions; legacyAdapterId?: string; services?: ExtensionHostOptions["services"]; serviceGrants?: ExtensionHostOptions["grants"] }) {
+export async function openAgentRuntime(options: { directory: string; adapters?: readonly AgentDomainAdapter[]; plugins?: AgentPluginOptions; legacyAdapterId?: string; signal?: AbortSignal; services?: ExtensionHostOptions["services"]; serviceGrants?: ExtensionHostOptions["grants"] }) {
+  options.signal?.throwIfAborted();
   await mkdir(options.directory, { recursive: true, mode: 0o700 });
   const unlock = await lock(options.directory, { realpath: true, stale: 5000, update: 1000, retries: 0 });
   let released = false;
@@ -23,14 +24,22 @@ export async function openAgentRuntime(options: { directory: string; adapters?: 
     const runtime = running = new DurableRuntime(store, options.directory, domains);
     // The host retains ownership through plugin disposal and database close.
     await runtime.start(async () => {});
-    await plugins?.extensions.start({ store, services: options.services, grants: options.serviceGrants });
+    await plugins?.extensions.start({ store, signal: options.signal, services: options.services, grants: options.serviceGrants });
+    options.signal?.throwIfAborted();
     let closing: Promise<void> | undefined;
+    const abort = () => { void close().catch(() => undefined); };
+    function close(): Promise<void> {
+      return closing ??= (async () => { options.signal?.removeEventListener("abort", abort);
+        try { try { await plugins?.extensions.stop(); } finally { await runtime.close(); } } finally {
+          try { await plugins?.close(); } finally { try { store!.close(); } finally { await release(); } }
+        }
+      })();
+    }
+    options.signal?.addEventListener("abort", abort, { once: true });
+    if (options.signal?.aborted) { await close(); options.signal.throwIfAborted(); }
     return { runtime, store, submit: runtime.submitDomain.bind(runtime), plugins: { list: () => plugins?.list() ?? [], extensions: () => plugins?.extensions.list() ?? [],
-        request: (ref: ContributionReference, request: Request) => { if (!plugins) throw new Error("No host plugins are loaded"); return plugins.extensions.handle(ref, request); }, channels: plugins?.extensions.channels },
-      close() { return closing ??= (async () => { try { try { await plugins?.extensions.stop(); } finally { await runtime.close(); } } finally {
-        try { await plugins?.close(); } finally { try { store!.close(); } finally { await release(); } }
-      } })(); },
-    };
+        request: (ref: ContributionReference, request: Request) => { if (!plugins) throw new Error("No host plugins are loaded"); return plugins.extensions.handle(ref, request); }, channels: plugins?.extensions.channels }, close };
+
   } catch (error) {
     try { try { await plugins?.extensions.stop(); } finally { await running?.close(); } } finally {
       try { await plugins?.close(); } finally { try { store?.close(); } finally { await release(); } }
