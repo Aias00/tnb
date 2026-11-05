@@ -149,6 +149,15 @@ export class RuntimeStore {
     this.#assertOpen(); this.#db.exec("PRAGMA wal_checkpoint(TRUNCATE); VACUUM; PRAGMA wal_checkpoint(TRUNCATE);");
   }
 
+  /** An unverified lookup hint, never a substitute for replayCommand's digest check. */
+  commandRunIdHint(commandId: string): string | undefined {
+    this.#assertOpen(); text(commandId, "command ID", 128);
+    const row = this.#db.query("SELECT result FROM commands WHERE command_id = ?").get(commandId) as { result: string } | null;
+    const result = row ? JSON.parse(row.result) : undefined;
+    // This is only a lookup hint. Callers must still verify the complete command digest.
+    return typeof result?.run?.runId === "string" ? result.run.runId : undefined;
+  }
+
   /** Read a matching historical receipt without mutating or relaxing its input digest. */
   replayCommand<T>(commandId: string, input: unknown): T | undefined {
     this.#assertOpen(); text(commandId, "command ID", 128);

@@ -12,7 +12,7 @@ export type CapabilityGrant = { name: string; resources: string[]; mode: "read" 
 /** Persisted data only. Credentials and executable adapter code remain on the host. */
 export type AdapterPluginIdentity = { name: string; version: string; fingerprint: string };
 export type DomainDescriptor = { id: string; version: string; config: JsonValue; resources: ResourceClaim[]; grants: CapabilityGrant[]; plugin?: AdapterPluginIdentity };
-export type PluginAdapterRegistration = { adapter: AgentDomainAdapter; plugin: AdapterPluginIdentity };
+export type PluginAdapterRegistration = { adapter: AgentDomainAdapter; plugin: AdapterPluginIdentity; recoveryOnly?: boolean };
 export type DomainContext = { descriptor: DomainDescriptor; namespace: string; run: DurableRun; task: DurableTask; signal: AbortSignal;
   configuration: RuntimeConfiguration; stateRoot: string };
 export type DomainAcceptance = { checks: Array<{ command: string; output: string }>; evidence?: JsonValue };
@@ -104,15 +104,21 @@ export function bindDomainAdapter(adapter: AgentDomainAdapter): AgentDomainAdapt
 export class DomainRegistry {
   readonly #adapters = new Map<string, AgentDomainAdapter>();
   readonly #plugins = new Map<string, AdapterPluginIdentity>();
+  readonly #generations = new Map<string, AgentDomainAdapter>();
   readonly #legacy?: AgentDomainAdapter;
   constructor(adapters: readonly AgentDomainAdapter[] = [], plugins: readonly PluginAdapterRegistration[] = [], legacyAdapterId?: string) {
-    for (const { adapter, plugin } of [...adapters.map(adapter => ({ adapter, plugin: undefined })), ...plugins]) {
+    for (const { adapter, plugin, recoveryOnly } of [...adapters.map(adapter => ({ adapter, plugin: undefined, recoveryOnly: false })), ...plugins]) {
       text(adapter.id, "adapter ID", 128); text(adapter.version, "adapter version", 128);
       const key = digestJson({ id: adapter.id, version: adapter.version });
-      if (this.#adapters.has(key)) throw new Error("Duplicate adapter identity");
-      this.#adapters.set(key, bindDomainAdapter(adapter));
-      if (plugin) this.#plugins.set(key, Object.freeze({ ...plugin }));
-      if (legacyAdapterId === adapter.id) {
+      const generationKey = digestJson({ id: adapter.id, version: adapter.version, plugin: plugin ?? null });
+      if (this.#generations.has(generationKey) || !recoveryOnly && this.#adapters.has(key)) throw new Error("Duplicate adapter identity");
+      const bound = bindDomainAdapter(adapter);
+      this.#generations.set(generationKey, bound);
+      if (!recoveryOnly) {
+        this.#adapters.set(key, bound);
+        if (plugin) this.#plugins.set(key, Object.freeze({ ...plugin }));
+      }
+      if (!recoveryOnly && legacyAdapterId === adapter.id) {
         if (this.#legacy || !adapter.runtime?.legacyDescriptor) throw new Error("Invalid or ambiguous legacy adapter");
         this.#legacy = this.#adapters.get(key);
       }
@@ -125,18 +131,22 @@ export class DomainRegistry {
   }
   has(id: string, version: string): boolean { return this.#adapters.has(digestJson({ id, version })); }
   /** Pin new submissions. Recovery must use resolve directly and cannot acquire a new identity. */
-  prepare(descriptor: DomainDescriptor): DomainDescriptor {
+  prepare(descriptor: DomainDescriptor, allowRetained = false): DomainDescriptor {
     const value = validateDomainDescriptor(descriptor);
     const plugin = this.#plugins.get(digestJson({ id: value.id, version: value.version }));
     if (!value.plugin && plugin) value.plugin = { ...plugin };
+    if (!allowRetained && this.#generations.has(digestJson({ id: value.id, version: value.version, plugin: value.plugin ?? null }))
+      && (digestJson(value.plugin ?? null) !== digestJson(plugin ?? null) || !this.has(value.id, value.version))) throw new Error("Retained adapter generation is available for pinned recovery only");
     this.resolve(value);
     return validateDomainDescriptor(value);
   }
   resolve(descriptor: DomainDescriptor): AgentDomainAdapter {
     const key = digestJson({ id: descriptor.id, version: descriptor.version });
-    const adapter = this.#adapters.get(key);
-    if (!adapter) throw new Error(`Adapter unavailable: ${descriptor.id}@${descriptor.version}; register the pinned version or migrate explicitly`);
-    if (digestJson(descriptor.plugin ?? null) !== digestJson(this.#plugins.get(key) ?? null)) throw new Error(`Adapter plugin identity changed: ${descriptor.id}@${descriptor.version}; restore the pinned package or migrate explicitly`);
+    const adapter = this.#generations.get(digestJson({ id: descriptor.id, version: descriptor.version, plugin: descriptor.plugin ?? null }));
+    if (!adapter) {
+      if (!this.#adapters.has(key)) throw new Error(`Adapter unavailable: ${descriptor.id}@${descriptor.version}; register the pinned version or migrate explicitly`);
+      throw new Error(`Adapter plugin identity changed: ${descriptor.id}@${descriptor.version}; restore the pinned package or migrate explicitly`);
+    }
     const validation: unknown = adapter.validate(structuredClone(descriptor.config));
     if (validation && typeof (validation as { then?: unknown }).then === "function") {
       void Promise.resolve(validation).catch(() => undefined);

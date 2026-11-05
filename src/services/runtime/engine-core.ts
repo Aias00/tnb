@@ -106,6 +106,13 @@ export class DurableRuntime {
   async submit(input: { commandId: string; objective: string; configuration: RuntimeConfiguration; mode?: ExecutionPolicy["mode"]; tasks?: TaskDefinition[]; deadline?: number; source?: RoutingInput; successorOf?: string }): Promise<{ run: DurableRun; tasks: DurableTask[] }> {
     if (this.#closed) throw new Error("Runtime is closed");
     if (this.lastError) throw new Error(`Runtime dispatch stopped: ${this.lastError}; stop and restart the owner before submitting`);
+    const requestDigest = digestJson(input, 256 * 1024);
+    const submission = this.store.record<{ requestDigest: string; command: Parameters<RuntimeCommands["createRun"]>[0] }>("submission", input.commandId)?.value;
+    if (submission?.requestDigest === requestDigest) {
+      const receipt = this.commands.replayCreateRun(submission.command);
+      if (!receipt) throw new Error("Submission receipt does not match the committed command");
+      return receipt;
+    }
     const configuration = structuredClone(input.configuration);
     if (!configuration) throw new Error("Invalid durable runtime configuration");
     configuration.strategyVersion ??= 2;
@@ -119,13 +126,20 @@ export class DurableRuntime {
       || (configuration.maxCostUsd !== undefined && (!Number.isFinite(configuration.maxCostUsd) || configuration.maxCostUsd <= 0))) throw new Error("Invalid durable runtime configuration");
     if (configuration.originSessionId !== undefined) text(configuration.originSessionId, "origin session", 128);
     if (configuration.conversationContext !== undefined) text(configuration.conversationContext, "conversation context", 16384);
-    const adapter = this.domains.resolve(this.domains.prepare(this.domains.descriptor(configuration)));
+    const previousRunId = this.store.commandRunIdHint(input.commandId);
+    const previousDomain = previousRunId ? this.store.record<RuntimeConfiguration>("configuration", previousRunId)?.value.domain : undefined;
+    const descriptor = this.domains.descriptor(configuration);
+    const replayGeneration = previousDomain?.plugin && previousDomain.id === descriptor.id && previousDomain.version === descriptor.version;
+    if (replayGeneration && !descriptor.plugin) descriptor.plugin = structuredClone(previousDomain.plugin);
+    const adapter = this.domains.resolve(this.domains.prepare(descriptor, !!replayGeneration));
     if (adapter.runtime?.normalize) await adapter.runtime.normalize(configuration, this.root);
     else if (configuration.strategyVersion !== 2 || !configuration.workspace.startsWith("agent:") || configuration.allowedWorkspaces.length !== 1
       || configuration.allowedWorkspaces[0] !== configuration.workspace || configuration.allowWrite || configuration.allowShell || configuration.checks.length) {
       throw new Error("Domain tasks use explicit resource capabilities, not coding flags");
     }
-    configuration.domain = this.domains.prepare(configuration.domain ?? this.domains.descriptor(configuration));
+    const normalizedDescriptor = configuration.domain ?? this.domains.descriptor(configuration);
+    if (replayGeneration && !input.configuration.domain?.plugin) normalizedDescriptor.plugin = structuredClone(previousDomain.plugin);
+    configuration.domain = this.domains.prepare(normalizedDescriptor, !!replayGeneration);
     if (!configuration.maxTurns || configuration.maxTurns > 2000 || configuration.maxRetries < 0 || configuration.maxRetries > 10) throw new Error("Invalid runtime limits");
     await this.#checkStorage();
     if (this.#storagePressure) throw new Error("Runtime storage limit reached; free space or prune terminal work before submitting");
@@ -138,12 +152,16 @@ export class DurableRuntime {
       deadline: input.deadline, source, successorOf: input.successorOf,
       policy: { mode, maxActiveAgents: mode === "single" ? 1 : configuration.strategyVersion === 1 || mode === "multi" ? 4 : 2,
         maxDelegationDepth: mode === "single" ? 0 : configuration.strategyVersion === 1 ? 2 : 1 } };
+    if (replayGeneration) {
+      const receipt = this.commands.replayCreateRun(command);
+      if (receipt) return receipt;
+    }
     if (!input.configuration.domain) {
       const legacy = structuredClone(command); delete legacy.configuration.domain;
       const receipt = this.commands.replayCreateRun(legacy);
       if (receipt) return receipt;
     }
-    return this.commands.createRun(command);
+    return this.commands.createRun(command, requestDigest);
   }
   configuration(runId: string, taskId?: string, originalLimits = false): RuntimeConfiguration {
     const config = this.store.record<RuntimeConfiguration>("configuration", runId)?.value;
@@ -984,7 +1002,7 @@ export class DurableRuntime {
       const workspace = override.workspace;
       if (!config.allowedWorkspaces.includes(workspace)) throw new Error("Delegation workspace is not authorized");
       if (override.domain) {
-        override.domain = this.domains.prepare(override.domain);
+        override.domain = this.domains.prepare(override.domain, true);
         if (override.domain.id !== context.descriptor.id || override.domain.version !== context.descriptor.version
           || digestJson(override.domain.plugin ?? null) !== digestJson(context.descriptor.plugin ?? null)
           || override.domain.resources.some(claim => claim.mode !== "read") || override.domain.grants.some(grant => grant.mode !== "read")) throw new Error("Child capabilities must retain the parent adapter and remain read-only");

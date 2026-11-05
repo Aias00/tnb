@@ -31,6 +31,22 @@ test("plugin provenance cannot be acquired during recovery or fall back to an in
   expect(() => new DomainRegistry([adapter]).resolve(pinned)).toThrow("identity changed");
   expect(() => validateDomainDescriptor({ ...descriptor(), plugin: null } as unknown as DomainDescriptor)).toThrow("plugin identity");
 });
+test("retained generations resolve exact pins without becoming defaults, and children can retain their parent's generation", () => {
+  const adapter: AgentDomainAdapter = { id: "fixture", version: "1", validate() {}, async snapshot() { return {}; },
+    async createWorker(): Promise<never> { throw new Error("unused"); }, async accept() { return { checks: [] }; } };
+  const current = { name: "fixture-plugin", version: "1.0.0", fingerprint: "b".repeat(64) }, old = { ...current, fingerprint: "a".repeat(64) };
+  const registry = new DomainRegistry([], [{ adapter, plugin: old, recoveryOnly: true }, { adapter, plugin: current }]);
+  expect(registry.prepare(descriptor()).plugin).toEqual(current);
+  const pinned = { ...descriptor(), plugin: old };
+  expect(registry.resolve(pinned).id).toBe("fixture");
+  expect(() => registry.prepare(pinned)).toThrow("recovery only");
+  expect(registry.prepare(pinned, true).plugin).toEqual(old);
+  const recovery = new DomainRegistry([], [{ adapter, plugin: old, recoveryOnly: true }]);
+  expect(recovery.has("fixture", "1")).toBe(false);
+  expect(() => recovery.prepare(descriptor())).toThrow("unavailable");
+  expect(recovery.resolve(pinned).id).toBe("fixture");
+  expect(() => new DomainRegistry([], [{ adapter, plugin: old }, { adapter, plugin: current }])).toThrow("Duplicate");
+});
 test("resource admission atomically allows readers, excludes writers and rolls back partial admission", async () => {
   const directoryPath = await directory(), id = randomUUID();
   const first = tryAcquireResources([{ id, mode: "read" }], directoryPath)!;

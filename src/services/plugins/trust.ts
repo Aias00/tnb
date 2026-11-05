@@ -13,6 +13,8 @@ type PluginTrustRecord = {
   root: string;
   fingerprint: string;
   trustedAt: string;
+  /** Previously explicitly approved bytes, for pinned recovery only. */
+  generations?: string[];
 };
 
 type PluginTrustDocument = {
@@ -66,10 +68,19 @@ export async function trustPlugin(storePath: string, root: string, fingerprint?:
   };
   await withFileLock(storePath, async () => {
     const document = await readTrustDocument(storePath);
-    document.plugins[canonicalRoot] = record;
+    const previous = document.plugins[canonicalRoot];
+    const generations = [...new Set([...(previous?.generations ?? []), ...(previous ? [previous.fingerprint] : []), record.fingerprint])];
+    document.plugins[canonicalRoot] = { ...record, generations };
     await writeTrustDocument(storePath, document);
   });
   return record;
+}
+
+/** Historical approval never changes the current installation's trusted/changed decision. */
+export async function pluginGenerationTrusted(storePath: string, root: string, fingerprint: string): Promise<boolean> {
+  const canonicalRoot = await realpath(root);
+  const record = (await readTrustDocument(storePath)).plugins[canonicalRoot];
+  return !!record && (record.fingerprint === fingerprint || !!record.generations?.includes(fingerprint));
 }
 
 export async function revokePluginTrust(storePath: string, root: string): Promise<boolean> {
@@ -109,7 +120,8 @@ function isTrustDocument(value: unknown): value is PluginTrustDocument {
   return Object.entries(document.plugins).every(([key, record]) => {
     if (typeof record !== "object" || record === null || Array.isArray(record)) return false;
     const candidate = record as Partial<PluginTrustRecord>;
-    return key === candidate.root && typeof candidate.fingerprint === "string" && /^[a-f0-9]{64}$/.test(candidate.fingerprint) && typeof candidate.trustedAt === "string";
+    return key === candidate.root && typeof candidate.fingerprint === "string" && /^[a-f0-9]{64}$/.test(candidate.fingerprint) && typeof candidate.trustedAt === "string"
+      && (candidate.generations === undefined || Array.isArray(candidate.generations) && candidate.generations.every(item => typeof item === "string" && /^[a-f0-9]{64}$/.test(item)));
   });
 }
 

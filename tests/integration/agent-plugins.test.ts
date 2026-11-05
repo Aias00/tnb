@@ -1,13 +1,16 @@
 import { afterEach, expect, test } from "bun:test";
-import { cp, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { Database } from "bun:sqlite";
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { spawn } from "node:child_process";
 import { openAgentRuntime, type AgentRuntimeHost } from "../../src/agent/runtime";
 import { loadAdapterPlugins } from "../../src/agent/plugins";
 import type { DomainDescriptor } from "../../src/agent/domain";
 import { loadPlugins } from "../../src/services/plugins/loader";
 import { installLocalPlugin } from "../../src/services/plugins/management";
 import { trustPlugin, computePluginTreeSha256, revokePluginTrust } from "../../src/services/plugins/trust";
+import { pluginGenerationKey, pluginGenerationReferences } from "../../src/agent/plugin-generations";
 
 const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -87,20 +90,159 @@ test("trusted installed adapter executes tools, pins provenance, waits, restarts
   expect(result.acceptance).toBe("domain-verified");
 });
 
-test("a trusted replacement with the same adapter/package versions cannot resume a pinned run; restoring bytes can", async () => {
+test("upgrading identical package/adapter versions restores the old waiting task while new roots use current bytes", async () => {
   const f = await fixture(); await trustPlugin(f.trust, f.installedRoot);
   let host = await f.open(); const { run, tasks } = await host.submit({ commandId: "create", objective: "Wait", namespace: "fixture", adapter: descriptor({ wait: true }) });
-  await until(host, () => host.store.getTask(tasks[0]!.taskId)?.status === "waiting"); await host.close();
+  await until(host, () => host.store.getTask(tasks[0]!.taskId)?.status === "waiting");
+  const originalIdentity = host.runtime.configuration(run.runId).domain!.plugin!; await host.close();
+  // Older hosts did not write the raw submission ledger. Preserve their exact command receipt too.
+  const legacy = new Database(join(f.root, "runtime", "state.sqlite"));
+  legacy.query("DELETE FROM runtime_records WHERE kind = 'submission'").run(); legacy.close();
   const entry = join(f.installedRoot, "index.mjs"), original = await readFile(entry, "utf8");
-  await writeFile(entry, original + "\n// new implementation, unchanged version\n"); await trustPlugin(f.trust, f.installedRoot);
-  host = await f.open(); expect(host.plugins.list()[0]!.status).toBe("active"); expect(host.store.getRun(run.runId)!.status).toBe("paused");
-  await expect(host.runtime.resume(run.runId)).rejects.toThrow("identity changed"); await host.close();
-  await writeFile(entry, original); await trustPlugin(f.trust, f.installedRoot);
-  host = await f.open(); await host.runtime.resume(run.runId);
+  await writeFile(entry, original.replaceAll("actual plugin fact", "updated plugin fact")); await trustPlugin(f.trust, f.installedRoot);
+  host = await f.open(); expect(host.plugins.list().map(item => [item.generation, item.status])).toEqual([["current", "active"], ["retained", "active"]]);
   expect(host.store.getRun(run.runId)!.status).toBe("active");
+  expect(host.runtime.configuration(run.runId).domain!.plugin).toEqual(originalIdentity);
+  const replay = { commandId: "create", objective: "Wait", namespace: "fixture", adapter: descriptor({ wait: true }) };
+  expect((await host.submit(replay)).run.runId).toBe(run.runId);
+  await expect(host.submit({ ...replay, objective: "Changed objective" })).rejects.toThrow("different input");
+  await expect(host.submit({ commandId: "old-root", objective: "Old", namespace: "fixture", adapter: { ...descriptor(), plugin: originalIdentity } })).rejects.toThrow("recovery only");
+  const current = await host.submit({ commandId: "new", objective: "Current", namespace: "fixture", adapter: descriptor(), mode: "single" });
+  expect(host.runtime.configuration(current.run.runId).domain!.plugin!.fingerprint).not.toBe(originalIdentity.fingerprint);
   const wait = host.runtime.waits.questions(run.runId)[0]!;
   host.runtime.waits.answer({ commandId: "answer", runId: run.runId, waitId: wait.waitId, expectedVersion: wait.version, answer: "A" });
   await until(host, () => host.store.getRun(run.runId)?.status === "succeeded");
+  await until(host, () => host.store.getRun(current.run.runId)?.status === "succeeded");
+  const oldResult = await host.runtime.artifacts.get<{ report: string }>(host.store.getTask(tasks[0]!.taskId)!.resultRef!);
+  const newResult = await host.runtime.artifacts.get<{ report: string }>(host.store.getTask(current.tasks[0]!.taskId)!.resultRef!);
+  expect(oldResult.report).toContain("actual plugin fact"); expect(newResult.report).toContain("updated plugin fact");
+  expect((await f.events()).filter(event => event === "tool")).toHaveLength(2);
+});
+
+test("history collection retains terminal Run references and task overrides, then collects only after explicit pruning", async () => {
+  const f = await fixture(); await trustPlugin(f.trust, f.installedRoot);
+  let host = await f.open(); const first = await host.submit({ commandId: "terminal", objective: "Finish", namespace: "fixture", adapter: descriptor() });
+  await until(host, () => host.store.getRun(first.run.runId)?.status === "succeeded");
+  const old = host.runtime.configuration(first.run.runId).domain!.plugin!;
+  const history = join(f.root, "runtime", "plugin-generations"), oldKey = pluginGenerationKey(old);
+  await host.close();
+  const entry = join(f.installedRoot, "index.mjs"); await writeFile(entry, await readFile(entry, "utf8") + "\n// upgrade\n"); await trustPlugin(f.trust, f.installedRoot);
+  host = await f.open(); expect(await readdir(history)).toContain(oldKey);
+  expect(host.plugins.list().find(item => item.generation === "retained")).toMatchObject({ status: "inactive", references: 1 }); // Terminal code is retained, not executed.
+  expect((await f.events()).filter(item => item === "import")).toHaveLength(2);
+  expect((await host.submit({ commandId: "terminal", objective: "Finish", namespace: "fixture", adapter: descriptor() })).run.runId).toBe(first.run.runId);
+  const current = await host.submit({ commandId: "hold-reference", objective: "Wait", namespace: "fixture", adapter: descriptor({ wait: true }) });
+  await until(host, () => host.store.getTask(current.tasks[0]!.taskId)?.status === "waiting");
+  host.store.command("override", {}, Date.now(), tx => tx.saveRecord({ kind: "task-configuration", id: current.tasks[0]!.taskId, runId: current.run.runId, taskId: current.tasks[0]!.taskId,
+    value: { domain: { ...descriptor(), plugin: old } } }, 0));
+  expect(pluginGenerationReferences(host.store).some(ref => ref.taskId === current.tasks[0]!.taskId && ref.plugin.fingerprint === old.fingerprint)).toBe(true);
+  host.store.deleteTerminalRun(first.run.runId); await host.close();
+  host = await f.open(); expect(host.plugins.list().find(item => item.generation === "retained")).toMatchObject({ status: "active", references: 1 });
+  expect(await readdir(history)).toContain(oldKey);
+  host.runtime.commands.cancelRun({ commandId: "cancel-current", runId: current.run.runId, expectedRevision: host.store.getRun(current.run.runId)!.revision });
+  await until(host, () => host.store.getRun(current.run.runId)?.status === "cancelled");
+  host.store.deleteTerminalRun(current.run.runId); await host.close();
+  host = await f.open(); expect(await readdir(history)).not.toContain(oldKey);
+});
+
+test("a failed current factory cannot make retained adapters the default or restart historical application entries", async () => {
+  const f = await fixture();
+  const manifest = { ...f.manifest, apiVersion: "tnb.host-plugin/v1", contributes: { ...f.manifest.contributes,
+    applications: [{ id: "panel", version: "1", entry: "panel.mjs" }] } };
+  await writeFile(join(f.installedRoot, "plugin.json"), JSON.stringify(manifest));
+  await writeFile(join(f.installedRoot, "panel.mjs"), `import { appendFile } from 'node:fs/promises';
+    await appendFile(${JSON.stringify(f.trace)}, 'panel-import\\n');
+    export default api => api.registerApplication({id:'panel',version:'1',start(){return {}}});`);
+  await trustPlugin(f.trust, f.installedRoot);
+  let host = await f.open(); const { run, tasks } = await host.submit({ commandId: "wait", objective: "Wait", namespace: "fixture", adapter: descriptor({ wait: true }) });
+  await until(host, () => host.store.getTask(tasks[0]!.taskId)?.status === "waiting"); await host.close();
+  await writeFile(join(f.installedRoot, "panel.mjs"), "throw new Error('current application is broken');"); await trustPlugin(f.trust, f.installedRoot);
+  host = await f.open(); expect(host.plugins.list().find(item => item.generation === "current")?.status).toBe("failed");
+  expect(host.plugins.list().find(item => item.generation === "retained")?.status).toBe("active");
+  expect(host.plugins.extensions()).toEqual([]);
+  expect((await f.events()).filter(item => item === "panel-import")).toHaveLength(1);
+  await expect(host.submit({ commandId: "fresh", objective: "Fresh", namespace: "fixture", adapter: descriptor() })).rejects.toThrow("unavailable");
+  const wait = host.runtime.waits.questions(run.runId)[0]!;
+  host.runtime.waits.answer({ commandId: "answer", runId: run.runId, waitId: wait.waitId, expectedVersion: wait.version, answer: "A" });
+  await until(host, () => host.store.getRun(run.runId)?.status === "succeeded");
+});
+
+test.skipIf(process.platform === "win32")("SIGKILL preserves referenced plugin bytes and a later upgrade recovers the same Run and question", async () => {
+  const f = await fixture(); await trustPlugin(f.trust, f.installedRoot);
+  const script = `import {openAgentRuntime} from ${JSON.stringify(new URL("../../src/agent/runtime.ts", import.meta.url).href)};
+    const h=await openAgentRuntime({directory:process.env.PLUGIN_STATE,plugins:JSON.parse(process.env.PLUGIN_OPTIONS)});
+    const {run,tasks}=await h.submit({commandId:'crash',objective:'Wait',namespace:'fixture',adapter:JSON.parse(process.env.PLUGIN_DESCRIPTOR)});
+    while(h.store.getTask(tasks[0].taskId).status!=='waiting')await Bun.sleep(10);
+    process.stdout.write(JSON.stringify({runId:run.runId,wait:h.runtime.waits.questions(run.runId)[0]})+'\\n');setInterval(()=>{},1000);`;
+  const child = spawn(process.execPath, ["-e", script], { env: { ...process.env, PLUGIN_STATE: join(f.root, "runtime"), PLUGIN_OPTIONS: JSON.stringify(f.options), PLUGIN_DESCRIPTOR: JSON.stringify(descriptor({ wait: true })) }, stdio: ["ignore", "pipe", "pipe"] });
+  const exited = new Promise<void>(resolve => child.once("close", () => resolve()));
+  let stderr = ""; child.stderr.on("data", chunk => { stderr += chunk; });
+  try {
+    const ready = await new Promise<{ runId: string; wait: { waitId: string; version: number } }>((resolve, reject) => {
+      let output = ""; const timer = setTimeout(() => reject(new Error(`Child not ready: ${stderr}`)), 10000);
+      child.stdout.on("data", chunk => { output += chunk; if (output.includes("\n")) { clearTimeout(timer); resolve(JSON.parse(output.split("\n")[0]!)); } });
+      child.once("error", error => { clearTimeout(timer); reject(error); });
+      child.once("exit", () => { clearTimeout(timer); reject(new Error(`Child exited: ${stderr}`)); });
+    });
+    child.kill("SIGKILL"); await exited;
+    // The killed owner cannot renew; advance its heartbeat past the production stale threshold.
+    const expired = new Date(Date.now() - 60000); await utimes(join(f.root, "runtime.lock"), expired, expired);
+    const entry = join(f.installedRoot, "index.mjs"); await writeFile(entry, await readFile(entry, "utf8") + "\n// upgrade after crash\n"); await trustPlugin(f.trust, f.installedRoot);
+    const orphan = join(f.root, "runtime", "plugin-generations", ".stage-orphan"); await mkdir(orphan);
+    const host = await f.open(); expect(host.store.runs()).toHaveLength(1);
+    expect(host.runtime.waits.questions(ready.runId)[0]!.waitId).toBe(ready.wait.waitId);
+    expect(host.plugins.list().find(item => item.generation === "retained")?.status).toBe("active");
+    expect(await readdir(join(f.root, "runtime", "plugin-generations"))).not.toContain(".stage-orphan");
+    host.runtime.waits.answer({ commandId: "answer", runId: ready.runId, waitId: ready.wait.waitId, expectedVersion: ready.wait.version, answer: "A" });
+    await until(host, () => host.store.getRun(ready.runId)?.status === "succeeded");
+    expect((await f.events()).filter(item => item === "tool")).toHaveLength(1);
+  } finally { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await exited; }
+});
+
+test("revocation followed by trusting only the new installation does not resurrect the old generation", async () => {
+  const f = await fixture(); await trustPlugin(f.trust, f.installedRoot);
+  let host = await f.open(); const { run, tasks } = await host.submit({ commandId: "wait", objective: "Wait", namespace: "fixture", adapter: descriptor({ wait: true }) });
+  await until(host, () => host.store.getTask(tasks[0]!.taskId)?.status === "waiting"); await host.close();
+  await revokePluginTrust(f.trust, f.installedRoot);
+  const entry = join(f.installedRoot, "index.mjs"); await writeFile(entry, await readFile(entry, "utf8") + "\n// new approved bytes\n"); await trustPlugin(f.trust, f.installedRoot);
+  const imports = (await f.events()).filter(item => item === "import").length;
+  host = await f.open(); expect(host.store.getRun(run.runId)?.status).toBe("paused");
+  expect(host.plugins.list().find(item => item.generation === "retained")?.error).toContain("no longer trusted");
+  expect((await f.events()).filter(item => item === "import")).toHaveLength(imports + 1);
+});
+
+test("disabled, removed, and changed unapproved current installations cannot activate retained code", async () => {
+  for (const mode of ["disabled", "removed", "changed"] as const) {
+    const f = await fixture(); await trustPlugin(f.trust, f.installedRoot);
+    let host = await f.open(); const { run, tasks } = await host.submit({ commandId: "wait", objective: "Wait", namespace: "fixture", adapter: descriptor({ wait: true }) });
+    await until(host, () => host.store.getTask(tasks[0]!.taskId)?.status === "waiting"); await host.close();
+    if (mode === "removed") await rm(f.installedRoot, { recursive: true });
+    else await writeFile(join(f.installedRoot, "extra"), "new bytes");
+    const imports = (await f.events()).filter(item => item === "import").length;
+    host = await openAgentRuntime({ directory: join(f.root, "runtime"), plugins: { ...f.options, ...(mode === "disabled" ? { enabled: { "fixture-plugin": false } } : {}) } });
+    cleanup.push(() => host.close());
+    expect(host.store.getRun(run.runId)?.status).toBe("paused");
+    expect(host.plugins.list().find(item => item.generation === "retained")?.status).toBe("blocked");
+    expect((await f.events()).filter(item => item === "import")).toHaveLength(imports);
+    await host.close();
+  }
+});
+
+test("corrupted or missing retained packages block recovery without executing their bytes", async () => {
+  for (const mode of ["corrupted", "missing"] as const) {
+    const f = await fixture(); await trustPlugin(f.trust, f.installedRoot);
+    let host = await f.open(); const { run, tasks } = await host.submit({ commandId: "wait", objective: "Wait", namespace: "fixture", adapter: descriptor({ wait: true }) });
+    await until(host, () => host.store.getTask(tasks[0]!.taskId)?.status === "waiting");
+    const old = host.runtime.configuration(run.runId).domain!.plugin!; await host.close();
+    const archived = join(f.root, "runtime", "plugin-generations", pluginGenerationKey(old));
+    if (mode === "missing") await rm(archived, { recursive: true });
+    else await writeFile(join(archived, "package", "index.mjs"), "throw new Error('must never execute');");
+    const entry = join(f.installedRoot, "index.mjs"); await writeFile(entry, await readFile(entry, "utf8") + "\n// current\n"); await trustPlugin(f.trust, f.installedRoot);
+    host = await f.open(); expect(host.plugins.list()[0]?.status).toBe("active");
+    expect(host.plugins.list().find(item => item.generation === "retained")?.status).toBe("blocked");
+    expect(host.store.getRun(run.runId)?.status).toBe("paused");
+    await expect(host.runtime.resume(run.runId)).rejects.toThrow("identity changed");
+  }
 });
 
 test("shutdown drains workers before disposers, concurrent close is shared and ownership lasts through cleanup", async () => {

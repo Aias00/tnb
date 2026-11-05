@@ -11,7 +11,7 @@ export type TaskDefinition = { key: string; objective: string; inputDigest: stri
 type Command = { commandId: string; source?: RoutingInput };
 type TaskCommand = Command & { taskId: string; expectedRevision: number };
 type RunCommand = Command & { runId: string; expectedRevision: number };
-type CreateRunInput = Command & { objective: string; tasks?: TaskDefinition[]; policy?: Partial<ExecutionPolicy>; deadline?: number; configuration?: unknown; source?: RoutingInput; successorOf?: string };
+export type CreateRunInput = Command & { objective: string; tasks?: TaskDefinition[]; policy?: Partial<ExecutionPolicy>; deadline?: number; configuration?: unknown; source?: RoutingInput; successorOf?: string };
 
 /** Trusted in-process business commands; the owner supplies authenticated IPC and execution. */
 export class RuntimeCommands {
@@ -20,7 +20,7 @@ export class RuntimeCommands {
   replayCreateRun(input: CreateRunInput): { run: DurableRun; tasks: DurableTask[] } | undefined {
     return this.store.replayCommand(input.commandId, { kind: "run.create", input });
   }
-  createRun(input: CreateRunInput): { run: DurableRun; tasks: DurableTask[] } {
+  createRun(input: CreateRunInput, requestDigest?: string): { run: DurableRun; tasks: DurableTask[] } {
     return this.#command(input, "run.create", (tx) => {
       text(input.objective, "run objective");
       if (input.deadline !== undefined) integer(input.deadline, "run deadline", tx.now + 1);
@@ -31,6 +31,7 @@ export class RuntimeCommands {
         createdAt: tx.now, updatedAt: tx.now, deadline: input.deadline ?? tx.now + 24 * 60 * 60_000 };
       tx.insertRun(run);
       if (input.configuration !== undefined) tx.saveRecord({ kind: "configuration", id: run.runId, runId: run.runId, value: input.configuration }, 0);
+      if (requestDigest) tx.saveRecord({ kind: "submission", id: input.commandId, runId: run.runId, value: { requestDigest, command: input } }, 0);
       tx.event(run.runId, "run.created", run);
       const ids = new Map(definitions.map((definition) => [definition.key, randomUUID()]));
       const tasks: DurableTask[] = definitions.map((definition) => ({

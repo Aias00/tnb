@@ -119,7 +119,7 @@ test("a legacy coding candidate without domain metadata retains its task, snapsh
   expect(host.store.runs()).toHaveLength(1);
 });
 
-test("a bundled installed coding package uses the ordinary trust loader and real model/read transport", async () => {
+test("a bundled installed coding package preserves real read receipts and question identity across an upgrade", async () => {
   const f = await fixture(), source = join(f.root, "package"), plugins = join(f.root, "plugins"); await mkdir(source);
   const bundle = await Bun.build({ entrypoints: [fileURLToPath(new URL("../../src/adapters/coding/plugin.ts", import.meta.url))], target: "bun", outdir: source, naming: "index.mjs" });
   expect(bundle.success).toBe(true);
@@ -131,10 +131,12 @@ test("a bundled installed coding package uses the ordinary trust loader and real
     const body = await request.json() as { tools: Array<{ function: { name: string } }>; messages: unknown[] };
     expect(body.tools.some(tool => ["write", "edit", "bash"].includes(tool.function.name))).toBe(false);
     expect(body.tools.some(tool => tool.function.name === "skill")).toBe(true);
-    const first = ++requests === 1;
+    const step = ++requests, first = step === 1;
     if (!first) expect(JSON.stringify(body.messages)).toContain("actual workspace evidence");
-    const delta = first ? { tool_calls: [{ index: 0, id: "read-file", type: "function", function: { name: "read", arguments: JSON.stringify({ path: "source.txt" }) } }] } : { content: "Verified actual workspace evidence" };
-    const events = [{ choices: [{ index: 0, delta, finish_reason: null }] }, { choices: [{ index: 0, delta: {}, finish_reason: first ? "tool_calls" : "stop" }], usage: { prompt_tokens: 2, completion_tokens: 2, total_tokens: 4 } }];
+    const delta = first ? { tool_calls: [{ index: 0, id: "read-file", type: "function", function: { name: "read", arguments: JSON.stringify({ path: "source.txt" }) } }] }
+      : step === 2 ? { tool_calls: [{ index: 0, id: "question", type: "function", function: { name: "durable_wait", arguments: JSON.stringify({ kind: "question", key: "continue", question: "Continue?", options: ["A", "B"], about: "Read evidence; waiting for a decision before the final report" }) } }] }
+      : { content: "Verified actual workspace evidence" };
+    const events = [{ choices: [{ index: 0, delta, finish_reason: null }] }, { choices: [{ index: 0, delta: {}, finish_reason: step <= 2 ? "tool_calls" : "stop" }], usage: { prompt_tokens: 2, completion_tokens: 2, total_tokens: 4 } }];
     return new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
   } }); cleanup.push(() => model.stop(true));
   await writeFile(join(f.configDir, "models.json"), JSON.stringify({ providers: { fixture: { api: "openai-completions", baseUrl: `${model.url}v1`, models: [{ id: "fixture", maxTokens: 1024 }] } } }));
@@ -144,10 +146,21 @@ test("a bundled installed coding package uses the ordinary trust loader and real
     configuration: { "tnb-coding": { configDir: f.configDir, env: f.env } } } };
   const host = await openAgentRuntime(options); cleanup.push(() => host.close());
   const input = { commandId: "installed", namespace: "coding", objective: "Read source.txt", adapter: await codingTask({ ...config(f), provider: "fixture", model: "fixture", skills: ["inspect"] }), mode: "single" as const };
-  const { run } = await host.submit(input); await until(host, () => host.store.getRun(run.runId)?.status === "succeeded");
+  const { run, tasks } = await host.submit(input); await until(host, () => host.store.getTask(tasks[0]!.taskId)?.status === "waiting");
+  const wait = host.runtime.waits.questions(run.runId)[0]!, originalPlugin = host.runtime.configuration(run.runId).domain!.plugin!;
   expect(host.plugins.list()[0]!.root).toBe(installed.root); expect(requests).toBe(2); await host.close();
+  await writeFile(join(installed.root, "index.mjs"), await readFile(join(installed.root, "index.mjs"), "utf8") + "\n// installed package upgrade\n");
+  await trustPlugin(join(f.configDir, "trust.json"), installed.root);
   const reopened = await openAgentRuntime(options); cleanup.push(() => reopened.close());
   expect((await reopened.submit(input)).run.runId).toBe(run.runId); expect(requests).toBe(2);
+  expect(reopened.plugins.list().find(item => item.generation === "retained")?.status).toBe("active");
+  expect(reopened.runtime.configuration(run.runId).domain!.plugin).toEqual(originalPlugin);
+  expect(reopened.runtime.waits.questions(run.runId)[0]!.waitId).toBe(wait.waitId);
+  reopened.runtime.waits.answer({ commandId: "answer-installed", runId: run.runId, waitId: wait.waitId, expectedVersion: wait.version, answer: "A" });
+  await until(reopened, () => reopened.store.getRun(run.runId)?.status === "succeeded"); expect(requests).toBe(3); await reopened.close();
+  const terminal = await openAgentRuntime(options); cleanup.push(() => terminal.close());
+  expect(terminal.plugins.list().find(item => item.generation === "retained")?.status).toBe("inactive");
+  expect((await terminal.submit(input)).run.runId).toBe(run.runId); expect(requests).toBe(3);
 });
 
 test("the public durable engine has no dependency on coding tools, model configuration or sandbox composition", async () => {

@@ -3,10 +3,11 @@ import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { loadPlugins, assertPluginContributionPath, type LoadedPlugin } from "../services/plugins/loader";
-import { computePluginTreeSha256, pluginTrustState } from "../services/plugins/trust";
+import { computePluginTreeSha256, pluginGenerationTrusted, pluginTrustState } from "../services/plugins/trust";
 import { ExtensionHost } from "./extension-host";
 import type { ExtensionDeclaration, ExtensionRegistration, PluginApplication, PluginInterface, PluginChannel, ExtensionState } from "./extensions";
 import { bindDomainAdapter, DomainRegistry, type AgentDomainAdapter, type AdapterPluginIdentity, type PluginAdapterRegistration } from "./domain";
+import { collectPluginGenerations, pluginGenerationKey, readRetainedPlugin, retainPluginGeneration, type PluginGenerationReference } from "./plugin-generations";
 
 /** Trusted in-process code. This API does not confer sandbox isolation. */
 export type AdapterPluginAPI = {
@@ -33,6 +34,8 @@ export type AgentPluginOptions = {
   trustStorePath: string;
   builtins?: readonly (BuiltinAdapterPlugin | BuiltinHostPlugin)[];
   configuration?: Record<string, unknown>;
+  /** Complete host-owned inventory; omitted means historical collection is disabled. */
+  generationReferences?: readonly PluginGenerationReference[];
 };
 export type AdapterPluginState = {
   name: string;
@@ -44,9 +47,11 @@ export type AdapterPluginState = {
   status: "inactive" | "blocked" | "loading" | "active" | "failed" | "draining" | "stopped";
   error?: string;
   contributions?: ExtensionState[];
+  generation?: "current" | "retained";
+  references?: number;
 };
 
-/** One immutable generation per host lifetime. Installation, trust and compatibility use the existing plugin services. */
+/** Immutable implementations per host lifetime; pinned installed domains may retain older generations. */
 export async function loadHostPlugins(options: AgentPluginOptions, inline: readonly AgentDomainAdapter[] = [], snapshotRoot?: string) {
   if (!options.trustStorePath?.trim()) throw new Error("Adapter plugins require a trust store");
   // The host supplies a private directory only after acquiring its owner lock.
@@ -59,11 +64,14 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
   // Detect invalid host registrations before executing any plugin code.
   new DomainRegistry(inline);
   const stateDirectory = snapshotRoot ? resolve(snapshotRoot, "..") : undefined;
+  const historyRoot = stateDirectory ? join(stateDirectory, "plugin-generations") : undefined;
+  const references = options.generationReferences ?? [];
+  const referenceCount = (identity: AdapterPluginIdentity) => references.filter(ref => pluginGenerationKey(ref.plugin) === pluginGenerationKey(identity)).length;
   for (const builtin of options.builtins ?? []) {
     // An explicitly installed package owns this name even if blocked or failed; never fall back past its trust decision.
     if (discovered.plugins.some(plugin => plugin.name.toLowerCase() === builtin.identity.name.toLowerCase()) || discovered.errors.some(error => basename(error.path).toLowerCase() === builtin.identity.name.toLowerCase())) continue;
     const identity = Object.freeze({ ...builtin.identity });
-    const state: AdapterPluginState = { ...identity, root: `builtin:${identity.name}`, enabled: options.enabled?.[identity.name] !== false && options.enabled?.[identity.name.toLowerCase()] !== false, trust: "trusted", status: "loading" };
+    const state: AdapterPluginState = { ...identity, generation: "current", references: referenceCount(identity), root: `builtin:${identity.name}`, enabled: options.enabled?.[identity.name] !== false && options.enabled?.[identity.name.toLowerCase()] !== false, trust: "trusted", status: "loading" };
     states.push(state);
     if (!state.enabled) { state.status = "inactive"; continue; }
     const callbacks: Array<() => void | Promise<void>> = [];
@@ -79,11 +87,31 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
       try { await disposeCallbacks(callbacks); } catch (cleanup) { state.error += `; ${String(cleanup)}`; }
     }
   }
-  for (const plugin of discovered.plugins) {
+  const candidates: Array<{ plugin: LoadedPlugin; recoveryOnly?: boolean; origin?: string }> = discovered.plugins.map(plugin => ({ plugin }));
+  const retainedStates: AdapterPluginState[] = [];
+  if (historyRoot) for (const identity of new Map(references.map(ref => [pluginGenerationKey(ref.plugin), ref.plugin])).values()) {
+    if (discovered.plugins.some(plugin => plugin.name === identity.name && plugin.version === identity.version && plugin.fingerprint === identity.fingerprint)
+      || states.some(state => state.name === identity.name && state.version === identity.version && state.fingerprint === identity.fingerprint)) continue;
+    const state: AdapterPluginState = { ...identity, generation: "retained", references: referenceCount(identity), root: join(historyRoot, pluginGenerationKey(identity)), enabled: false, trust: "untrusted", status: "blocked" };
+    try {
+      const installed = discovered.plugins.find(plugin => plugin.name === identity.name);
+      if (!installed || !installed.active) throw new Error("Historical recovery requires the original plugin installation to remain enabled and trusted");
+      if (!await pluginGenerationTrusted(options.trustStorePath, installed.root, identity.fingerprint)) throw new Error("Retained plugin generation is no longer trusted");
+      const retained = await readRetainedPlugin(historyRoot, identity);
+      if (retained.origin !== installed.root) throw new Error("Retained plugin installation origin changed");
+      if (!references.some(ref => ref.load && pluginGenerationKey(ref.plugin) === pluginGenerationKey(identity))) {
+        retainedStates.push({ ...state, root: retained.plugin.root, enabled: true, trust: "trusted", status: "inactive" });
+        continue;
+      }
+      candidates.push({ plugin: { ...retained.plugin, trust: "trusted", explicitlyEnabled: true }, recoveryOnly: true, origin: installed.root });
+    } catch (error) { state.error = String(error); retainedStates.push(state); }
+  }
+  for (const { plugin, recoveryOnly, origin } of candidates) {
     if (!plugin.adapterContributions?.length && !plugin.extensionContributions?.length) continue;
     const enabled = options.enabled?.[plugin.name] !== false && options.enabled?.[plugin.name.toLowerCase()] !== false
       && (plugin.lifecycle.activation === "auto" || plugin.explicitlyEnabled);
     const state: AdapterPluginState = { name: plugin.name, version: plugin.version, fingerprint: plugin.fingerprint, root: plugin.root,
+      generation: recoveryOnly ? "retained" : "current", references: referenceCount({ name: plugin.name, version: plugin.version!, fingerprint: plugin.fingerprint! }),
       enabled, trust: plugin.trust, status: !enabled ? "inactive" : plugin.trust !== "trusted" ? "blocked" : "loading" };
     states.push(state);
     if (state.status !== "loading") continue;
@@ -97,8 +125,11 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
     };
     try {
       const fingerprint = plugin.fingerprint!;
+      const authorized = async () => recoveryOnly ? await pluginGenerationTrusted(options.trustStorePath, origin!, fingerprint)
+        && await pluginTrustState(options.trustStorePath, origin!, await computePluginTreeSha256(origin!)) === "trusted"
+        : await pluginTrustState(options.trustStorePath, plugin.root, fingerprint) === "trusted";
       if (await computePluginTreeSha256(plugin.root) !== fingerprint
-        || await pluginTrustState(options.trustStorePath, plugin.root, fingerprint) !== "trusted") throw new Error("Plugin trust/content changed before activation");
+        || !await authorized()) throw new Error("Plugin trust/content changed before activation");
       // Load a verified private copy, so edits or uninstall cannot change deferred module reads in this generation.
       snapshot = await mkdtemp(join(snapshotRoot ?? tmpdir(), "tnb-adapter-"));
       const copyTarget = join(snapshot, "package");
@@ -115,16 +146,21 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
         byEntry.set(key, [...(byEntry.get(key) ?? []), contribution]);
       }
       for (const [entry, expected] of byEntry) {
+        if (recoveryOnly && !expected.some(item => item.kind === "adapter")) continue;
         const path = await assertPluginContributionPath({ ...plugin, root: target }, entry);
         const loaded: { default?: unknown } = await import(pathToFileURL(path).href);
         if (typeof loaded.default !== "function") throw new Error("Adapter module must export a default factory");
         const entryResult = await initializeEntry(loaded.default as HostPluginFactory, expected, identity, callbacks, stateDirectory, options.configuration?.[plugin.name]);
-        staged.push(...entryResult.adapters); stagedExtensions.push(...entryResult.extensions);
+        staged.push(...entryResult.adapters.map(registration => ({ ...registration, ...(recoveryOnly ? { recoveryOnly: true } : {}) })));
+        if (!recoveryOnly) stagedExtensions.push(...entryResult.extensions);
       }
       if (await computePluginTreeSha256(target) !== fingerprint
-        || await pluginTrustState(options.trustStorePath, plugin.root, fingerprint) !== "trusted") throw new Error("Plugin content/trust changed during activation");
+        || !await authorized()) throw new Error("Plugin content/trust changed during activation");
+      if (recoveryOnly && references.filter(ref => ref.load && pluginGenerationKey(ref.plugin) === pluginGenerationKey(identity))
+        .some(ref => !staged.some(row => row.adapter.id === ref.adapter.id && row.adapter.version === ref.adapter.version))) throw new Error("Retained plugin does not provide the pinned adapter");
       new DomainRegistry(inline, [...registrations, ...staged]);
       new ExtensionHost([...extensionRegistrations, ...stagedExtensions], registrations, stateDirectory);
+      if (!recoveryOnly && historyRoot && staged.length) await retainPluginGeneration(historyRoot, identity, plugin.root, target);
       registrations.push(...staged); extensionRegistrations.push(...stagedExtensions); // Commit only after all entries and identities validate.
       state.status = "active";
       generations.push({ state, dispose });
@@ -134,11 +170,18 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
       try { await dispose(); } catch (cleanup) { state.error += `; ${String(cleanup)}`; }
     }
   }
+  states.push(...retainedStates);
+  if (historyRoot && options.generationReferences) {
+    const keep = new Set(references.map(ref => pluginGenerationKey(ref.plugin)));
+    for (const state of states) if (state.generation === "current" && state.version && state.fingerprint) keep.add(pluginGenerationKey({ name: state.name, version: state.version, fingerprint: state.fingerprint }));
+    try { await collectPluginGenerations(historyRoot, keep); }
+    catch (error) { states.push({ name: "plugin-generations", root: historyRoot, enabled: false, trust: "untrusted", status: "failed", error: `Historical collection failed: ${String(error)}` }); }
+  }
   const extensions = new ExtensionHost(extensionRegistrations, [...registrations, ...inline.map(adapter => ({ adapter }))], stateDirectory);
   let closing: Promise<void> | undefined;
   return { registrations, extensions,
     list: () => structuredClone(states.map(state => {
-      const contributions = extensions.list().filter(contribution => contribution.plugin.name === state.name);
+      const contributions = extensions.list().filter(contribution => contribution.plugin.name === state.name && contribution.plugin.fingerprint === state.fingerprint);
       return contributions.length ? { ...state, contributions } : state;
     })),
     close() {
