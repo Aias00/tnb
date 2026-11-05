@@ -6,11 +6,12 @@ import { workspaceManifest } from "./snapshot";
 
 export const codingDomain = {
   async normalize(configuration: RuntimeConfiguration, stateRoot: string) {
+    const controlRoot = await realpath(resolve(stateRoot, ".."));
     configuration.workspace = await realpath(configuration.workspace);
     configuration.allowedWorkspaces = await Promise.all(configuration.allowedWorkspaces.map(path => realpath(path)));
     if (!configuration.allowedWorkspaces.includes(configuration.workspace)) configuration.allowedWorkspaces.push(configuration.workspace);
     for (const workspace of configuration.allowedWorkspaces) {
-      if (contains(workspace, resolve(stateRoot, "..")) || contains(resolve(stateRoot, ".."), workspace)) throw new Error("Workspace must be separate from runtime control state");
+      if (contains(workspace, controlRoot) || contains(controlRoot, workspace)) throw new Error("Workspace must be separate from runtime control state");
     }
     if (configuration.allowWrite && !configuration.checks.length) throw new Error("Coding tasks require explicit replay-safe verification commands");
     if (configuration.allowShell && !configuration.allowWrite) throw new Error("Shell execution requires explicit write authority");

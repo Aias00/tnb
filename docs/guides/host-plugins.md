@@ -59,7 +59,7 @@ tnb runtime plugins
 
 默认产品 profile 在一个宿主内组合 `tnb-coding`、`tnb-channels`、`tnb-collaboration`、`tnb-web`。这些包也在构建产物的 dist/plugins 下提供可安装包，运行中的内置版本和安装版本走相同注册与生命周期。停用协作插件不会删除工单、通知或原 Run。
 
-已安装领域包另支持历史可执行代际留存：新任务使用当前实现，旧任务按原指纹恢复；inventory 显示 current/retained 和引用数。历史加载仍受安装、启用、信任与兼容性约束，不能成为默认回退。终态任务也保留引用，明确 prune 后才在后续启动回收。详见 [历史插件代际](plugin-generations.md)；内置 factory 和历史应用/渠道不在此恢复范围。
+领域包支持历史可执行代际留存：新任务使用当前实现，旧任务按原指纹恢复；inventory 显示 current/retained 和引用数。安装包受安装、启用、信任和兼容性约束；默认 Coding 使用嵌入代码包与宿主私有批准。终态任务也保留引用，明确 prune 后才在后续启动回收。详见 [安装包代际](plugin-generations.md) 和 [默认 Coding 代际](builtin-generations.md)；自定义 inline factory 和历史应用/渠道不在此恢复范围。
 
 ## 服务、状态和依赖
 

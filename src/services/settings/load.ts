@@ -20,6 +20,7 @@ export type TnbSettings = {
   autoMemoryDirectory?: string;
   enabledPlugins?: Record<string, boolean>;
   pluginServices?: Record<string, string[]>;
+  blockedPluginFingerprints?: string[];
   general?: { vimMode?: boolean; editor?: string };
   ui?: { theme?: "magenta" | "cyan" | "blue" | "green" };
   permissions?: PermissionRules & {
@@ -147,6 +148,11 @@ function validateSettings(value: unknown, path: string): TnbSettings {
     if (Object.keys(services).some(name => !/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(name)) || Object.values(services).some(value => !Array.isArray(value) || value.length > 32 || new Set(value).size !== value.length || value.some(name => typeof name !== "string" || !/^[A-Za-z0-9][A-Za-z0-9.:/_-]{0,127}$/.test(name)))) throw new Error(`Invalid plugin service grants: ${path}`);
     result.pluginServices = services as Record<string, string[]>;
   }
+  if (root.blockedPluginFingerprints !== undefined) {
+    if (!Array.isArray(root.blockedPluginFingerprints) || root.blockedPluginFingerprints.length > 4096
+      || root.blockedPluginFingerprints.some(value => typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value))) throw new Error(`blockedPluginFingerprints must contain SHA256 fingerprints: ${path}`);
+    result.blockedPluginFingerprints = [...new Set(root.blockedPluginFingerprints)];
+  }
   if (root.general !== undefined) {
     const general = requireObject(root.general, `general must be an object: ${path}`);
     const parsed: NonNullable<TnbSettings["general"]> = {};
@@ -272,6 +278,7 @@ function mergeSettings(
       ? { enabledPlugins: { ...earlier.enabledPlugins, ...later.enabledPlugins } }
       : {}),
     ...(earlier.pluginServices || later.pluginServices ? { pluginServices: { ...earlier.pluginServices, ...later.pluginServices } } : {}),
+    ...(earlier.blockedPluginFingerprints || later.blockedPluginFingerprints ? { blockedPluginFingerprints: [...new Set([...(earlier.blockedPluginFingerprints ?? []), ...(later.blockedPluginFingerprints ?? [])])] } : {}),
     ...(earlier.general || later.general ? { general: { ...earlier.general, ...later.general } } : {}),
     ...(earlier.ui || later.ui ? { ui: { ...earlier.ui, ...later.ui } } : {}),
     ...(permissions ? { permissions } : {}),

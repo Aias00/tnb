@@ -6032,7 +6032,7 @@ if (import.meta.main) {
   if (isUnknownCliCommand(argv)) {
     process.stderr.write(`tnb: Unknown command '${argv[0]}'. Run tnb --help for CLI commands; /commands such as /diff are entered inside tnb.\n`);
     process.exitCode = 1;
-  } else if (argv.includes("--version") || argv.includes("-V")) {
+  } else if (argv[0] === "--version" || argv[0] === "-V") {
     process.stdout.write(`${packageJson.version}\n`);
   } else if (argv[0] === "collaboration") {
     const { runCollaborationCommand } = await import("./collaboration");

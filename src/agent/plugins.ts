@@ -8,6 +8,8 @@ import { ExtensionHost } from "./extension-host";
 import type { ExtensionDeclaration, ExtensionRegistration, PluginApplication, PluginInterface, PluginChannel, ExtensionState } from "./extensions";
 import { bindDomainAdapter, DomainRegistry, type AgentDomainAdapter, type AdapterPluginIdentity, type PluginAdapterRegistration } from "./domain";
 import { collectPluginGenerations, pluginGenerationKey, readRetainedPlugin, retainPluginGeneration, type PluginGenerationReference } from "./plugin-generations";
+import { unpackPlugin, type PackedPlugin } from "./packed-plugin";
+import type { BuiltinGenerationAuthority } from "./builtin-generations";
 
 /** Trusted in-process code. This API does not confer sandbox isolation. */
 export type AdapterPluginAPI = {
@@ -24,9 +26,9 @@ export type HostPluginAPI = AdapterPluginAPI & {
   registerChannel(channel: PluginChannel): void;
 };
 export type HostPluginFactory = (api: HostPluginAPI) => void | Promise<void>;
-export type BuiltinHostPlugin = { identity: AdapterPluginIdentity; adapters?: Array<{ id: string; version: string }>; extensions?: ExtensionDeclaration[]; setup: HostPluginFactory };
+export type BuiltinHostPlugin = { identity: AdapterPluginIdentity; adapters?: Array<{ id: string; version: string }>; extensions?: ExtensionDeclaration[]; setup: HostPluginFactory; package?: PackedPlugin; configuration?: unknown };
 export type AdapterPluginFactory = (api: AdapterPluginAPI) => void | Promise<void>;
-export type BuiltinAdapterPlugin = { identity: AdapterPluginIdentity; adapters: Array<{ id: string; version: string }>; setup: AdapterPluginFactory };
+export type BuiltinAdapterPlugin = { identity: AdapterPluginIdentity; adapters: Array<{ id: string; version: string }>; setup: AdapterPluginFactory; package?: PackedPlugin; configuration?: unknown };
 export type AgentPluginOptions = {
   roots: Array<{ directory: string; source: LoadedPlugin["source"] }>;
   enabled?: Record<string, boolean>;
@@ -36,6 +38,9 @@ export type AgentPluginOptions = {
   configuration?: Record<string, unknown>;
   /** Complete host-owned inventory; omitted means historical collection is disabled. */
   generationReferences?: readonly PluginGenerationReference[];
+  /** Owner-held host approval table. Never exposed through the plugin API. */
+  builtinAuthority?: BuiltinGenerationAuthority;
+  blockedFingerprints?: readonly string[];
 };
 export type AdapterPluginState = {
   name: string;
@@ -67,6 +72,9 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
   const historyRoot = stateDirectory ? join(stateDirectory, "plugin-generations") : undefined;
   const references = options.generationReferences ?? [];
   const referenceCount = (identity: AdapterPluginIdentity) => references.filter(ref => pluginGenerationKey(ref.plugin) === pluginGenerationKey(identity)).length;
+  const blocked = (fingerprint: string) => options.blockedFingerprints?.includes(fingerprint) === true;
+  type Candidate = { plugin: LoadedPlugin; recoveryOnly?: boolean; origin?: string; builtin?: boolean; state?: AdapterPluginState; sourceSnapshot?: string; configuration?: unknown };
+  const candidates: Candidate[] = [];
   for (const builtin of options.builtins ?? []) {
     // An explicitly installed package owns this name even if blocked or failed; never fall back past its trust decision.
     if (discovered.plugins.some(plugin => plugin.name.toLowerCase() === builtin.identity.name.toLowerCase()) || discovered.errors.some(error => basename(error.path).toLowerCase() === builtin.identity.name.toLowerCase())) continue;
@@ -74,10 +82,29 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
     const state: AdapterPluginState = { ...identity, generation: "current", references: referenceCount(identity), root: `builtin:${identity.name}`, enabled: options.enabled?.[identity.name] !== false && options.enabled?.[identity.name.toLowerCase()] !== false, trust: "trusted", status: "loading" };
     states.push(state);
     if (!state.enabled) { state.status = "inactive"; continue; }
+    if (blocked(identity.fingerprint)) { state.status = "blocked"; state.error = "Plugin fingerprint is blocked by host policy"; continue; }
+    if (builtin.package) {
+      let sourceSnapshot: string | undefined;
+      try {
+        if (!historyRoot || !options.builtinAuthority) throw new Error("Packaged builtin requires a private history root and host approval authority");
+        if (builtin.package.fingerprint !== identity.fingerprint) throw new Error("Builtin package identity does not match its bytes");
+        sourceSnapshot = await mkdtemp(join(snapshotRoot!, "tnb-builtin-"));
+        await unpackPlugin(builtin.package, join(sourceSnapshot, "package"));
+        const loaded = await loadPlugins([{ directory: sourceSnapshot, source: "user" }]);
+        const plugin = loaded.plugins[0];
+        if (!plugin || plugin.name !== identity.name || plugin.version !== identity.version || plugin.extensionContributions?.length
+          || JSON.stringify(plugin.adapterContributions?.map(({ id, version }) => ({ id, version }))) !== JSON.stringify(builtin.adapters)) throw new Error(loaded.errors[0]?.error ?? "Builtin package declarations do not match its host registration");
+        candidates.push({ plugin: { ...plugin, trust: "trusted", fingerprint: identity.fingerprint }, builtin: true, state, sourceSnapshot, configuration: builtin.configuration });
+      } catch (error) {
+        state.status = "failed"; state.error = String(error);
+        if (sourceSnapshot) { try { await rm(sourceSnapshot, { recursive: true, force: true }); } catch (cleanup) { state.error += `; ${String(cleanup)}`; } }
+      }
+      continue;
+    }
     const callbacks: Array<() => void | Promise<void>> = [];
     try {
       const declarations: EntryDeclaration[] = [...(builtin.adapters ?? []).map(adapter => ({ ...adapter, kind: "adapter" as const })), ...("extensions" in builtin ? builtin.extensions ?? [] : [])];
-      const staged = await initializeEntry(builtin.setup, declarations, identity, callbacks, stateDirectory, options.configuration?.[identity.name]);
+      const staged = await initializeEntry(builtin.setup, declarations, identity, callbacks, stateDirectory, options.configuration?.[identity.name] ?? builtin.configuration);
       new DomainRegistry(inline, [...registrations, ...staged.adapters]);
       new ExtensionHost([...extensionRegistrations, ...staged.extensions], registrations, stateDirectory);
       registrations.push(...staged.adapters); extensionRegistrations.push(...staged.extensions); state.status = "active";
@@ -87,33 +114,44 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
       try { await disposeCallbacks(callbacks); } catch (cleanup) { state.error += `; ${String(cleanup)}`; }
     }
   }
-  const candidates: Array<{ plugin: LoadedPlugin; recoveryOnly?: boolean; origin?: string }> = discovered.plugins.map(plugin => ({ plugin }));
+  candidates.push(...discovered.plugins.map(plugin => ({ plugin })));
   const retainedStates: AdapterPluginState[] = [];
   if (historyRoot) for (const identity of new Map(references.map(ref => [pluginGenerationKey(ref.plugin), ref.plugin])).values()) {
     if (discovered.plugins.some(plugin => plugin.name === identity.name && plugin.version === identity.version && plugin.fingerprint === identity.fingerprint)
       || states.some(state => state.name === identity.name && state.version === identity.version && state.fingerprint === identity.fingerprint)) continue;
     const state: AdapterPluginState = { ...identity, generation: "retained", references: referenceCount(identity), root: join(historyRoot, pluginGenerationKey(identity)), enabled: false, trust: "untrusted", status: "blocked" };
     try {
-      const installed = discovered.plugins.find(plugin => plugin.name === identity.name);
-      if (!installed || !installed.active) throw new Error("Historical recovery requires the original plugin installation to remain enabled and trusted");
-      if (!await pluginGenerationTrusted(options.trustStorePath, installed.root, identity.fingerprint)) throw new Error("Retained plugin generation is no longer trusted");
+      if (blocked(identity.fingerprint)) throw new Error("Plugin fingerprint is blocked by host policy");
+      const installed = discovered.plugins.find(plugin => plugin.name.toLowerCase() === identity.name.toLowerCase());
       const retained = await readRetainedPlugin(historyRoot, identity);
-      if (retained.origin !== installed.root) throw new Error("Retained plugin installation origin changed");
+      const builtin = !installed && retained.origins.includes(`builtin:${identity.name}`);
+      if (builtin) {
+        if (installed || discovered.errors.some(error => basename(error.path).toLowerCase() === identity.name.toLowerCase())) throw new Error("Installed plugin selection blocks historical builtin recovery");
+        const selected = options.builtins?.find(item => item.identity.name === identity.name);
+        if (!selected?.package || options.enabled?.[identity.name] === false || options.enabled?.[identity.name.toLowerCase()] === false) throw new Error("Historical builtin is disabled or not selected by this host");
+        if (!options.builtinAuthority?.approved(identity)) throw new Error("Historical builtin has no matching host approval or recovery ABI");
+      } else {
+        if (!installed || !installed.active) throw new Error("Historical recovery requires the original plugin installation to remain enabled and trusted");
+        if (!await pluginGenerationTrusted(options.trustStorePath, installed.root, identity.fingerprint)) throw new Error("Retained plugin generation is no longer trusted");
+        if (!retained.origins.includes(installed.root)) throw new Error("Retained plugin installation origin changed");
+      }
       if (!references.some(ref => ref.load && pluginGenerationKey(ref.plugin) === pluginGenerationKey(identity))) {
         retainedStates.push({ ...state, root: retained.plugin.root, enabled: true, trust: "trusted", status: "inactive" });
         continue;
       }
-      candidates.push({ plugin: { ...retained.plugin, trust: "trusted", explicitlyEnabled: true }, recoveryOnly: true, origin: installed.root });
+      candidates.push({ plugin: { ...retained.plugin, trust: "trusted", explicitlyEnabled: true }, recoveryOnly: true, origin: builtin ? `builtin:${identity.name}` : installed!.root, builtin,
+        configuration: builtin ? options.builtins?.find(item => item.identity.name === identity.name)?.configuration : undefined });
     } catch (error) { state.error = String(error); retainedStates.push(state); }
   }
-  for (const { plugin, recoveryOnly, origin } of candidates) {
+  for (const { plugin, recoveryOnly, origin, builtin, state: existingState, sourceSnapshot, configuration } of candidates) {
     if (!plugin.adapterContributions?.length && !plugin.extensionContributions?.length) continue;
     const enabled = options.enabled?.[plugin.name] !== false && options.enabled?.[plugin.name.toLowerCase()] !== false
       && (plugin.lifecycle.activation === "auto" || plugin.explicitlyEnabled);
-    const state: AdapterPluginState = { name: plugin.name, version: plugin.version, fingerprint: plugin.fingerprint, root: plugin.root,
+    const state: AdapterPluginState = existingState ?? { name: plugin.name, version: plugin.version, fingerprint: plugin.fingerprint, root: plugin.root,
       generation: recoveryOnly ? "retained" : "current", references: referenceCount({ name: plugin.name, version: plugin.version!, fingerprint: plugin.fingerprint! }),
       enabled, trust: plugin.trust, status: !enabled ? "inactive" : plugin.trust !== "trusted" ? "blocked" : "loading" };
-    states.push(state);
+    if (!existingState) states.push(state);
+    if (blocked(plugin.fingerprint!)) { state.status = "blocked"; state.error = "Plugin fingerprint is blocked by host policy"; }
     if (state.status !== "loading") continue;
     const callbacks: Array<() => void | Promise<void>> = [];
     let snapshot: string | undefined;
@@ -121,11 +159,13 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
       const errors: unknown[] = [];
       try { await disposeCallbacks(callbacks); } catch (error) { errors.push(error); }
       if (snapshot) { try { await rm(snapshot, { recursive: true, force: true }); } catch (error) { errors.push(error); } }
+      if (sourceSnapshot) { try { await rm(sourceSnapshot, { recursive: true, force: true }); } catch (error) { errors.push(error); } }
       if (errors.length) throw new AggregateError(errors, "Plugin cleanup failed");
     };
     try {
       const fingerprint = plugin.fingerprint!;
-      const authorized = async () => recoveryOnly ? await pluginGenerationTrusted(options.trustStorePath, origin!, fingerprint)
+      const identity = Object.freeze({ name: plugin.name, version: plugin.version!, fingerprint });
+      const authorized = async () => builtin ? !recoveryOnly || options.builtinAuthority?.approved(identity) === true : recoveryOnly ? await pluginGenerationTrusted(options.trustStorePath, origin!, fingerprint)
         && await pluginTrustState(options.trustStorePath, origin!, await computePluginTreeSha256(origin!)) === "trusted"
         : await pluginTrustState(options.trustStorePath, plugin.root, fingerprint) === "trusted";
       if (await computePluginTreeSha256(plugin.root) !== fingerprint
@@ -137,7 +177,6 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
         filter: source => ![".git", ".tnb-provenance.json"].includes(source.split(/[\\/]/).at(-1)!) });
       const target = await realpath(copyTarget);
       if (await computePluginTreeSha256(target) !== fingerprint) throw new Error("Plugin content changed while taking snapshot");
-      const identity = Object.freeze({ name: plugin.name, version: plugin.version!, fingerprint });
       const staged: PluginAdapterRegistration[] = [], stagedExtensions: ExtensionRegistration[] = [];
       const byEntry = new Map<string, EntryDeclaration[]>();
       const declarations: Array<EntryDeclaration & { entry: string }> = [...(plugin.adapterContributions ?? []).map(adapter => ({ ...adapter, kind: "adapter" as const })), ...(plugin.extensionContributions ?? [])];
@@ -150,7 +189,7 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
         const path = await assertPluginContributionPath({ ...plugin, root: target }, entry);
         const loaded: { default?: unknown } = await import(pathToFileURL(path).href);
         if (typeof loaded.default !== "function") throw new Error("Adapter module must export a default factory");
-        const entryResult = await initializeEntry(loaded.default as HostPluginFactory, expected, identity, callbacks, stateDirectory, options.configuration?.[plugin.name]);
+        const entryResult = await initializeEntry(loaded.default as HostPluginFactory, expected, identity, callbacks, stateDirectory, options.configuration?.[plugin.name] ?? configuration);
         staged.push(...entryResult.adapters.map(registration => ({ ...registration, ...(recoveryOnly ? { recoveryOnly: true } : {}) })));
         if (!recoveryOnly) stagedExtensions.push(...entryResult.extensions);
       }
@@ -160,7 +199,10 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
         .some(ref => !staged.some(row => row.adapter.id === ref.adapter.id && row.adapter.version === ref.adapter.version))) throw new Error("Retained plugin does not provide the pinned adapter");
       new DomainRegistry(inline, [...registrations, ...staged]);
       new ExtensionHost([...extensionRegistrations, ...stagedExtensions], registrations, stateDirectory);
-      if (!recoveryOnly && historyRoot && staged.length) await retainPluginGeneration(historyRoot, identity, plugin.root, target);
+      if (!recoveryOnly && historyRoot && staged.length) {
+        await retainPluginGeneration(historyRoot, identity, builtin ? `builtin:${identity.name}` : plugin.root, target);
+        if (builtin) options.builtinAuthority!.approve(identity);
+      }
       registrations.push(...staged); extensionRegistrations.push(...stagedExtensions); // Commit only after all entries and identities validate.
       state.status = "active";
       generations.push({ state, dispose });

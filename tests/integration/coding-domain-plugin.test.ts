@@ -61,6 +61,14 @@ test("the built-in coding plugin writes through actual tools and accepts only it
   expect(await host.runtime.artifacts.get(host.store.getTask(tasks[0]!.taskId)!.resultRef!)).toMatchObject({ acceptance: "verification-commands", adapter: { id: "coding", version: "1" } });
 });
 
+test("canonical workspace paths cannot enter a runtime control directory through a host path alias", async () => {
+  const f = await fixture(), inside = join(f.state, "nested-work"); await mkdir(inside, { recursive: true });
+  const builtin = await plugin(f, factory(f, { async *stream() { throw new Error("No model may execute inside control state"); } }));
+  const host = await open(f, builtin);
+  await expect(host.submit({ commandId: "control-overlap", namespace: "coding", objective: "Reject overlap",
+    adapter: await codingTask({ ...config(f), workspace: inside, allowedWorkspaces: [inside] }) })).rejects.toThrow("separate from runtime control state");
+});
+
 test("read-only coding capabilities cannot be enlarged by forging descriptor resource grants", async () => {
   const f = await fixture(); let requests = 0;
   const host = await open(f, await plugin(f, factory(f, { async *stream() { requests++; yield* report(); } })));

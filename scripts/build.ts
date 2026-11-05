@@ -1,7 +1,9 @@
-import { chmod, copyFile, cp, mkdir, readdir } from "node:fs/promises";
+import { chmod, copyFile, cp, mkdir, readdir, rm } from "node:fs/promises";
 import { arch, platform } from "node:os";
 import { join, resolve } from "node:path";
 import { codingPluginFingerprint } from "../src/adapters/coding/identity";
+import { buildCodingRecoveryPackage } from "../src/adapters/coding/recovery-package";
+import { unpackPlugin } from "../src/agent/packed-plugin";
 
 const root = resolve(import.meta.dir, "..");
 const outputDirectory = join(root, "dist");
@@ -18,22 +20,15 @@ const nativePackage = join(
 const nativeLibrary = join(nativePackage, "lib");
 
 await mkdir(outputDirectory, { recursive: true });
-const build = Bun.spawn([
-  process.execPath,
-  "build",
-  join(root, "src", "entrypoints", "cli.ts"),
-  "--compile",
-  `--outfile=${join(outputDirectory, cliName)}`,
-  `--define=TNB_BUILD_SOURCE_SHA256=${JSON.stringify(await codingPluginFingerprint(root))}`,
-], { cwd: root, stdout: "inherit", stderr: "inherit" });
-const exitCode = await build.exited;
-if (exitCode !== 0) process.exit(exitCode);
+const codingPackage = await buildCodingRecoveryPackage(root);
+const build = await Bun.build({ entrypoints: [join(root, "src/entrypoints/cli.ts")], target: "bun", compile: { outfile: join(outputDirectory, cliName) },
+  define: { TNB_BUILD_SOURCE_SHA256: JSON.stringify(await codingPluginFingerprint(root)), TNB_CODING_PACKAGE: JSON.stringify(codingPackage) } });
+if (!build.success) throw new AggregateError(build.logs, "CLI compilation failed");
 const pluginRoot = join(outputDirectory, "plugins", "tnb-coding");
 await mkdir(pluginRoot, { recursive: true });
-const plugin = await Bun.build({ entrypoints: [join(root, "src/adapters/coding/plugin.ts")], target: "bun", outdir: pluginRoot, naming: "index.mjs" });
-if (!plugin.success) throw new AggregateError(plugin.logs, "Coding plugin bundle failed");
-await copyFile(join(root, "src/adapters/coding/plugin.json"), join(pluginRoot, "plugin.json"));
-await cp(join(root, "src/services/skills/bundled"), join(pluginRoot, "bundled"), { recursive: true, force: true });
+// The distributable package and embedded default contain the same bytes.
+await rm(pluginRoot, { recursive: true, force: true });
+await unpackPlugin(codingPackage, pluginRoot);
 
 for (const name of ["channels", "collaboration", "web"]) {
   const target = join(outputDirectory, "plugins", `tnb-${name}`); await mkdir(target, { recursive: true });

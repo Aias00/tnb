@@ -39,7 +39,7 @@ export function capabilityClaims(config: Pick<RuntimeConfiguration, "skills" | "
     ...(config.mcpTools ?? []).map(name => ({ id: `mcp-tool:${name}`, mode: "write" as const })) ];
 }
 
-export function createDurableCapabilityHost(options: { configDir: string; env: Record<string, string | undefined> }) {
+export function createDurableCapabilityHost(options: { configDir: string; env: Record<string, string | undefined>; bundledSkillIdentity?: string }) {
   const catalog = async (config: RuntimeConfiguration) => {
     validateCapabilitySelection(config);
     const pins: Record<string, string> = {}, snapshots: SkillSnapshot[] = [], grants = new Map<string, McpGrant>();
@@ -73,7 +73,8 @@ export function createDurableCapabilityHost(options: { configDir: string; env: R
           resources.set(path, await readFile(file));
         }
         if (size > MAX_BYTES) throw new Error(`Durable skill ${name} exceeds 1 MiB`);
-        const digest = digestJson({ skill, resources: [...resources].map(([path, bytes]) => [path, createHash("sha256").update(bytes).digest("hex")]) });
+        const identity = skill.source === "bundled" && options.bundledSkillIdentity ? { ...skill, baseDir: `package:${options.bundledSkillIdentity}/bundled/${skill.name}` } : skill;
+        const digest = digestJson({ skill: identity, resources: [...resources].map(([path, bytes]) => [path, createHash("sha256").update(bytes).digest("hex")]) });
         snapshots.push({ skill, resources, digest }); pins[`skill:${name}`] = digest;
       }
     }

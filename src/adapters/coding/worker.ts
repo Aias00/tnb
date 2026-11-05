@@ -17,7 +17,7 @@ import type { RuntimeWorkerFactory } from "../../services/runtime/engine-core";
 import { createDurableCapabilityHost, type CodingWorkerFactory } from "./capabilities";
 
 /** Compose existing tnb tools/providers; credentials stay on the host, outside model and shell environments. */
-export function createRuntimeWorkerFactory(options: { configDir: string; runtimeRoot: string; env: Record<string, string | undefined> }): CodingWorkerFactory {
+export function createRuntimeWorkerFactory(options: { configDir: string; runtimeRoot: string; env: Record<string, string | undefined>; bundledSkillIdentity?: string }): CodingWorkerFactory {
   const capabilities = createDurableCapabilityHost(options);
   const factory: RuntimeWorkerFactory = async ({ task, configuration, signal }) => {
     const catalog = await loadProviderCatalog({ configDir: options.configDir, env: options.env });

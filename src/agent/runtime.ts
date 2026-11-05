@@ -7,6 +7,7 @@ import { DomainRegistry, type AgentDomainAdapter } from "./domain";
 import type { ExtensionHostOptions, ContributionReference } from "./extensions";
 import { loadAdapterPlugins, type AgentPluginOptions } from "./plugins";
 import { pluginGenerationReferences } from "./plugin-generations";
+import { builtinGenerationAuthority } from "./builtin-generations";
 
 /** Local Bun host. Acquire the owner lock before opening SQLite, including on recovery. */
 export async function openAgentRuntime(options: { directory: string; adapters?: readonly AgentDomainAdapter[]; plugins?: AgentPluginOptions; legacyAdapterId?: string; signal?: AbortSignal; services?: ExtensionHostOptions["services"]; serviceGrants?: ExtensionHostOptions["grants"] }) {
@@ -20,7 +21,7 @@ export async function openAgentRuntime(options: { directory: string; adapters?: 
   let plugins: Awaited<ReturnType<typeof loadAdapterPlugins>> | undefined;
   try {
     store = new RuntimeStore(join(options.directory, "state.sqlite"));
-    plugins = options.plugins ? await loadAdapterPlugins({ ...options.plugins, generationReferences: pluginGenerationReferences(store) }, options.adapters, join(options.directory, "plugin-snapshots")) : undefined;
+    plugins = options.plugins ? await loadAdapterPlugins({ ...options.plugins, generationReferences: pluginGenerationReferences(store), builtinAuthority: builtinGenerationAuthority(store) }, options.adapters, join(options.directory, "plugin-snapshots")) : undefined;
     const domains = new DomainRegistry(options.adapters, plugins?.registrations, options.legacyAdapterId);
     const runtime = running = new DurableRuntime(store, options.directory, domains);
     // The host retains ownership through plugin disposal and database close.
@@ -60,6 +61,9 @@ export type { TaskService, WorkspaceTaskService } from "./task-service";
 export { TASK_SERVICE } from "./task-service";
 export type { HostPluginAPI, HostPluginFactory, BuiltinHostPlugin, HostPluginOptions, HostPluginState } from "./plugins";
 export type { PluginGenerationReference } from "./plugin-generations";
+export { builtinGenerationAuthority } from "./builtin-generations";
+export type { BuiltinGenerationAuthority } from "./builtin-generations";
+export type { PackedPlugin } from "./packed-plugin";
 export type { PluginApplication, PluginInterface, PluginChannel, ExtensionContext, ActiveExtension, ChannelPort, ChannelDescriptor, ChannelRegistry, PluginStateStore, ContributionReference, ExtensionState } from "./extensions";
 
 export { COLLABORATION_SERVICE } from "./collaboration-service";

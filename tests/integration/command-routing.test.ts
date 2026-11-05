@@ -51,6 +51,14 @@ test("nested help never executes mutation or remote actions", async () => {
   }
 });
 
+test("a nested question version is routed to the answer command instead of printing the app version", async () => {
+  const result = await cli(["runtime", "answer", "missing-run", "--version", "1"]);
+  expect(result.code).toBe(1); expect(result.stderr).toContain("Answer requires --question"); expect(result.stdout).toBe("");
+  for (const flag of ["--version", "-V"]) {
+    const version = await cli([flag]); expect(version.code).toBe(0); expect(version.stdout.trim()).toMatch(/^\d+\.\d+\.\d+/);
+  }
+});
+
 test("all built-in slash names and aliases resolve to a canonical command", () => {
   for (const command of SLASH_COMMANDS) {
     for (const name of [command.name, ...command.aliases]) {

@@ -20,6 +20,14 @@ async function temporaryDirectory(): Promise<string> {
 }
 
 describe("settings loading", () => {
+  test("generation blocks survive layered overrides and reject malformed fingerprints", async () => {
+    const configDir = await temporaryDirectory(), cwd = await temporaryDirectory(); await mkdir(join(cwd, ".tnb"));
+    await writeFile(join(configDir, "settings.json"), JSON.stringify({ blockedPluginFingerprints: ["a".repeat(64)] }));
+    await writeFile(join(cwd, ".tnb", "settings.json"), JSON.stringify({ blockedPluginFingerprints: [] }));
+    expect((await loadSettings({ configDir, cwd, additional: JSON.stringify({ blockedPluginFingerprints: ["b".repeat(64)] }) })).blockedPluginFingerprints).toEqual(["a".repeat(64), "b".repeat(64)]);
+    await writeFile(join(configDir, "settings.json"), JSON.stringify({ blockedPluginFingerprints: ["not-a-sha"] }));
+    await expect(loadSettings({ configDir, cwd })).rejects.toThrow("SHA256 fingerprints");
+  });
   test("atomically adds and deduplicates project-local permission rules", async () => {
     const cwd = await temporaryDirectory();
     await addProjectPermissionRule({ cwd, behavior: "allow", rule: "Bash(bun test)" });

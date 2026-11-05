@@ -1,5 +1,6 @@
 import { cp, lstat, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { randomUUID } from "node:crypto";
 import type { RuntimeStore } from "../services/runtime/store";
 import { digestJson } from "../services/runtime/json";
 import { computePluginTreeSha256 } from "../services/plugins/trust";
@@ -7,7 +8,7 @@ import { loadPlugins, type LoadedPlugin } from "../services/plugins/loader";
 import { validateDomainDescriptor, type AdapterPluginIdentity, type DomainDescriptor } from "./domain";
 
 export type PluginGenerationReference = { plugin: AdapterPluginIdentity; adapter: { id: string; version: string }; runId: string; taskId?: string; load: boolean };
-type GenerationMetadata = { version: 1; identity: AdapterPluginIdentity; origin: string };
+type GenerationMetadata = { version: 1; identity: AdapterPluginIdentity; origin: string; origins?: string[] };
 export const pluginGenerationKey = (identity: AdapterPluginIdentity) => digestJson(identity);
 
 /** Host facts only. Terminal evidence pins its bytes until explicit Run pruning. */
@@ -31,7 +32,14 @@ export async function retainPluginGeneration(root: string, identity: AdapterPlug
   const target = join(root, pluginGenerationKey(identity));
   try {
     const existing = await readRetainedPlugin(root, identity);
-    if (existing.origin !== origin) throw new Error("Retained plugin origin changed");
+    if (!existing.origins.includes(origin)) {
+      const temporary = join(target, `generation.${randomUUID()}.tmp`);
+      try {
+        await writeFile(temporary, JSON.stringify({ version: 1, identity, origin: existing.origin, origins: [...existing.origins, origin] } satisfies GenerationMetadata), { mode: 0o600 });
+        const handle = await open(temporary, "r+"); try { await handle.sync(); } finally { await handle.close(); }
+        await rename(temporary, join(target, "generation.json")); await syncDirectory(target);
+      } finally { await rm(temporary, { force: true }); }
+    }
     return;
   } catch (error) {
     if (!missing(error)) throw error; // Never overwrite corrupted historical evidence.
@@ -67,13 +75,14 @@ async function syncTree(directory: string): Promise<void> {
 }
 
 /** Revalidate both package bytes and current host compatibility before any import. */
-export async function readRetainedPlugin(root: string, identity: AdapterPluginIdentity): Promise<{ plugin: LoadedPlugin; origin: string }> {
+export async function readRetainedPlugin(root: string, identity: AdapterPluginIdentity): Promise<{ plugin: LoadedPlugin; origin: string; origins: string[] }> {
   await assertHistoryRoot(root);
   const directory = join(root, pluginGenerationKey(identity));
   if ((await lstat(directory)).isSymbolicLink()) throw new Error("Retained plugin directory cannot be a symbolic link");
   if ((await lstat(join(directory, "generation.json"))).isSymbolicLink()) throw new Error("Retained plugin metadata cannot be a symbolic link");
   const metadata: GenerationMetadata = JSON.parse(await readFile(join(directory, "generation.json"), "utf8"));
   if (metadata.version !== 1 || digestJson(metadata.identity) !== digestJson(identity) || typeof metadata.origin !== "string") throw new Error("Retained plugin metadata does not match pinned identity");
+  if (metadata.origins !== undefined && (!Array.isArray(metadata.origins) || !metadata.origins.includes(metadata.origin) || metadata.origins.some(origin => typeof origin !== "string" || !origin))) throw new Error("Invalid retained plugin origins");
   const packageRoot = join(directory, "package");
   if ((await lstat(packageRoot)).isSymbolicLink()) throw new Error("Retained plugin package cannot be a symbolic link");
   if (await computePluginTreeSha256(packageRoot) !== identity.fingerprint) throw new Error("Retained plugin fingerprint mismatch");
@@ -81,7 +90,7 @@ export async function readRetainedPlugin(root: string, identity: AdapterPluginId
   const canonicalRoot = await realpath(packageRoot);
   const plugin = loaded.plugins.find(item => item.root === canonicalRoot);
   if (!plugin || plugin.name !== identity.name || plugin.version !== identity.version) throw new Error(loaded.errors[0]?.error ?? "Retained plugin manifest does not match pinned identity");
-  return { plugin: { ...plugin, fingerprint: identity.fingerprint }, origin: metadata.origin };
+  return { plugin: { ...plugin, fingerprint: identity.fingerprint }, origin: metadata.origin, origins: metadata.origins ?? [metadata.origin] };
 }
 
 /** Only under owner lock, with a complete reference inventory supplied by the host. */
