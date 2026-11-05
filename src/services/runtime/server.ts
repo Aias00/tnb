@@ -13,6 +13,7 @@ import { lock } from "../../utils/lockfile";
 import { questionAttentionResponse } from "./attention-stream";
 import type { RoutingInput, RoutingDecision } from "./routing";
 import { presentRunDetail, presentRuns } from "./presentation";
+import { CollaborationHost } from "../collaboration/host";
 
 export async function runtimePaths(configDir: string): Promise<{ root: string; socket: string; token: string }> {
   const root = resolve(configDir, "runtime"); await mkdir(root, { recursive: true, mode: 0o700 });
@@ -29,7 +30,7 @@ export const RUNTIME_CAPABILITIES = Object.freeze({ protocol: 2, defaultMode: "a
   durableWaits: true, durableDelegation: true, deadlineScheduling: true, questionNotifications: true, lifecycleNotifications: true, adjustableLimits: true,
   taskRouting: true, safeFollowups: true, delegationStrategyVersion: 2, defaultDelegationDepth: 1, autoParallelBranches: 2,
   structuredChildReports: true, machineModelCoordination: true, overlappingWorkspaceLocks: true,
-  domainAdapters: true, codingPlugin: true, pluginInventory: true });
+  domainAdapters: true, codingPlugin: true, pluginInventory: true, collaborationProfile: true });
 export async function serveDurableRuntime(options: ServerOptions): Promise<void> {
   const paths = await runtimePaths(options.configDir);
   const release = await lock(paths.root, { realpath: true, stale: 5000, update: 1000, retries: 0 });
@@ -40,14 +41,18 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
   const { store, runtime, plugins } = options.runtime ? { store: options.runtime.store, runtime: options.runtime, plugins: undefined }
     : await composeRuntime(options, paths.root);
   let server: ReturnType<typeof Bun.serve> | undefined;
+  let collaboration: CollaborationHost | undefined;
+  let closing = false;
+  let ready = false;
   const stopped = Promise.withResolvers<void>();
   let started = false;
   let commandTail = Promise.resolve();
   async function serialCommand<T>(apply: () => Promise<T>): Promise<T> {
+    if (closing) throw new Error("Runtime is stopping");
     const previous = commandTail; const finished = Promise.withResolvers<void>();
     commandTail = previous.catch(() => undefined).then(() => finished.promise);
     await previous.catch(() => undefined);
-    try { return await apply(); } finally { finished.resolve(); }
+    try { if (closing) throw new Error("Runtime is stopping"); return await apply(); } finally { finished.resolve(); }
   }
   try {
     await runtime.start(async () => {}); started = true;
@@ -57,11 +62,16 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
     await unlink(paths.socket).catch((error) => { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; });
     server = Bun.serve({ unix: paths.socket, maxRequestBodySize: 256 * 1024,
       async fetch(request) {
+        if (closing) return Response.json({ error: "Runtime is stopping" }, { status: 503 });
         const supplied = request.headers.get("authorization")?.replace(/^Bearer /, "") ?? "";
         const suppliedBytes = Buffer.from(supplied); const tokenBytes = Buffer.from(token);
         if (suppliedBytes.length !== tokenBytes.length || !timingSafeEqual(suppliedBytes, tokenBytes)) return Response.json({ error: "Unauthorized" }, { status: 403 });
         try {
           const url = new URL(request.url);
+          if (url.pathname === "/collaboration") {
+            if (!collaboration) return request.method === "GET" ? Response.json({ enabled: false }) : Response.json({ error: "Collaboration is not enabled" }, { status: 400 });
+            return Response.json(await (request.method === "GET" ? collaboration.resource(request) : serialCommand(() => collaboration!.resource(request))));
+          }
             if (url.pathname === "/plugins") return Response.json(plugins?.list() ?? []);
           if (request.method === "GET") {
             if (url.pathname === "/presentation") {
@@ -70,7 +80,7 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
               if (store.record<{ workspace: string }>("configuration", runId)?.value.workspace !== workspace) throw new Error("Task is outside the current workspace");
               return Response.json(await presentRunDetail(runtime, runId));
             }
-            if (url.pathname === "/health") return Response.json({ ready: !runtime.lastError, pid: process.pid, error: runtime.lastError, capabilities: RUNTIME_CAPABILITIES });
+            if (url.pathname === "/health") return Response.json({ ready: ready && !runtime.lastError, pid: process.pid, error: runtime.lastError, capabilities: RUNTIME_CAPABILITIES });
             if (url.pathname === "/routing") {
               const workspace = await realpath(url.searchParams.get("workspace") ?? "");
               if (url.searchParams.has("inputId")) {
@@ -181,10 +191,13 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
       },
     });
     await chmod(paths.socket, 0o600);
+    collaboration = await CollaborationHost.open(runtime, options.configDir, options.env);
+    ready = true;
     options.ready?.(paths.socket);
     if (!options.signal.aborted) await Promise.race([stopped.promise, new Promise<void>((done) => options.signal.addEventListener("abort", () => done(), { once: true }))]);
   } finally {
-    try { if (started) await runtime.close(); }
+    closing = true;
+    try { try { await collaboration?.close(); await commandTail; } finally { if (started) await runtime.close(); } }
     finally {
       try { await plugins?.close(); }
       finally {

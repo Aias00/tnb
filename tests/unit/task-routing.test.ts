@@ -140,9 +140,9 @@ test("schema v3 routing migrates without losing pending decisions", async () => 
   const root = await mkdtemp(join(tmpdir(), "tnb-route-migrate-")); roots.push(root); const path = join(root, "state.sqlite");
   const f = fixture(new RuntimeStore(path)); f.create("a"); f.create("b");
   f.router.followup({ commandId: "question", source: f.source("question") }); f.store.close();
-  const legacy = new Database(path); legacy.exec("DROP TABLE routing_tombstones; DROP INDEX routing_pending; PRAGMA user_version=3"); legacy.close();
+  const legacy = new Database(path); legacy.exec("DROP TABLE application_records; DROP TABLE routing_tombstones; DROP INDEX routing_pending; PRAGMA user_version=3"); legacy.close();
   const next = fixture(new RuntimeStore(path));
   expect(next.store.routes<{ status: string }>(next.workspace, { pendingOnly: true })[0]!.status).toBe("clarify");
   const db = new Database(path, { readonly: true });
-  try { expect(db.query("PRAGMA user_version").get()).toEqual({ user_version: 4 }); expect(db.query("SELECT COUNT(*) AS n FROM routing_tombstones").get()).toEqual({ n: 0 }); } finally { db.close(); }
+  try { expect(db.query("PRAGMA user_version").get()).toEqual({ user_version: 5 }); expect(db.query("SELECT COUNT(*) AS n FROM routing_tombstones").get()).toEqual({ n: 0 }); } finally { db.close(); }
 });

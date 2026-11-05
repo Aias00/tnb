@@ -112,6 +112,7 @@ Commands:
   config [list|get|set|unset|path]
                                  Inspect or edit settings
   status                         Show effective local configuration
+  collaboration                  Manage optional persistent channel collaboration
   doctor                         Validate local runtime and configuration
   resume [session-id]            Open the session picker or restore a session
   continue                       Continue the latest workspace session

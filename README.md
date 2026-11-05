@@ -621,3 +621,7 @@ bun run install:local
 target as `tnb.previous`. Pass `--prefix <directory>` for an isolated install.
 Set `TNB_RELEASE_BASE_URL` during `release:current` to generate the remote
 self-update manifest alongside the binary and `SHA256SUMS`.
+
+### 常驻协作模式
+
+可选启用同一持久任务后台的 GitHub、签名 webhook/IM 桥和定时来源，通过 `/tnb run` 接单，自动回传问题与验收结果，并跟踪明确绑定的 PR。启动、权限、配置、恢复和当前边界见 [常驻协作指南](docs/guides/collaboration.md)，配置见 [示例](examples/collaboration/collaboration.json)。

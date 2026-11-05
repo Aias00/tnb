@@ -10,21 +10,25 @@ export function assertConversationOwner(health: { capabilities?: { conversationH
   if (!health.capabilities?.conversationHandoff) throw new RuntimeUnavailable("The runtime owner needs an update/restart for conversational handoff. Stop the existing runtime service, then retry");
 }
 export async function ensureRuntime(configDir: string, env: Record<string, string | undefined>, conversation = false): Promise<void> {
+  let starting = false;
   try {
     const health = await runtimeRequest(configDir, "/health") as { ready?: boolean; error?: string; capabilities?: { conversationHandoff?: boolean } };
     if (conversation) assertConversationOwner(health);
-    if (!health.ready) throw new RuntimeUnavailable(health.error ?? "Runtime dispatch stopped; stop and restart the service");
-    return;
+    if (health.error) throw new RuntimeUnavailable(health.error);
+    if (health.ready) return;
+    starting = true;
   } catch (error) { if (error instanceof RuntimeUnavailable) throw error; }
   const paths = await runtimePaths(configDir);
-  try { if (statSync(join(paths.root, "service.log")).size > 4 * 1024 * 1024) renameSync(join(paths.root, "service.log"), join(paths.root, "service.log.1")); }
-  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  const log = openSync(join(paths.root, "service.log"), "a", 0o600);
-  const argv = Bun.main.startsWith("/$bunfs/") ? [] : [fileURLToPath(new URL("../../entrypoints/cli.ts", import.meta.url))];
-  try {
-    const owner = spawn(process.execPath, [...argv, "runtime", "serve", "--config-dir", configDir],
-      { env: env as NodeJS.ProcessEnv, detached: true, stdio: ["ignore", log, log] }); owner.unref();
-  } finally { closeSync(log); }
+  if (!starting) {
+    try { if (statSync(join(paths.root, "service.log")).size > 4 * 1024 * 1024) renameSync(join(paths.root, "service.log"), join(paths.root, "service.log.1")); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    const log = openSync(join(paths.root, "service.log"), "a", 0o600);
+    const argv = Bun.main.startsWith("/$bunfs/") ? [] : [fileURLToPath(new URL("../../entrypoints/cli.ts", import.meta.url))];
+    try {
+      const owner = spawn(process.execPath, [...argv, "runtime", "serve", "--config-dir", configDir],
+        { env: env as NodeJS.ProcessEnv, detached: true, stdio: ["ignore", log, log] }); owner.unref();
+    } finally { closeSync(log); }
+  }
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     try {
