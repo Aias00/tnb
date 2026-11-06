@@ -1,4 +1,6 @@
 import { buildInfo, sameBuild } from "../services/update/build-info";
+import { agentNamespace } from "../agent/execution";
+import { readDomainSubmission } from "../services/cli/domain-submission";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -10,7 +12,7 @@ import type { DurableRun } from "../services/runtime/types";
 import { registerCleanup } from "../utils/cleanup-registry";
 import { withOfflineRuntime, backupRuntime, checkRuntimeBackup, restoreRuntime, pruneRuntime, runtimeStorageUsage } from "../services/runtime/maintenance";
 
-const HELP = `Usage: tnb runtime <submit|status|result|list|events|questions|answer|limits|pause|resume|cancel|reconcile|start|restart|serve|stop|backup|backup-check|restore|prune|storage|plugins|version> [options]
+const HELP = `Usage: tnb runtime <submit|adapters|status|result|list|events|questions|answer|limits|pause|resume|cancel|reconcile|start|restart|serve|stop|backup|backup-check|restore|prune|storage|plugins|version> [options]
 
 followup [run-id] --text "requirements" [--task ID] [--input-id ID]
   Select an unresolved input with --resolve-input ID --revision N and a run-id.
@@ -18,6 +20,12 @@ routing [--cwd PATH] [--pending] [--before-input ID]  Show decisions, prioritizi
 submit <objective> [--cwd PATH] [--mode single|auto|multi] [--allow-write] [--allow-shell]
   [--check COMMAND]... [--allow-workspace PATH]... [--skill NAME]... [--mcp-tool NAME]... [--provider ID] [--model ID]
   [--max-budget-usd N] [--max-turns N] [--deadline ISO-DATE] [--command-id ID] [--no-start]
+submit <objective> --adapter descriptor.json --namespace NAME [--mode single|auto|multi]
+  [--max-turns N] [--max-retries N] [--max-model-requests N] [--compact-threshold N]
+  [--max-budget-usd N] [--deadline ISO-DATE] [--provider ID] [--model ID] [--command-id ID] [--no-start]
+  Explicit domain submission; does not accept Coding directory, Shell, check, Skill or MCP flags.
+adapters  List current Adapter identities/configuration schemas; never starts the owner.
+list|followup|routing [--namespace NAME]  Select a domain scope instead of a file workspace.
 status|result|events|pause|resume|cancel <run-id>  (result accepts --task TASK-ID)
 questions <run-id>  Show outstanding questions and their versions.
 answer <run-id> --question ID --answer TEXT --version N  Answer without changing permissions.
@@ -52,6 +60,15 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
   const configDir = resolve(value("--config-dir") ?? options.env.TNB_HOME ?? join(homedir(), ".tnb"));
   try {
     if (!action || args.includes("--help") || args.includes("-h")) { options.stdout.write(HELP); return 0; }
+    const domainInput = action === "submit" && args.includes("--adapter") ? await readDomainSubmission(args, options.cwd, options.originSessionId) : undefined;
+    if (action === "submit" && !domainInput && ["--namespace", "--max-retries", "--max-model-requests", "--compact-threshold"].some(flag => args.includes(flag))) throw new Error("Domain execution options require --adapter descriptor.json");
+    if (args.includes("--namespace") && args.includes("--cwd")) throw new Error("Choose --namespace or --cwd");
+    if (args.includes("--namespace") && (!value("--namespace") || value("--namespace")!.startsWith("--"))) throw new Error("--namespace requires a value");
+    if (args.includes("--namespace") && !["submit", "list", "followup", "routing"].includes(action)) throw new Error("--namespace applies to submit, list, followup and routing");
+    if (action === "adapters") for (let index = 1; index < args.length; index += 2) {
+      if (args[index] !== "--config-dir" || !args[index + 1] || args[index + 1]!.startsWith("--")) throw new Error("Usage: runtime adapters [--config-dir PATH]");
+    }
+    const scope = async () => value("--namespace") !== undefined ? agentNamespace(value("--namespace")!) : realpath(resolve(options.cwd, value("--cwd") ?? options.cwd));
     if (action === "version") {
       const cli = buildInfo();
       let health: { ready?: boolean; pid?: number; build?: unknown };
@@ -95,19 +112,24 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
     }
     if (action === "submit" && !args.includes("--no-start")) await ensureRuntime(configDir, options.env);
     let result: unknown;
-    if (action === "list") result = await runtimeRequest(configDir, "/runs");
+    if (action === "adapters") {
+      const health = await runtimeRequest(configDir, "/health") as { capabilities?: { domainCatalog?: boolean } };
+      if (!health.capabilities?.domainCatalog) throw new Error("The running owner does not support the Adapter catalog; explicitly run tnb runtime restart after updating it");
+      result = await runtimeRequest(configDir, "/adapters");
+    }
+    else if (action === "list") result = await runtimeRequest(configDir, args.includes("--namespace") ? `/runs?workspace=${encodeURIComponent(await scope())}` : "/runs");
     else if (action === "plugins") {
       if (args.includes("--check") && args.includes("--references")) throw new Error("Choose --check or --references");
       result = await runtimeRequest(configDir, args.includes("--check") ? "/plugins/recovery" : args.includes("--references") ? "/plugins/references" : "/plugins");
     }
     else if (action === "routing") {
-      const query = new URLSearchParams({ workspace: await realpath(resolve(value("--cwd") ?? options.cwd)), pending: String(args.includes("--pending")) });
+      const query = new URLSearchParams({ workspace: await scope(), pending: String(args.includes("--pending")) });
       if (value("--before-input")) query.set("beforeInput", value("--before-input")!);
       result = await runtimeRequest(configDir, `/routing?${query}`);
     }
     else if (action === "followup") {
       const commandId = value("--command-id") ?? randomUUID();
-      const workspace = await realpath(resolve(value("--cwd") ?? options.cwd));
+      const workspace = await scope();
       const original = value("--text") ?? (value("--resolve-input") ? "Resolve original input" : undefined);
       if (!original) throw new Error("Followup requires --text or --resolve-input");
       result = await runtimeRequest(configDir, "/command", { action, commandId, workspace, runId: args[1] && !args[1].startsWith("--") ? args[1] : undefined,
@@ -117,6 +139,13 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
     else if (action === "stop") result = await runtimeRequest(configDir, "/command", { action: "stop", commandId: randomUUID() });
     else if (["status", "events", "result", "questions"].includes(action)) result = await runtimeRequest(configDir, `/${action}?runId=${encodeURIComponent(args[1] ?? "")}&after=${value("--after") ?? "0"}&taskId=${encodeURIComponent(value("--task") ?? "")}`);
     else if (action === "submit") {
+      if (domainInput) {
+        const health = await runtimeRequest(configDir, "/health") as { capabilities?: { domainSubmission?: boolean } };
+        if (!health.capabilities?.domainSubmission) throw new Error("The running owner does not support domain submission; explicitly run tnb runtime restart after updating it");
+        try { result = await runtimeRequest(configDir, "/agent-tasks", domainInput); }
+        catch (error) { throw new Error(`${error instanceof Error ? error.message : String(error)}. Retry identical input with --command-id ${domainInput.commandId}`); }
+        options.stdout.write(`${JSON.stringify(result, null, 2)}\n`); return 0;
+      }
       for (const flag of ["--skill", "--mcp-tool"]) {
         for (let index = 0; index < args.length; index++) if (args[index] === flag && (!args[index + 1] || args[index + 1]!.startsWith("--"))) throw new Error(`${flag} requires a value`);
       }
@@ -168,8 +197,8 @@ export type RuntimeChatOptions = { args: string[]; cwd: string; workspace: strin
   env: Record<string, string | undefined>; provider: string; model: string; sessionId: string; sourceText?: string };
 export async function runRuntimeChatCommand(options: RuntimeChatOptions): Promise<string> {
   const args = options.args.length ? [...options.args] : ["list"]; const action = args[0]!;
-  if (!["followup", "routing", "submit", "list", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel", "storage", "version", "start", "restart", "stop", "plugins", "backup-check"].includes(action)) throw new Error("/runtime supports submit, list, status, result, events, questions, answer, limits, pause, resume, cancel, storage, start, restart, stop, plugins, version and backup-check.");
-  const valueFlags = new Set(["--before-input", "--text", "--input-id", "--resolve-input", "--successor", "--cwd", "--mode", "--check", "--skill", "--mcp-tool", "--allow-workspace", "--provider", "--model", "--max-budget-usd", "--max-turns", "--command-id", "--config-dir", "--after", "--task", "--question", "--answer", "--version", "--deadline", "--extend-hours", "--revision"]);
+  if (!["followup", "routing", "submit", "adapters", "list", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel", "storage", "version", "start", "restart", "stop", "plugins", "backup-check"].includes(action)) throw new Error("/runtime supports submit, adapters, list, status, result, events, questions, answer, limits, pause, resume, cancel, storage, start, restart, stop, plugins, version and backup-check.");
+  const valueFlags = new Set(["--adapter", "--namespace", "--max-retries", "--max-model-requests", "--compact-threshold", "--before-input", "--text", "--input-id", "--resolve-input", "--successor", "--cwd", "--mode", "--check", "--skill", "--mcp-tool", "--allow-workspace", "--provider", "--model", "--max-budget-usd", "--max-turns", "--command-id", "--config-dir", "--after", "--task", "--question", "--answer", "--version", "--deadline", "--extend-hours", "--revision"]);
   const flags = new Set(["--references", "--pending", "--allow-write", "--allow-shell", "--no-start", "--help", "-h"]);
   if (action === "followup" && (!args[1] || args[1].startsWith("--"))) args.splice(1, 0, "");
   const hasTarget = ["followup", "submit", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel", "backup-check"].includes(action);
@@ -179,15 +208,15 @@ export async function runRuntimeChatCommand(options: RuntimeChatOptions): Promis
     if (valueFlags.has(flag)) { if (!args[index + 1] || args[index + 1]!.startsWith("--")) throw new Error(`${flag} requires a value`); index++; }
     else if (!flags.has(flag)) throw new Error(`Unexpected argument ${flag}; quote the objective and use supported runtime options`);
   }
-  if (["followup", "routing"].includes(action) && !args.includes("--cwd")) args.push("--cwd", options.workspace);
+  if (["followup", "routing"].includes(action) && !args.includes("--cwd") && !args.includes("--namespace")) args.push("--cwd", options.workspace);
   if (action === "submit") {
     if (!args[1] || args[1].startsWith("--")) throw new Error('Usage: /runtime submit "objective" [--mode auto] [--allow-write --check "command"]');
-    if (!args.includes("--cwd")) args.push("--cwd", options.workspace);
+    if (!args.includes("--cwd") && !args.includes("--adapter")) args.push("--cwd", options.workspace);
     if (!args.includes("--provider")) args.push("--provider", options.provider);
     if (!args.includes("--model")) args.push("--model", options.model);
   }
   let output = ""; let error = "";
-  const code = await runRuntimeCommand({ argv: ["runtime", ...args, "--config-dir", options.configDir], cwd: options.cwd,
+  const code = await runRuntimeCommand({ argv: ["runtime", ...args, ...(!args.includes("--config-dir") ? ["--config-dir", options.configDir] : [])], cwd: args.includes("--adapter") ? options.workspace : options.cwd,
     env: options.env, originSessionId: options.sessionId, sourceText: options.sourceText, stdout: { write: (value) => { output += value; } }, stderr: { write: (value) => { error += value; } } });
   if (code) throw new Error(error.trim());
   return action === "submit" ? `Durable task accepted; it continues in the background. Use /runtime status <run-id> or /runtime result <run-id>.\n${output.trim()}` : output.trim();
@@ -197,9 +226,10 @@ const LONG_TASK_HELP = `Long tasks · /longtask (aliases: /task, /long, /长任�
 
 /longtask "objective" [--mode single|auto|multi] [--allow-write] [--allow-shell]
   [--check "command"]... [--skill NAME]... [--mcp-tool NAME]... [--max-budget-usd N] [--max-turns N]
+/longtask "objective" --adapter task.json --namespace NAME
 /longtask followup [run-id] --text "additional requirements"
 /longtask routing [--pending] [--before-input ID]
-/longtask list
+/longtask list [--namespace NAME]
 /longtask status|result|events|pause|resume|cancel [run-id]
 /longtask questions [run-id]
 /longtask answer [run-id] --question ID --answer "text" --version N
@@ -224,25 +254,29 @@ export async function runLongTaskChatCommand(options: RuntimeChatOptions): Promi
     const boundary = flagAt < 0 ? args.length : flagAt;
     args = ["submit", args.slice(1, boundary).join(" "), ...args.slice(boundary)];
     const result = await runRuntimeChatCommand({ ...options, args });
-    return result.replaceAll("/runtime status <run-id>", "/longtask status").replaceAll("/runtime result <run-id>", "/longtask result");
+    return result.replaceAll("/runtime status <run-id>", args.includes("--namespace") ? "/longtask status <run-id>" : "/longtask status")
+      .replaceAll("/runtime result <run-id>", args.includes("--namespace") ? "/longtask result <run-id>" : "/longtask result");
   }
   if (["followup", "routing"].includes(args[0]!)) return runRuntimeChatCommand({ ...options, args });
   if (args[0] === "list" || !args[1] || args[1]!.startsWith("--")) {
     if (args[0] === "list") for (let index = 1; index < args.length; index += 2) {
-      if (!["--cwd", "--config-dir"].includes(args[index]!) || !args[index + 1] || args[index + 1]!.startsWith("--")) throw new Error("Usage: /longtask list [--cwd PATH] [--config-dir PATH]");
+      if (!["--cwd", "--namespace", "--config-dir"].includes(args[index]!) || !args[index + 1] || args[index + 1]!.startsWith("--")) throw new Error("Usage: /longtask list [--cwd PATH | --namespace NAME] [--config-dir PATH]");
     }
     const option = (name: string) => { const index = args.indexOf(name); return index < 0 ? undefined : args[index + 1]; };
     const configDir = resolve(option("--config-dir") ?? options.configDir);
-    const workspace = await realpath(resolve(option("--cwd") ?? options.workspace));
+    if (args.includes("--namespace") && (!option("--namespace") || option("--namespace")!.startsWith("--"))) throw new Error("--namespace requires a value");
+    if (args.includes("--namespace") && args.includes("--cwd")) throw new Error("Choose --namespace or --cwd");
+    const workspace = option("--namespace") !== undefined ? agentNamespace(option("--namespace")!) : await realpath(resolve(option("--cwd") ?? options.workspace));
     assertConversationOwner(await runtimeRequest(configDir, "/health") as Parameters<typeof assertConversationOwner>[0]);
     const resource = `/runs?workspace=${encodeURIComponent(workspace)}`;
     const runs = await runtimeRequest(configDir, resource) as DurableRun[];
     if (args[0] === "list") {
-      return runs.length ? JSON.stringify(runs, null, 2) : '当前工作区没有长任务。使用 /longtask "任务目标" 创建。';
+      return runs.length ? JSON.stringify(runs, null, 2) : option("--namespace") !== undefined ? `命名空间 ${JSON.stringify(option("--namespace"))} 没有长任务。使用 /runtime adapters 查看可用业务。` : '当前工作区没有长任务。使用 /longtask "任务目标" 创建。';
     }
     const own = await runtimeRequest(configDir, `${resource}&sessionId=${encodeURIComponent(options.sessionId)}`) as DurableRun[];
     const run = own.at(-1) ?? runs.at(-1);
     if (!run) throw new Error('当前工作区没有长任务。使用 /longtask "任务目标" 创建。');
+    const namespaceIndex = args.indexOf("--namespace"); if (namespaceIndex >= 0) args.splice(namespaceIndex, 2);
     args.splice(1, 0, run.runId);
   }
   return runRuntimeChatCommand({ ...options, args });

@@ -1,3 +1,4 @@
+import { buildInfo } from "../update/build-info";
 import { openSync, closeSync, statSync, renameSync } from "node:fs";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
@@ -23,7 +24,7 @@ export async function ensureRuntime(configDir: string, env: Record<string, strin
     try { if (statSync(join(paths.root, "service.log")).size > 4 * 1024 * 1024) renameSync(join(paths.root, "service.log"), join(paths.root, "service.log.1")); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     const log = openSync(join(paths.root, "service.log"), "a", 0o600);
-    const argv = Bun.main.startsWith("/$bunfs/") ? [] : [fileURLToPath(new URL("../../entrypoints/cli.ts", import.meta.url))];
+    const argv = buildInfo().mode === "compiled" ? [] : [fileURLToPath(new URL("../../entrypoints/cli.ts", import.meta.url))];
     try {
       const owner = spawn(process.execPath, [...argv, "runtime", "serve", "--config-dir", configDir],
         { env: env as NodeJS.ProcessEnv, detached: true, stdio: ["ignore", log, log] }); owner.unref();

@@ -85,6 +85,8 @@ Coding 持久 Worker 记录选中 Skill/MCP 的包来源，在授权以及 Skill
 
 默认产品 profile 在一个宿主内组合 `tnb-coding`、`tnb-channels`、`tnb-collaboration`、`tnb-web`。这些包也在构建产物的 dist/plugins 下提供可安装包，运行中的内置版本和安装版本走相同注册与生命周期。停用协作插件不会删除工单、通知或原 Run。Web 默认进入普通 Coding 对话，通过类型化 `tnb.chat/v1` 接入终端执行器，并保留 `tnb.tasks/v1` 后台任务入口，见[网页指南](web-workbench.md)。
 
+默认 Owner 也提供当前领域 Adapter 目录和显式业务任务提交，不需要修改核心来硬编码业务 ID。CLI 用 `runtime adapters` 和 `runtime submit --adapter task.json --namespace NAME`，客户端用认证的 `/adapters` 与 `/agent-tasks`；详见[业务任务](domain-tasks.md)。这些入口不自动提供插件自定义服务、模型凭据或公共 HTTP 权限。
+
 领域包和渠道支持历史可执行代际留存，inventory 显示 current/retained 和引用数。安装包受安装、启用、信任和兼容性约束；默认 Coding/channels 使用嵌入包和宿主私有批准。任务和来源保留原指纹，不把历史实现作为默认回退。详见 [领域安装包](plugin-generations.md)、[默认 Coding](builtin-generations.md) 和 [渠道来源恢复](channel-generations.md)；自定义 inline factory 和历史应用/界面不在此恢复范围。
 
 `tnb runtime plugins --references` 提供实时引用理由；SDK 使用 `host.plugins.references()`。直接 `loadHostPlugins` 时，启动回收必须明确提供领域和渠道两类完整清单，省略表示未知，见[引用与回收指南](plugin-references.md)。

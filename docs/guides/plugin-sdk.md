@@ -33,7 +33,7 @@ SDK tarball 是本地开发依赖；项目移动到其他机器时，重新提�
 
 运行 validate/test 需把 TNB CLI 放在 PATH。构建过程需要 Bun；这里只对插件运行时源码 `src` 做 TypeScript 检查，构建脚本由 Bun 执行。Node 专属 API、Bun 专属 API 的业务插件可以按需显式增加相应类型依赖，不由 SDK 隐式带入。
 
-构建删除上次输出，在暂存目录完成打包和清单复制后发布 `package/`。构建失败不会留下可误安装的旧包。只把 `package/` 安装进宿主；源码、编译器和开发 `node_modules` 无需一起交付。业务额外的运行资源需自行纳入构建，当前模板只复制实现、manifest 和测试文件。
+构建删除上次输出，在暂存目录完成打包和清单复制后发布 `package/`。构建失败不会留下可误安装的旧包。只把 `package/` 安装进宿主；源码、编译器和开发 `node_modules` 无需一起交付。业务额外的运行资源需自行纳入构建；Agent 模板还会生成并复制 `task.json`，可通过[产品业务任务入口](domain-tasks.md)直接提交。
 
 ## 统一作者 API
 
@@ -78,6 +78,8 @@ SDK 包版本跟随交付宿主版本；真正的执行兼容性仍由 `manifest
 新 Agent 推荐 `api.registerAdapter(defineAgent(definition))`。`definition.configuration` 是运行时校验的 Schema；`snapshot/createWorker/accept/reconcile` 收到 `AgentContext`。业务输入保存在 `descriptor.config`，执行限制在 `context.execution`，工具授权由 `descriptor.resources/grants` 决定。TypeScript Agent 模板已使用这个入口。
 
 `RuntimeConfiguration`、原始 `DomainContext` 和 `AgentDomainAdapter` 保留给旧插件及高级宿主集成。它们仍带宿主持久化兼容形状，不应作为新业务的配置模型。内部旧记录仍使用原字段和摘要，未对已有 Run 做隐式迁移；新的中立作者上下文按白名单构造，既不暴露内部 Coding 字段，也不传递宿主状态目录。
+
+`defineAgent` 的 Schema 同时通过当前 Adapter 目录暴露，便于客户端发现配置合同。`validateAgentTaskInput` 校验公开任务输入；旧 `AgentDomainAdapter` 可省略 Schema。目录只展示当前代际，任务代码仍由 Owner 固定。`AgentTaskInput.originSessionId` 仅用于来源追踪，不授予业务能力或文件权限。
 
 | 合同 | 兼容约定 |
 | --- | --- |

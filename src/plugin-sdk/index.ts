@@ -16,6 +16,8 @@ export type { AgentTool, ToolDefinition, ToolAccess, ToolOutput, ToolExecutionCo
 export type { ModelTransport, ModelRequest, ModelEvent, TokenUsage, StopReason } from "../providers/types";
 export type { ConversationMessage, ToolUseBlock, ToolResultBlock, MediaBlock } from "../core/message";
 export type { WorkerResources, ExecutionConfiguration, AgentTaskInput } from "../agent/execution";
+export { validateAgentTaskInput } from "../agent/execution";
+export type { AdapterCatalogEntry } from "../agent/domain";
 /** @deprecated Host compatibility shape; new authors use AgentContext.execution. */
 export type { RuntimeConfiguration } from "../services/runtime/engine-core";
 export { defineAgent } from "./agent";

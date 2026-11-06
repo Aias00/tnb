@@ -15,7 +15,7 @@ export const SLASH_COMMANDS = [
   {
     name: "runtime",
     aliases: [] as const,
-    usage: '/runtime submit "objective" [options] | list|status|result|events|questions|answer|limits|pause|resume|cancel|storage [run-id] | start|restart|stop|plugins',
+    usage: '/runtime adapters | submit "objective" [--adapter task.json --namespace NAME] [options] | list|status|result|events|questions|answer|limits|pause|resume|cancel|storage [run-id] | start|restart|stop|plugins',
     description: "Submit durable background tasks, inspect their results, and control their execution.",
   },
   {

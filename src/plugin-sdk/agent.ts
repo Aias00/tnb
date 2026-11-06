@@ -23,7 +23,7 @@ function context(value: DomainContext): AgentContext {
 export function defineAgent(definition: AgentDefinition): AgentDomainAdapter {
   validatePluginSchema(definition.configuration);
   const schema = structuredClone(definition.configuration);
-  return { id: definition.id, version: definition.version,
+  return { id: definition.id, version: definition.version, configurationSchema: structuredClone(schema),
     validate(value) {
       validatePluginConfiguration(schema, value);
       const result: unknown = definition.validate?.(value);

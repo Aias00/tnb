@@ -5,6 +5,7 @@ import type { ToolUseBlock } from "../core/message";
 import type { AgentTool } from "../core/tool";
 import type { DelegationProposal } from "../services/runtime/delegation";
 import { digestJson, encodeJson, text } from "../services/runtime/json";
+import { validatePluginSchema, type PluginJsonSchema } from "./plugin-schema";
 
 export type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
 export type ResourceClaim = { id: string; mode: "read" | "write" };
@@ -36,6 +37,7 @@ export type DomainReceipt = { operationId: string; name: string; input: unknown;
 export interface AgentDomainAdapter {
   readonly id: string;
   readonly version: string;
+  readonly configurationSchema?: PluginJsonSchema;
   readonly runtime?: DomainRuntimePolicy;
   validate(config: JsonValue): void;
   createWorker(context: DomainContext): Promise<WorkerResources>;
@@ -84,6 +86,7 @@ export function validateDomainDescriptor(descriptor: DomainDescriptor): DomainDe
 
 export function bindDomainAdapter(adapter: AgentDomainAdapter): AgentDomainAdapter {
   text(adapter.id, "adapter ID", 128); text(adapter.version, "adapter version", 128);
+  if (adapter.configurationSchema !== undefined) validatePluginSchema(adapter.configurationSchema);
   const policy = adapter.runtime;
   const runtime = policy ? Object.freeze({ ...policy,
     ...(policy.normalize ? { normalize: policy.normalize.bind(policy) } : {}),
@@ -96,7 +99,7 @@ export function bindDomainAdapter(adapter: AgentDomainAdapter): AgentDomainAdapt
     ...(policy.delegate ? { delegate: policy.delegate.bind(policy) } : {}),
     ...(policy.verification ? { verification: Object.freeze({ ...policy.verification }) } : {}),
   }) : undefined;
-  return Object.freeze({ id: adapter.id, version: adapter.version, validate: adapter.validate.bind(adapter), createWorker: adapter.createWorker.bind(adapter),
+  return Object.freeze({ id: adapter.id, version: adapter.version, ...(adapter.configurationSchema ? { configurationSchema: structuredClone(adapter.configurationSchema) } : {}), validate: adapter.validate.bind(adapter), createWorker: adapter.createWorker.bind(adapter),
     snapshot: adapter.snapshot.bind(adapter), accept: adapter.accept.bind(adapter), ...(adapter.reconcile ? { reconcile: adapter.reconcile.bind(adapter) } : {}),
     ...(runtime ? { runtime } : {}) });
 }
@@ -105,6 +108,7 @@ export class DomainRegistry {
   readonly #adapters = new Map<string, AgentDomainAdapter>();
   readonly #plugins = new Map<string, AdapterPluginIdentity>();
   readonly #generations = new Map<string, AgentDomainAdapter>();
+  readonly #catalog = new Map<string, AdapterCatalogEntry>();
   readonly #legacy?: AgentDomainAdapter;
   constructor(adapters: readonly AgentDomainAdapter[] = [], plugins: readonly PluginAdapterRegistration[] = [], legacyAdapterId?: string) {
     for (const { adapter, plugin, recoveryOnly } of [...adapters.map(adapter => ({ adapter, plugin: undefined, recoveryOnly: false })), ...plugins]) {
@@ -117,6 +121,8 @@ export class DomainRegistry {
       if (!recoveryOnly) {
         this.#adapters.set(key, bound);
         if (plugin) this.#plugins.set(key, Object.freeze({ ...plugin }));
+        this.#catalog.set(key, { id: bound.id, version: bound.version, submission: bound.runtime?.legacyDescriptor ? "host" : "domain",
+          ...(plugin ? { plugin: { ...plugin } } : {}), ...(bound.configurationSchema ? { configurationSchema: structuredClone(bound.configurationSchema) } : {}) });
       }
       if (!recoveryOnly && legacyAdapterId === adapter.id) {
         if (this.#legacy || !adapter.runtime?.legacyDescriptor) throw new Error("Invalid or ambiguous legacy adapter");
@@ -130,6 +136,11 @@ export class DomainRegistry {
     return this.prepare(this.#legacy.runtime.legacyDescriptor(configuration));
   }
   has(id: string, version: string): boolean { return this.#adapters.has(digestJson({ id, version })); }
+  /** Current registrations only. Retained generations are recovery targets, never new candidates. */
+  catalog(): AdapterCatalogEntry[] {
+    return structuredClone([...this.#catalog.values()])
+      .sort((a, b) => a.id.localeCompare(b.id) || a.version.localeCompare(b.version));
+  }
   /** Pin new submissions. Recovery must use resolve directly and cannot acquire a new identity. */
   prepare(descriptor: DomainDescriptor, allowRetained = false): DomainDescriptor {
     const value = validateDomainDescriptor(descriptor);
@@ -155,6 +166,7 @@ export class DomainRegistry {
     return adapter;
   }
 }
+export type AdapterCatalogEntry = { id: string; version: string; submission: "domain" | "host"; plugin?: AdapterPluginIdentity; configurationSchema?: PluginJsonSchema };
 
 export const RUNTIME_TOOL_NAMES = new Set(["agent", "durable_wait", "durable_recall", "assess_delegation", "review_child_result", "complete_investigation"]);
 export function selectDomainTools(tools: AgentTool[], descriptor: DomainDescriptor): AgentTool[] {

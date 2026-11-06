@@ -1,6 +1,8 @@
 import { buildInfo } from "../update/build-info";
+import { validateAgentTaskInput } from "../../agent/execution";
+import { canonicalTaskScope } from "./scope";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { chmod, mkdir, readFile, writeFile, unlink, lstat, realpath } from "node:fs/promises";
+import { chmod, mkdir, readFile, writeFile, unlink, lstat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { digestJson } from "./json";
 import { DurableRuntime, type RuntimeConfiguration } from "./engine-core";
@@ -25,6 +27,7 @@ export async function runtimePaths(configDir: string): Promise<{ root: string; s
 
 type ServerOptions = { configDir: string; env: Record<string, string | undefined>; signal: AbortSignal; runtime?: DurableRuntime; ready?(socket: string): void };
 export const RUNTIME_CAPABILITIES = Object.freeze({ protocol: 2, defaultMode: "auto", maxDelegationDepth: 2, maxParallelBranches: 4,
+  domainSubmission: true, domainCatalog: true,
   readOnlyDelegation: true, parallelWrites: false, skills: true, mcp: true, durableCapabilityPolicy: "explicit-selection-host-allowlist-v1", remoteFederation: false, offlineBackup: true, conversationHandoff: true,
   durableWaits: true, durableDelegation: true, deadlineScheduling: true, questionNotifications: true, lifecycleNotifications: true, adjustableLimits: true,
   taskRouting: true, safeFollowups: true, delegationStrategyVersion: 2, defaultDelegationDepth: 1, autoParallelBranches: 2,
@@ -83,16 +86,21 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
           if (url.pathname === "/plugins") return Response.json(plugins?.list() ?? []);
           if (request.method === "GET" && url.pathname === "/plugins/references") return Response.json(profile.references(store));
           if (request.method === "GET" && url.pathname === "/plugins/recovery") return Response.json(await profile.checkRecovery(store));
+          if (request.method === "POST" && url.pathname === "/agent-tasks") {
+            const input = validateAgentTaskInput(await request.json());
+            return await serialCommand(async () => Response.json(await runtime.submitDomain(input, { domainOnly: true })));
+          }
           if (request.method === "GET") {
+            if (url.pathname === "/adapters") return Response.json(runtime.domains.catalog());
             if (url.pathname === "/presentation") {
-              const workspace = await realpath(url.searchParams.get("workspace") ?? ""); const runId = url.searchParams.get("runId");
+              const workspace = await canonicalTaskScope(url.searchParams.get("workspace") ?? ""); const runId = url.searchParams.get("runId");
               if (!runId) return Response.json(presentRuns(runtime, workspace));
               if (store.record<{ workspace: string }>("configuration", runId)?.value.workspace !== workspace) throw new Error("Task is outside the current workspace");
               return Response.json(await presentRunDetail(runtime, runId));
             }
             if (url.pathname === "/health") return Response.json({ ready: ready && !runtime.lastError, pid: process.pid, build: buildInfo(), error: runtime.lastError, capabilities: RUNTIME_CAPABILITIES });
             if (url.pathname === "/routing") {
-              const workspace = await realpath(url.searchParams.get("workspace") ?? "");
+              const workspace = await canonicalTaskScope(url.searchParams.get("workspace") ?? "");
               if (url.searchParams.has("inputId")) {
                 const decision = store.route<RoutingDecision>(url.searchParams.get("inputId")!);
                 return Response.json(decision?.workspace === workspace ? [decision] : []);
@@ -137,7 +145,7 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
             if (input.expectedRevision !== undefined && (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 1)) throw new Error("Invalid expected Run revision");
             if (input.action === "stop") { closing = true; setTimeout(() => { stopping.abort(); stopped.resolve(); }, 20); return Response.json({ stopping: true }); }
             if (input.action === "route-control") {
-              if (!input.source || await realpath(input.source.workspace) !== input.source.workspace) throw new Error("Canonical input source is required");
+              if (!input.source || await canonicalTaskScope(input.source.workspace) !== input.source.workspace) throw new Error("Canonical input source is required");
               return Response.json(runtime.router.clarifyControl({ commandId: input.commandId, source: input.source, action: input.routeAction! }));
             }
             if (input.action === "resolve-route") {
@@ -157,7 +165,7 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
             }
             if (input.action === "submit") return Response.json(await runtime.submit({ commandId: input.commandId, objective: input.objective!, configuration: { ...input.configuration!, strategyVersion: 2 }, mode: input.mode, deadline: input.deadline, source: input.source, successorOf: input.successorOf }));
             if (input.action === "followup") {
-              const workspace = await realpath(input.workspace ?? input.source?.workspace ?? "");
+              const workspace = await canonicalTaskScope(input.workspace ?? input.source?.workspace ?? "");
               return Response.json(runtime.router.followup({ commandId: input.commandId, runId: input.runId, taskId: input.taskId,
                 resolveInputId: input.resolveInputId, expectedRevision: input.expectedRevision,
                 source: input.source ?? { inputId: input.inputId ?? input.commandId, workspace, rawText: input.text ?? "Resolve original input", source: "api" } }));

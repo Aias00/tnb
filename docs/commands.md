@@ -349,3 +349,17 @@ Web 状态使用真实事件区分请求模型、思考、准备工具、运行�
 FileChanged 对明确配置的文件 matcher 增加 500ms 元数据轮询兜底，恢复可能丢失的原生文件通知；与原生事件合并去重，关闭监听后不再触发。该兜底不递归扫描整个工程。
 
 上下文页脚的数据来源明确区分：恢复时为“历史文本 ≈N tokens”，不是完整请求；主对话准备请求后为“上下文 ≈N%”，包含已准备的系统提示/工具定义/文本；有媒体时明确标为文本估算并附“+媒体”。模型返回输入用量后为不带 ≈ 的实报占比。输出-only usage 不会清零输入。上述显示不使用会话累计 token 推算当前上下文，也不改变额度限制。
+
+
+## Explicit domain tasks
+
+Installed business Adapters can be selected without replacing the default Coding route:
+
+```sh
+tnb runtime adapters
+tnb runtime submit "Review the ticket" --adapter ./task.json --namespace support --mode single
+tnb runtime list --namespace support
+tnb runtime followup <run-id> --namespace support --text "Additional acceptance criteria"
+```
+
+The same options work with `/runtime submit` and `/task`; implicit `/task status --namespace support` selection stays inside that namespace. The descriptor is bounded JSON containing business config, resource claims and capability grants. Coding flags cannot be mixed into a domain submission. See [domain tasks](guides/domain-tasks.md) for setup, questions, recovery and client API contracts.

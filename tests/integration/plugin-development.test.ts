@@ -25,7 +25,7 @@ for (const template of ["agent", "application", "channel"] as const) {
     const f = await fixture();
     const initialized = await f.cli("init", "my-plugin", "--template", template, "--json");
     expect(initialized.code, initialized.stderr).toBe(0); expect(JSON.parse(initialized.stdout).template).toBe(template);
-    expect((await readdir(f.directory)).sort()).toEqual(["README.md", "index.mjs", "plugin.json", "plugin.test.json"]);
+    expect((await readdir(f.directory)).sort()).toEqual(["README.md", "index.mjs", "plugin.json", "plugin.test.json", ...(template === "agent" ? ["task.json"] : [])]);
     const validated = await f.cli("validate", "my-plugin", "--json");
     expect(validated.code, validated.stdout).toBe(0); expect(JSON.parse(validated.stdout).plugin.name).toBe("my-plugin");
     expect((await f.cli("test", "my-plugin")).stderr).toContain("--yes");

@@ -35,6 +35,7 @@ export function typescriptPluginTemplate(name: string, template: PluginTemplate,
     "src/index.ts": processSource ?? imports + helper + source + "\nexport default definePlugin(setup);\n",
     "plugin.json": JSON.stringify(manifest, null, 2) + "\n",
     "plugin.test.json": test,
+    ...(files["task.json"] ? { "task.json": files["task.json"] } : {}),
     "package.json": JSON.stringify({ name: `${name}-development`, private: true, type: "module", scripts: {
       typecheck: "tsc --noEmit", build: "bun scripts/build.ts", validate: "tnb plugins validate package", test: "tnb plugins test package --yes",
       check: "bun run typecheck && bun run build && bun run validate && bun run test",
@@ -49,11 +50,11 @@ const stage = await mkdtemp(join(root, ".plugin-build-"));
 try {
   const built = await Bun.build({ entrypoints: [join(root, "src/index.ts")], target: "bun", format: "esm", outdir: stage, naming: "index.mjs", packages: "bundle" });
   if (!built.success) throw new AggregateError(built.logs, "Plugin build failed");
-  for (const name of ["plugin.test.json", "plugin.json"]) await writeFile(join(stage, name), await readFile(join(root, name)));
+  for (const name of ${JSON.stringify(["plugin.test.json", "plugin.json", ...(template === "agent" ? ["task.json"] : [])])}) await writeFile(join(stage, name), await readFile(join(root, name)));
   await rename(stage, out); console.log("Built installable package/");
 } finally { await rm(stage, { recursive: true, force: true }); }
 `,
     ".gitignore": "node_modules/\npackage/\n.plugin-build-*/\n",
-    "README.md": `# ${name}\n\nTypeScript ${template} plugin using the standalone @tnb/plugin-sdk tarball delivered with TNB. No registry publication is assumed.\n\n\`\`\`sh\nbun install --ignore-scripts\nbun run typecheck\nbun run build\nbun run validate\nbun run test\n# Or: bun run check\n\`\`\`\n\nKeep tnb on PATH. Edit src/index.ts and plugin.test.json; type checking includes full SDK declarations without skipLibCheck. The Agent transport is an offline fixture. SDK package paths are local development dependencies; use --sdk to select another tarball when creating the project, or update package.json if you move it.\n\nOnly package/ is installable. It contains bundled index.mjs, plugin.json and plugin.test.json; it does not require node_modules at runtime.\n\n\`\`\`sh\ntnb plugins install ./package\ntnb plugins trust ${name} --yes\ntnb plugins enable ${name}\ntnb runtime restart\n\`\`\`\n\nThe test command executes trusted code with temporary state, not an OS sandbox. Real model credentials, host services and business acceptance remain explicit integrations. Adapter installation alone does not add a default CLI task route.\n`,
+    "README.md": `# ${name}\n\nTypeScript ${template} plugin using the standalone @tnb/plugin-sdk tarball delivered with TNB. No registry publication is assumed.\n\n\`\`\`sh\nbun install --ignore-scripts\nbun run typecheck\nbun run build\nbun run validate\nbun run test\n# Or: bun run check\n\`\`\`\n\nKeep tnb on PATH. Edit src/index.ts and plugin.test.json; type checking includes full SDK declarations without skipLibCheck. The Agent transport is an offline fixture. SDK package paths are local development dependencies; use --sdk to select another tarball when creating the project, or update package.json if you move it.\n\nOnly package/ is installable. It contains bundled index.mjs, plugin.json and plugin.test.json; it does not require node_modules at runtime.\n\n\`\`\`sh\ntnb plugins install ./package\ntnb plugins trust ${name} --yes\ntnb plugins enable ${name}\ntnb runtime restart\n\`\`\`\n\nThe test command executes trusted code with temporary state, not an OS sandbox. Real model credentials, host services and business acceptance remain explicit integrations. The Agent template also ships task.json: use tnb runtime adapters, then tnb runtime submit "Read the authorized message" --adapter ./package/task.json --namespace demo after installation. The default Coding route stays explicit.\n`,
   };
 }

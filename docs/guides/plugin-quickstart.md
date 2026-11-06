@@ -26,7 +26,7 @@ tnb plugins init ./my-channel --template channel
 | `application` | 有持久计数的应用，以及调用该应用的界面 handler | GET/POST 响应、相同 commandId 不重复计数、界面依赖调用 |
 | `channel` | 本地事件拉取、发送回执、回执查询 | 游标不重复投递、重复发送返回同一回执、find 核对 |
 
-每个模板生成四个文件：`plugin.json` 声明贡献，`index.mjs` 注册和实现，`plugin.test.json` 定义测试输入/断言，`README.md` 给出下一步操作。包代码没有 TNB 仓库内部导入，移出源码仓库仍可安装。目标目录须不存在；`init` 不覆盖已有项目。目录名不适合作为包名时使用 `--name my-plugin`。
+每个模板生成四个基础文件，Agent 模板另含可提交的 `task.json`：`plugin.json` 声明贡献，`index.mjs` 注册和实现，`plugin.test.json` 定义测试输入/断言，`README.md` 给出下一步操作。包代码没有 TNB 仓库内部导入，移出源码仓库仍可安装。目标目录须不存在；`init` 不覆盖已有项目。目录名不适合作为包名时使用 `--name my-plugin`。
 
 ## 修改后的检查循环
 
@@ -82,4 +82,4 @@ tnb runtime restart
 tnb runtime plugins
 ```
 
-安装包和服务授权仍分别管理。Adapter 安装后可由 SDK 选择；当前默认 CLI 的任务入口仍是 Coding，安装不自动新增任意领域提交路由。应用/界面需要宿主请求入口，渠道需要显式配置 Source；下一步分别见[宿主接入与路由](host-plugins.md)和[协作来源](collaboration.md)。这种选择不会为了通过测试而修改宿主核心。
+安装包和服务授权仍分别管理。Agent 模板会生成 `task.json`；安装并重启 Owner 后，可用 `tnb runtime adapters` 查看，再以 `tnb runtime submit "目标" --adapter ./my-agent/task.json --namespace demo` 显式提交，详见[业务任务入口](domain-tasks.md)。TypeScript 构建会复制描述到 `package/task.json`。应用/界面需要宿主请求入口，渠道需要显式配置 Source；分别见[宿主接入与路由](host-plugins.md)和[协作来源](collaboration.md)。

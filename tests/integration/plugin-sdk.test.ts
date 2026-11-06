@@ -1,3 +1,4 @@
+import { readDomainSubmission } from "../../src/services/cli/domain-submission";
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { delimiter, join, resolve } from "node:path";
@@ -61,6 +62,10 @@ for (const [template, execution] of [["agent", "in-process"], ["application", "i
   await writeFile(entry, original);
   const built = await command([process.execPath, "run", "build"], project);
   expect(built.code, built.stdout + built.stderr).toBe(0);
+  if (template === "agent") {
+    const task = await readDomainSubmission(["submit", "Read the message", "--adapter", "package/task.json", "--namespace", "sdk-demo"], project);
+    expect(task.adapter.id).toBe("typed-plugin"); expect(task.adapter.config).toEqual({ message: "Hello from my plugin" });
+  }
   // Runtime artifact must work without the development SDK or compiler installed beside it.
   await rm(join(project, "node_modules"), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   const validation = await validatePluginPackage(join(project, "package")); expect(validation.ok, JSON.stringify(validation)).toBe(true);
