@@ -1,5 +1,5 @@
 import { readFile, readdir, realpath, stat } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { gte, lte, valid } from "semver";
 
 import type { ExtensionDeclaration, ContributionReference, ExtensionKind } from "../../agent/extensions";
@@ -169,10 +169,67 @@ export type PluginLoadResult = {
   errors: Array<{ path: string; error: string }>;
 };
 
+export type PluginLoadOptions = { trustStorePath?: string; includeDisabled?: boolean; blockedFingerprints?: readonly string[] };
+
+/** Inspect exactly one package using discovery's parser; never imports executable entries. */
+export async function loadPluginDirectory(directory: string, source: LoadedPlugin["source"] = "user", enabled: Record<string, boolean> = {}, options: PluginLoadOptions = {}): Promise<LoadedPlugin> {
+  const root = await realpath(directory);
+  const manifest = await readManifest(root, basename(root));
+  return describePlugin(root, manifest, source, enabled, options);
+}
+
+async function describePlugin(root: string, manifest: Awaited<ReturnType<typeof readManifest>>, source: LoadedPlugin["source"], enabled: Record<string, boolean>, options: PluginLoadOptions): Promise<LoadedPlugin> {
+  const explicitlyEnabled = enabled[manifest.name] === true || enabled[manifest.name.toLowerCase()] === true;
+  const skillsDir = join(root, "skills");
+  const agentsDir = join(root, "agents");
+  const commandsDir = join(root, "commands");
+  const hooksPath = manifest.hooks ? contributionPath(root, manifest.hooks, "hooks") : undefined;
+  const mcpPath = manifest.mcpServers ? contributionPath(root, manifest.mcpServers, "mcpServers") : undefined;
+  const fingerprint = options.trustStorePath || options.blockedFingerprints?.length ? await computePluginTreeSha256(root) : undefined;
+  const trust = options.trustStorePath && fingerprint
+    ? await pluginTrustState(options.trustStorePath, root, fingerprint)
+    : "not-required";
+  const policy = resolvePluginPolicy({ ...manifest, fingerprint, trust }, { enabled, blockedFingerprints: options.blockedFingerprints });
+  return {
+    ...manifest,
+    root,
+    source,
+    explicitlyEnabled,
+    active: policy.status === "ready",
+    policy,
+    ...(fingerprint ? { fingerprint } : {}),
+    trust,
+    skillsDir,
+    agentsDir,
+    commandsDir,
+    ...(hooksPath ? { hooksPath } : {}),
+    ...(mcpPath ? { mcpPath } : {}),
+    ...(manifest.tools?.length ? { tools: manifest.tools } : {}),
+    contributionSummary: {
+      skills: await directoryExists(skillsDir),
+      agents: await directoryExists(agentsDir),
+      commands: await directoryExists(commandsDir),
+      hooks: Boolean(hooksPath),
+      mcpServers: Boolean(mcpPath),
+      builtInTools: manifest.toolContributions
+        .filter((tool): tool is BuiltInPluginToolContribution => tool.type === "builtin")
+        .map((tool) => tool.id),
+      externalTools: manifest.toolContributions
+        .filter((tool): tool is ExternalPluginToolContribution => tool.type === "external")
+        .map((tool) => tool.id),
+      ...Object.fromEntries((["application", "interface", "channel"] as const).flatMap(kind => {
+        const values = manifest.extensionContributions?.filter(item => item.kind === kind).map(item => `${item.id}@${item.version}`) ?? [];
+        return values.length ? [[`${kind}s`, values]] : [];
+      })),
+      ...(manifest.adapterContributions?.length ? { adapters: manifest.adapterContributions.map(adapter => `${adapter.id}@${adapter.version}`) } : {}),
+    },
+  };
+}
+
 export async function loadPlugins(
   roots: Array<{ directory: string; source: LoadedPlugin["source"] }>,
   enabled: Record<string, boolean> = {},
-  options: { trustStorePath?: string; includeDisabled?: boolean; blockedFingerprints?: readonly string[] } = {},
+  options: PluginLoadOptions = {},
 ): Promise<PluginLoadResult> {
   const plugins = new Map<string, LoadedPlugin>();
   const errors: PluginLoadResult["errors"] = [];
@@ -194,52 +251,8 @@ export async function loadPlugins(
         const key = manifest.name.toLowerCase();
         const disabled = enabled[manifest.name] === false || enabled[key] === false;
         if (disabled && !options.includeDisabled) continue;
-        const explicitlyEnabled = enabled[manifest.name] === true || enabled[key] === true;
         if (plugins.has(key)) continue;
-        const skillsDir = join(root, "skills");
-        const agentsDir = join(root, "agents");
-        const commandsDir = join(root, "commands");
-        const hooksPath = manifest.hooks ? contributionPath(root, manifest.hooks, "hooks") : undefined;
-        const mcpPath = manifest.mcpServers ? contributionPath(root, manifest.mcpServers, "mcpServers") : undefined;
-        const fingerprint = options.trustStorePath || options.blockedFingerprints?.length ? await computePluginTreeSha256(root) : undefined;
-        const trust = options.trustStorePath && fingerprint
-          ? await pluginTrustState(options.trustStorePath, root, fingerprint)
-          : "not-required";
-        const policy = resolvePluginPolicy({ ...manifest, fingerprint, trust }, { enabled, blockedFingerprints: options.blockedFingerprints });
-        plugins.set(key, {
-          ...manifest,
-          root,
-          source: source.source,
-          explicitlyEnabled,
-          active: policy.status === "ready",
-          policy,
-          ...(fingerprint ? { fingerprint } : {}),
-          trust,
-          skillsDir,
-          agentsDir,
-          commandsDir,
-          ...(hooksPath ? { hooksPath } : {}),
-          ...(mcpPath ? { mcpPath } : {}),
-          ...(manifest.tools?.length ? { tools: manifest.tools } : {}),
-          contributionSummary: {
-            skills: await directoryExists(skillsDir),
-            agents: await directoryExists(agentsDir),
-            commands: await directoryExists(commandsDir),
-            hooks: Boolean(hooksPath),
-            mcpServers: Boolean(mcpPath),
-            builtInTools: manifest.toolContributions
-              .filter((tool): tool is BuiltInPluginToolContribution => tool.type === "builtin")
-              .map((tool) => tool.id),
-            externalTools: manifest.toolContributions
-              .filter((tool): tool is ExternalPluginToolContribution => tool.type === "external")
-              .map((tool) => tool.id),
-            ...Object.fromEntries((["application", "interface", "channel"] as const).flatMap(kind => {
-              const values = manifest.extensionContributions?.filter(item => item.kind === kind).map(item => `${item.id}@${item.version}`) ?? [];
-              return values.length ? [[`${kind}s`, values]] : [];
-            })),
-            ...(manifest.adapterContributions?.length ? { adapters: manifest.adapterContributions.map(adapter => `${adapter.id}@${adapter.version}`) } : {}),
-          },
-        });
+        plugins.set(key, await describePlugin(root, manifest, source.source, enabled, options));
       } catch (error) {
         errors.push({ path: candidate, error: error instanceof Error ? error.message : String(error) });
       }

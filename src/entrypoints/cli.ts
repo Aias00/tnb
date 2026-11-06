@@ -6070,7 +6070,7 @@ if (import.meta.main) {
     }
   } else if (argv.length === 0 ? false : argv[0] === "--help" || argv[0] === "-h" || argv[0] === "help") {
     process.stdout.write(CLI_HELP);
-  } else if (argv[0] && SIMPLE_COMMAND_HELP[argv[0]] && (argv.includes("--help") || argv.includes("-h"))) {
+  } else if (argv[0] && argv[0] !== "plugins" && SIMPLE_COMMAND_HELP[argv[0]] && (argv.includes("--help") || argv.includes("-h"))) {
     process.stdout.write(`Usage: ${SIMPLE_COMMAND_HELP[argv[0]]}\n`);
   } else if (argv[0] === "config") {
     process.exitCode = await runConfigCommand({ argv, env: process.env, cwd: process.cwd(), stdout: process.stdout, stderr: process.stderr });

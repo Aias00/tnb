@@ -37,7 +37,7 @@ _tnb_completion() {
       if [[ \${COMP_CWORD} -eq 2 ]]; then COMPREPLY=( $(compgen -W '${PROVIDER_ACTIONS.join(" ")}' -- "\${current}") ); fi ;;
     mcp)
       if [[ \${COMP_CWORD} -eq 2 ]]; then COMPREPLY=( $(compgen -W '${MCP_ACTIONS.join(" ")}' -- "\${current}") ); fi ;;
-    plugins) COMPREPLY=( $(compgen -W 'list show marketplace search install update remove enable disable --marketplace --project --yes --json' -- "\${current}") ) ;;
+    plugins) COMPREPLY=( $(compgen -W 'init validate test list show marketplace search install update remove enable disable trust untrust --template --name --marketplace --project --yes --json' -- "\${current}") ) ;;
     skills) COMPREPLY=( $(compgen -W 'list show install remove --project --yes --json' -- "\${current}") ) ;;
     sessions) COMPREPLY=( $(compgen -W 'list show delete --yes --json' -- "\${current}") ) ;;
     jobs) COMPREPLY=( $(compgen -W 'list show rm --yes --discard-changes --json' -- "\${current}") ) ;;
@@ -66,7 +66,7 @@ ${COMMANDS.map((command) => `    '${command}:${command.replaceAll("-", " ")}'`).
         completion) _values 'shell' bash zsh fish ;;
         provider) _values 'provider action' ${PROVIDER_ACTIONS.join(" ")} ;;
         mcp) _values 'MCP action' ${MCP_ACTIONS.join(" ")} ;;
-        plugins) _values 'plugin action' list show marketplace search install update remove enable disable ;;
+        plugins) _values 'plugin action' init validate test list show marketplace search install update remove enable disable trust untrust ;;
         skills) _values 'Skill action' list show install remove ;;
         sessions) _values 'session action' list show delete ;;
         jobs) _values 'job action' list show rm ;;
@@ -85,6 +85,7 @@ function fishCompletion(): string {
     "complete -c tnb -n '__fish_seen_subcommand_from completion' -a 'bash zsh fish'",
     `complete -c tnb -n '__fish_seen_subcommand_from provider' -a '${PROVIDER_ACTIONS.join(" ")}'`,
     `complete -c tnb -n '__fish_seen_subcommand_from mcp' -a '${MCP_ACTIONS.join(" ")}'`,
+    "complete -c tnb -n '__fish_seen_subcommand_from plugins' -a 'init validate test list show marketplace search install update remove enable disable trust untrust'",
     "complete -c tnb -s h -l help -d 'Show help'",
     "complete -c tnb -s V -l version -d 'Show version'",
     "complete -c tnb -l provider -r -d 'Provider id'",

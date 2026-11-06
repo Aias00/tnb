@@ -17,5 +17,5 @@ export const SIMPLE_COMMAND_HELP: Record<string, string> = {
   skills: "tnb skills [list|show <name>|install <dir>|remove <name> --yes] [--project] [--json]",
   agents: "tnb agents [--json]",
   hooks: "tnb hooks [--json]",
-  plugins: "tnb plugins [list|show|marketplace|search|install|update|remove|enable|disable|trust|untrust] [name] [--project] [--yes]",
+  plugins: "tnb plugins [init|validate|test|list|show|marketplace|search|install|update|remove|enable|disable|trust|untrust] [directory|name] [--template agent|application|channel] [--project] [--yes] [--json]",
 };

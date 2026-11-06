@@ -19,6 +19,7 @@ import {
 import { loadSkills, parseSkillMarkdown } from "../skills/loader";
 import { bundledSkills } from "../skills/bundled";
 import { loadPlugins } from "../plugins/loader";
+import { runPluginDevelopmentCommand, PLUGIN_DEVELOPMENT_HELP } from "./plugin-development";
 import { pluginTrustStorePath, revokePluginTrust, trustPlugin } from "../plugins/trust";
 import {
   installLocalPlugin,
@@ -834,6 +835,8 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
     }
     if (command === "plugins") {
       const action = options.argv[1] ?? "list";
+      if (["init", "validate", "test"].includes(action)) return await runPluginDevelopmentCommand(options);
+      if (["--help", "-h", "help"].includes(action) || options.argv.includes("--help") || options.argv.includes("-h")) { options.stdout.write(PLUGIN_DEVELOPMENT_HELP + "\nInstalled plugins: list, show, install, update, remove, enable, disable, trust, untrust, marketplace, search.\n"); return 0; }
       if (action === "marketplace" || action === "search") {
         const sources = await configuredMarketplaceSources(configDir, options.env);
         if (!sources.length) throw new Error("No plugin marketplace configured; set TNB_PLUGIN_MARKETPLACE or ~/.tnb/marketplaces.json");

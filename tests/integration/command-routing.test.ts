@@ -44,7 +44,7 @@ test("unknown and slash-only shell commands fail explicitly rather than opening 
 });
 
 test("nested help never executes mutation or remote actions", async () => {
-  for (const argv of [["provider", "remove", "sample", "--help"], ["mcp", "add", "sample", "--help"], ["update", "--rollback", "--help"], ["goal-loop-stop", "sample", "--help"]]) {
+  for (const argv of [["provider", "remove", "sample", "--help"], ["mcp", "add", "sample", "--help"], ["update", "--rollback", "--help"], ["goal-loop-stop", "sample", "--help"], ["plugins", "init", "sample", "--help"], ["plugins", "test", "sample", "--help"], ["plugins", "remove", "sample", "--help"]]) {
     const result = await cli(argv);
     expect(result.code, result.stderr).toBe(0);
     expect(result.stdout).toContain("Usage:");
