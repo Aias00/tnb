@@ -54,7 +54,8 @@
     "./runtime": "./src/services/runtime/index.ts",
     "./agent/plugins": "./src/agent/plugins.ts",
     "./agent/extensions": "./src/agent/extensions.ts",
-    "./agent/services": "./src/agent/services.ts"
+    "./agent/services": "./src/agent/services.ts",
+    "./plugin-sdk": "./src/plugin-sdk/index.ts"
   },
   "license": "Apache-2.0",
   "private": true,
@@ -66,7 +67,9 @@
     "build": "bun ./scripts/build.ts",
     "release:current": "bun ./scripts/release-current.ts",
     "install:local": "bun ./scripts/install-local.ts",
-    "provider:smoke": "bun ./scripts/provider-smoke-matrix.ts"
+    "provider:smoke": "bun ./scripts/provider-smoke-matrix.ts",
+    "sdk:setup": "bun install --cwd tools/plugin-sdk-build --frozen-lockfile --ignore-scripts",
+    "sdk:build": "bun ./scripts/build-plugin-sdk.ts"
   },
   "type": "module"
 }

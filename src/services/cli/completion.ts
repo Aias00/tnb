@@ -37,7 +37,7 @@ _tnb_completion() {
       if [[ \${COMP_CWORD} -eq 2 ]]; then COMPREPLY=( $(compgen -W '${PROVIDER_ACTIONS.join(" ")}' -- "\${current}") ); fi ;;
     mcp)
       if [[ \${COMP_CWORD} -eq 2 ]]; then COMPREPLY=( $(compgen -W '${MCP_ACTIONS.join(" ")}' -- "\${current}") ); fi ;;
-    plugins) COMPREPLY=( $(compgen -W 'init validate test list show marketplace search install update remove enable disable trust untrust --template --name --marketplace --project --yes --json' -- "\${current}") ) ;;
+    plugins) COMPREPLY=( $(compgen -W 'init validate test list show marketplace search install update remove enable disable trust untrust --template --name --language --sdk --marketplace --project --yes --json' -- "\${current}") ) ;;
     skills) COMPREPLY=( $(compgen -W 'list show install remove --project --yes --json' -- "\${current}") ) ;;
     sessions) COMPREPLY=( $(compgen -W 'list show delete --yes --json' -- "\${current}") ) ;;
     jobs) COMPREPLY=( $(compgen -W 'list show rm --yes --discard-changes --json' -- "\${current}") ) ;;

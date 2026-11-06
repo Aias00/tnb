@@ -11,6 +11,8 @@ tnb plugins test . --yes
 
 不需要 API Key、依赖下载或构建。默认 Agent 模板通过离线模型调用 `read_message`，内核持久记录工具结果，领域 `accept` 核对实际回执后接受报告。通过测试说明这条真实接入链路可以运行；离线模型只是演示，接入真实业务时替换 `createWorker` 的 transport、工具和验收逻辑。
 
+需要 TypeScript 类型提示和标准工程结构时，加 `--language typescript`，再执行 `bun install --ignore-scripts`、`bun run check`。独立 `@tnb/plugin-sdk` 的本地 tarball 随 TNB 构建交付，详见[SDK 开发指南](plugin-sdk.md)。
+
 ## 按职责选择模板
 
 ```sh

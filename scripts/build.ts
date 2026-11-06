@@ -5,6 +5,7 @@ import { codingPluginFingerprint } from "../src/adapters/coding/identity";
 import { buildCodingRecoveryPackage } from "../src/adapters/coding/recovery-package";
 import { unpackPlugin } from "../src/agent/packed-plugin";
 import { buildChannelsRecoveryPackage } from "../src/plugins/channels/recovery-package";
+import { buildPluginSdk } from "./build-plugin-sdk";
 
 const root = resolve(import.meta.dir, "..");
 const outputDirectory = join(root, "dist");
@@ -21,6 +22,7 @@ const nativePackage = join(
 const nativeLibrary = join(nativePackage, "lib");
 
 await mkdir(outputDirectory, { recursive: true });
+await buildPluginSdk(root, outputDirectory);
 const codingPackage = await buildCodingRecoveryPackage(root);
 const channelsPackage = await buildChannelsRecoveryPackage(root);
 const build = await Bun.build({ entrypoints: [join(root, "src/entrypoints/cli.ts")], target: "bun", compile: { outfile: join(outputDirectory, cliName) },

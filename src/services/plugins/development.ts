@@ -10,6 +10,8 @@ import { validateDomainDescriptor, type DomainDescriptor, type JsonValue } from 
 import type { ContributionReference, ChannelDescriptor, ChannelMessage } from "../../agent/extensions";
 import { digestJson } from "../runtime/json";
 import type { Operation } from "../runtime/journal";
+import { typescriptPluginTemplate } from "./typescript-template";
+import packageJson from "../../../package.json";
 
 type TaskScenario = { kind: "task"; objective: string; adapter: DomainDescriptor; expect: { reportIncludes: string; tools?: string[] } };
 type RequestScenario = { kind: "request"; contribution: ContributionReference & { kind: "application" | "interface" }; path: string; method: "GET" | "POST"; body?: JsonValue; expect: { status: number; json?: JsonValue; textIncludes?: string } };
@@ -54,16 +56,23 @@ export async function readPluginTests(directory: string): Promise<PluginTestSpec
   return value as PluginTestSpecification;
 }
 
-export async function initializePlugin(directory: string, template: PluginTemplate, name = basename(resolve(directory))) {
+export async function initializePlugin(directory: string, template: PluginTemplate, name = basename(resolve(directory)), options: { language?: "javascript" | "typescript"; sdkTarball?: string } = {}) {
   if (!PLUGIN_TEMPLATES.includes(template)) throw new Error("--template must be agent, application or channel");
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(name)) throw new Error("Use --name with a valid plugin name (letters, numbers, _ or -; at most 64 characters)");
   const target = resolve(directory);
+  let sdkTarball: string | undefined;
+  if (options.language === "typescript") {
+    const filename = `tnb-plugin-sdk-${packageJson.version}.tgz`;
+    const candidates = options.sdkTarball ? [resolve(options.sdkTarball)] : [join(dirname(process.execPath), filename), resolve(import.meta.dir, "../../../dist", filename)];
+    for (const candidate of candidates) if (candidate.endsWith(".tgz") && await Bun.file(candidate).exists() && (await lstat(candidate)).isFile()) { sdkTarball = candidate; break; }
+    if (!sdkTarball) throw new Error("Plugin SDK tarball not found; build it with bun run sdk:setup && bun run sdk:build, or pass --sdk /path/to/sdk.tgz");
+  }
   await mkdir(dirname(target), { recursive: true });
   await mkdir(target, { mode: 0o700 }); // Deliberately refuses existing paths, including empty directories and symlinks.
   try {
-    const files = pluginTemplate(name, template);
-    for (const [path, content] of Object.entries(files)) await writeFile(join(target, path), content, { flag: "wx" });
-    return { directory: target, name, template, files: Object.keys(files) };
+    const files = sdkTarball ? typescriptPluginTemplate(name, template, sdkTarball) : pluginTemplate(name, template);
+    for (const [path, content] of Object.entries(files)) { await mkdir(dirname(join(target, path)), { recursive: true }); await writeFile(join(target, path), content, { flag: "wx" }); }
+    return { directory: target, name, template, language: options.language ?? "javascript", files: Object.keys(files), ...(sdkTarball ? { sdkTarball } : {}) };
   } catch (error) { await rm(target, { recursive: true, force: true }); throw error; }
 }
 

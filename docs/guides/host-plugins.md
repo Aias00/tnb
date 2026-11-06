@@ -2,6 +2,8 @@
 
 初次开发先看[创建与验证插件](plugin-quickstart.md)：`tnb plugins init ./my-agent` → `tnb plugins validate ./my-agent` → `tnb plugins test ./my-agent --yes`。三种独立模板提供可直接运行的接入起点，验证后再安装到正式宿主。
 
+需要类型提示时使用 `--language typescript` 和独立 `@tnb/plugin-sdk`，通过 `bun run check` 完成构建及试跑。SDK 的本地分发、公开入口与宿主职责见[作者 SDK](plugin-sdk.md)。
+
 TNB 的执行内核管理任务、恢复、预算、权限和持久状态；插件宿主管理可替换能力。领域适配器、常驻应用、交互接口、渠道使用同一套安装、信任、私有内容快照和固定代际机制。已有 skills、commands、hooks、MCP、工具插件仍按原贡献协议使用，没有另设安装目录或另一套信任表。宿主插件注册不会自动把能力暴露为模型工具；模型仍通过原工具目录、领域能力授权和 MCP/skill 管理机制使用能力。
 
 | 贡献 | 注册接口 | 职责 |

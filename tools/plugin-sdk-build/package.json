@@ -1,0 +1,8 @@
+{
+  "name": "tnb-plugin-sdk-build-tools",
+  "private": true,
+  "dependencies": {
+    "dts-bundle-generator": "9.5.1",
+    "typescript": "5.9.3"
+  }
+}

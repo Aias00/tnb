@@ -595,6 +595,7 @@ the established 200-turn fork limit.
 
 ```bash
 bun install
+bun run sdk:setup
 bun test
 bun run typecheck
 bun run build
@@ -631,6 +632,8 @@ self-update manifest alongside the binary and `SHA256SUMS`.
 场景、应用、交互与渠道使用统一插件包、信任和生命周期。协作应用及 GitHub/webhook/timer 已通过插件组合；安装、自定义渠道、依赖、服务授权与恢复边界见 [插件宿主指南](docs/guides/host-plugins.md)。
 
 开发新插件可从 `tnb plugins init ./my-agent` 开始，再运行 `tnb plugins validate ./my-agent` 和 `tnb plugins test ./my-agent --yes`。提供 Agent、应用/界面、渠道模板，无需 API Key 即可验证真实宿主接入，见[插件快速开始](docs/guides/plugin-quickstart.md)。
+
+TypeScript 作者可用 `--language typescript` 创建项目，通过 `bun run check` 完成类型检查、构建、校验和真实试跑。独立 `@tnb/plugin-sdk` 以本地 `.tgz` 随构建产物交付，尚未发布到注册表，见[SDK 使用和分发](docs/guides/plugin-sdk.md)。
 
 宿主服务支持类型化引用、工厂依赖和按贡献管理的生命周期，默认 Web/协作/渠道已使用同一协议，见[服务接入指南](docs/guides/plugin-services.md)。运行 `bun examples/typed-plugin-service.ts` 可验证一个无需模型的完整服务样例。
 
