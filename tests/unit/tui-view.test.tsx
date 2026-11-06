@@ -748,3 +748,27 @@ test("session metadata keeps timestamps and IDs on their own indented rows", () 
     expect(dateRow).not.toContain("1eb5b835");
   }
 });
+
+test("wide footer spreads metadata and puts shortcuts and totals on the same aligned row", () => {
+  const state = createTuiState("glm-5", "bypassPermissions", { usage: { inputTokens:139128, outputTokens:265, cacheReadInputTokens:0, cacheCreationInputTokens:0, costUsd:0 } });
+  const frame = renderToString(<TuiView state={state} input="" cursor={0} columns={180} rows={24} workspaceLabel="/Users/aias/Work/claude-code (main)" />, { columns:180 });
+  const lines = frame.split("\n");
+  const totals = lines.find(line => line.includes("会话累计"))!;
+  expect(totals).toContain("enter send");
+  const { stringWidth } = require("../../src/ui/ink/stringWidth");
+  expect(stringWidth(totals.slice(0,totals.indexOf("会话累计")))).toBeGreaterThan(100);
+  expect(lines.find(line=>line.includes("glm-5"))).toContain("/Users/aias/Work/claude-code (main)");
+  expect(lines.filter(line=>line.includes("会话累计") || line.includes("glm-5") || line.includes("enter send"))).toHaveLength(2);
+});
+
+test("horizontal footer stays within standard widths and keeps the invocation budget visible", () => {
+  const base = createTuiState("glm-5", "bypassPermissions", { usage: { inputTokens:139128, outputTokens:265, cacheReadInputTokens:0, cacheCreationInputTokens:0, costUsd:1.2345 } });
+  const state = { ...base, invocationUsage: { ...base.invocationUsage, costUsd:0.0123 } };
+  const { stringWidth } = require("../../src/ui/ink/stringWidth");
+  for (const columns of [80,100,180]) {
+    const frame = renderToString(<TuiView state={state} input="" cursor={0} columns={columns} rows={24} invocationBudgetUsd={1} workspaceLabel="/Users/aias/开发/很长的工程路径/项目 (main)" />, { columns });
+    expect(frame).toContain("本轮 $0.0123/$1.00"); expect(frame).toContain("bypassPermissions");
+    expect(frame.split("\n").find(line=>line.includes("会话累计"))).toContain("enter send");
+    for (const line of frame.split("\n")) expect(stringWidth(line)).toBeLessThanOrEqual(columns);
+  }
+});

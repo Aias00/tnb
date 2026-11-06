@@ -1,6 +1,7 @@
 import React, { memo, useCallback, useEffect, useRef, useState } from "react";
 import figures from "figures";
 import stripAnsi from "strip-ansi";
+import { stringWidth } from "./ink/stringWidth";
 import { Box, ScrollBox, Text, type DOMElement, type ScrollBoxHandle, useInput } from "./ink/index";
 
 import type { PermissionAskRequest, PermissionMode, PermissionPromptDecision } from "../core/permissions";
@@ -166,9 +167,9 @@ export const TuiView = memo(function TuiView({
     + (tasks.length ? Math.min(3, tasks.length) + 4 + Number(tasks.length > 3) : 0);
   const activityRows = Number(state.busy) + Number(Boolean(state.busy && mcpActivity && !permission && !question && !activityLabel.startsWith("Cancelling")));
   const infoRows = Number(Boolean(backgroundSummary)) + Number(Boolean(durableQuestionCount)) + Number(Boolean(inputTarget)) + Number(Boolean(runtimeConnectionMessage));
-  const activityBudget = Math.max(0, Math.min(taskRows + activityRows + infoRows, rows - suggestionRows - queueRows - (5 + statusLineRows(rows))));
+  const activityBudget = Math.max(0, Math.min(taskRows + activityRows + infoRows, rows - suggestionRows - queueRows - (5 + statusLineRows(rows, columns))));
   const auxiliaryRows = 1 + activityBudget + (transcriptSearch ? 3 : 0) + (historySearch ? 3 : 0);
-  const maxPromptLines = Math.max(1, Math.min(6, Math.floor(rows / 3), rows - suggestionRows - queueRows - auxiliaryRows - (3 + statusLineRows(rows))));
+  const maxPromptLines = Math.max(1, Math.min(6, Math.floor(rows / 3), rows - suggestionRows - queueRows - auxiliaryRows - (3 + statusLineRows(rows, columns))));
   const promptLayout = buildPromptLayout({
     text: input,
     offset: cursor,
@@ -176,7 +177,7 @@ export const TuiView = memo(function TuiView({
     maxVisibleLines: maxPromptLines,
     prefixColumns: columns - contentColumns,
   });
-  const transcriptHeight = measureTranscriptHeight({ terminalRows: rows, promptLayout, suggestionRows: suggestionRows + queueRows, auxiliaryRows });
+  const transcriptHeight = measureTranscriptHeight({ terminalRows: rows, terminalColumns: columns, promptLayout, suggestionRows: suggestionRows + queueRows, auxiliaryRows });
   return (
     <KeybindingProvider value={keybindings}>
     <AccentProvider value={primaryColor}>
@@ -203,7 +204,7 @@ export const TuiView = memo(function TuiView({
         </Box>
       ) : null}
       {permission ? (
-        <PermissionDialog request={permission} selection={permissionSelection} offset={permissionOffset} width={columns} height={rows - (statusLineRows(rows) - 2)} />
+        <PermissionDialog request={permission} selection={permissionSelection} offset={permissionOffset} width={columns} height={rows - (statusLineRows(rows, columns) - 2)} />
       ) : question ? (
         <QuestionDialog
           question={question}
@@ -211,14 +212,14 @@ export const TuiView = memo(function TuiView({
           selected={questionSelected}
           {...(questionOtherInput !== undefined ? { otherInput: questionOtherInput } : {})}
         />
-      ) : workbench ? <WorkbenchView {...workbench} width={Math.max(12, columns - 2)} height={Math.max(8, rows - statusLineRows(rows))} /> : management ? (
+      ) : workbench ? <WorkbenchView {...workbench} width={Math.max(12, columns - 2)} height={Math.max(8, rows - statusLineRows(rows, columns))} /> : management ? (
         <ManagementDialog
           view={management}
           selection={managementSelection}
           {...(sessionAction ? { sessionAction } : {})}
           maxItems={Math.max(3, Math.min(7, rows - 16))}
           columns={columns}
-          height={Math.max(6, rows - statusLineRows(rows))}
+          height={Math.max(6, rows - statusLineRows(rows, columns))}
           filter={sessionFilter}
           filterEditing={sessionFilterEditing}
           detailOnly={managementDetailOnly}
@@ -249,6 +250,7 @@ export const TuiView = memo(function TuiView({
       )}
       <StatusLine
         rows={rows}
+        columns={columns}
         invocationUsage={state.invocationUsage}
         invocationBudgetUsd={invocationBudgetUsd}
         model={state.model}
@@ -292,14 +294,14 @@ function QueuePanel({ prompts, states, confirming, selection, columns, rows, not
   });
   const itemRefs = useRef(new Map<number, DOMElement>());
   useEffect(() => { const element = itemRefs.current.get(selection); if (element) listRef.current?.scrollToElement(element); previewRef.current?.scrollTo(0); }, [selection, prompts]);
-  return <Box height={Math.max(6, rows - statusLineRows(rows))} borderStyle="round" borderColor={UI_COLORS.border} paddingX={1} flexDirection="column">
+  return <Box height={Math.max(6, rows - statusLineRows(rows, columns))} borderStyle="round" borderColor={UI_COLORS.border} paddingX={1} flexDirection="column">
     <Text bold color={accent}>Queued prompts · {prompts.length} saved</Text>
     <Text dimColor wrap="truncate-end">Execution pauses here after the current turn finishes.</Text>
-    <ScrollBox ref={listRef} height={Math.max(1, Math.floor((rows - (5 + statusLineRows(rows)) - Number(Boolean(notice))) / 2))} flexDirection="column">
+    <ScrollBox ref={listRef} height={Math.max(1, Math.floor((rows - (5 + statusLineRows(rows, columns)) - Number(Boolean(notice))) / 2))} flexDirection="column">
       {prompts.map((prompt, index) => <Box key={index} ref={element => { if (element) itemRefs.current.set(index, element); else itemRefs.current.delete(index); }}><Text wrap="truncate-end" color={selection === index ? accent : undefined}>{selection === index ? figures.pointer : " "} {index + 1}. {states[index] === "uncertain" ? "[未确认，先核对] " : states[index] === "draft" ? "[编辑中，原输入保留] " : ""}{prompt.display.replace(/\s+/g, " ").slice(0, Math.max(10, columns - 12))}</Text></Box>)}
       {!prompts.length ? <Text dimColor>No pending prompts.</Text> : null}
     </ScrollBox>
-    {prompts[selection] ? <ScrollBox ref={previewRef} height={Math.max(1, Math.ceil((rows - (5 + statusLineRows(rows)) - Number(Boolean(notice))) / 2))}><Text>{prompts[selection]!.expanded}</Text></ScrollBox> : null}
+    {prompts[selection] ? <ScrollBox ref={previewRef} height={Math.max(1, Math.ceil((rows - (5 + statusLineRows(rows, columns)) - Number(Boolean(notice))) / 2))}><Text>{prompts[selection]!.expanded}</Text></ScrollBox> : null}
     {notice ? <Text color="yellow" wrap="truncate-end">{notice}</Text> : null}
     <Text dimColor={!confirming} color={confirming ? "red" : undefined} wrap="truncate-end">{confirming ? "删除这条排队输入？ · Y 确认 / Esc 取消" : `↑/↓ select · Enter/E edit · D/Delete remove · PgUp/PgDn preview · ${queueKey}/Esc close`}</Text>
   </Box>;
@@ -733,6 +735,7 @@ function PermissionDialog({ request, selection, offset, width, height }: { reque
 
 function StatusLine({
   rows,
+  columns,
   invocationUsage,
   invocationBudgetUsd,
   model,
@@ -750,6 +753,7 @@ function StatusLine({
   queuedPromptCount,
 }: {
   rows: number;
+  columns: number;
   invocationUsage: UsageTotals;
   invocationBudgetUsd?: number;
   model: string;
@@ -776,11 +780,30 @@ function StatusLine({
     : transcriptOffset > 0 ? `PgUp/PgDn · Shift+↑/↓ · Ctrl+End latest · ${transcriptOffset} newer`
     : busy ? `enter queue · esc interrupt · ${queuedPromptCount} queued · ${queueKey} manage`
     : `enter send · ${toggleKey} tool · ${allKey} all · ${queueKey} queue`;
-  const metadata = <Text wrap="truncate-end"><Text bold>{model}</Text><Text dimColor> · {permissionMode} · {context}{workspaceLabel ? ` · ${workspaceLabel}` : ""}</Text></Text>;
-  return statusLineRows(rows) === 3 ? (
+  const width = Math.max(1, columns - 2);
+  const totals = `${cost ? cost.replace(/^ · /, "") + " · " : ""}会话累计 ↑${inputTokens.toLocaleString()} ↓${usage.outputTokens.toLocaleString()} tokens`;
+  const modelWidth = Math.min(stringWidth(`${model} · ${permissionMode}`), Math.floor(width * 0.45));
+  const contextWidth = Math.min(stringWidth(context), Math.floor(width * 0.35));
+  const workspaceWidth = workspaceLabel ? Math.max(0, Math.min(stringWidth(workspaceLabel), width - modelWidth - contextWidth - 4)) : 0;
+  const metadataRow = <Box width={width} height={1} gap={2} justifyContent="space-between">
+    <Box width={modelWidth} flexShrink={0}><Text wrap="truncate-end"><Text bold>{model}</Text><Text dimColor> · {permissionMode}</Text></Text></Box>
+    <Box width={contextWidth} flexShrink={0}><Text dimColor wrap="truncate-end">{context}</Text></Box>
+    {workspaceWidth > 0 ? <Box width={workspaceWidth} flexShrink={0}><Text dimColor wrap="truncate-middle">{workspaceLabel}</Text></Box> : null}
+  </Box>;
+  if (columns >= 80) {
+    const totalsWidth = Math.min(stringWidth(totals), Math.floor(width * 0.75));
+    return <Box flexShrink={0} height={2} flexDirection="column" width={width}>
+      {metadataRow}
+      <Box height={1} width={width} gap={2}>
+        <Box flexGrow={1} flexBasis={0} minWidth={0}><Text dimColor wrap="truncate-end">{hints}</Text></Box>
+        <Box width={totalsWidth} flexShrink={0}><Text dimColor wrap="truncate-end">{totals}</Text></Box>
+      </Box>
+    </Box>;
+  }
+  return statusLineRows(rows, columns) === 3 ? (
     <Box flexShrink={0} height={3} flexDirection="column">
-      {metadata}
-      <Text dimColor wrap="truncate-end">{cost ? cost.replace(/^ · /, "") + " · " : ""}会话累计 ↑{inputTokens.toLocaleString()} ↓{usage.outputTokens.toLocaleString()} tokens</Text>
+      {metadataRow}
+      <Text dimColor wrap="truncate-end">{totals}</Text>
       <Text dimColor wrap="truncate-end">{hints}</Text>
     </Box>
   ) : (

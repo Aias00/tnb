@@ -103,6 +103,7 @@ test("queue panel previews, removes and restores editable structured pastes", as
     await until(() => ui.screen().includes("Queued prompts · 2 saved"));
     expect(ui.screen()).toContain("alpha");
     await ui.send("\u001b[B"); await ui.send("d");
+    await until(() => ui.screen().includes("Y 确认"));
     expect(ui.screen()).toContain("Y 确认");
     expect(ui.screen()).toContain("Queued prompts · 2 saved");
     await ui.send("y");
