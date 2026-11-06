@@ -70,6 +70,7 @@ export function cleanDeadLeases(db: Database): void {
     (SELECT 1 FROM slots s WHERE s.domain=g.domain AND s.project=g.project) ORDER BY last_grant DESC LIMIT -1 OFFSET 10000)`);
 }
 export function pathsOverlap(a: string, b: string): boolean {
+  if (process.platform === "win32") { a = a.toLowerCase(); b = b.toLowerCase(); }
   return a === b || a.startsWith(b.endsWith(sep) ? b : b + sep) || b.startsWith(a.endsWith(sep) ? a : a + sep);
 }
 

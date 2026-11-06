@@ -3,16 +3,17 @@ import { join } from "node:path";
 import { lock, check } from "../../utils/lockfile";
 import { digestJson } from "./json";
 import { randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
 import { openCoordinator, cleanDeadLeases, pathsOverlap, processBirth } from "../usage/coordinator";
 
 /** Shared by durable workers and foreground invocations, even with different TNB_HOME values. */
 async function workspaceLockTarget(workspace: string): Promise<string> {
   const canonical = await realpath(workspace);
-  const directory = join("/tmp", `tnb-workspace-${process.getuid?.() ?? "local"}`);
+  const directory = join(process.platform === "win32" ? tmpdir() : "/tmp", `tnb-workspace-${process.getuid?.() ?? "local"}`);
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const info = await lstat(directory);
-  if (!info.isDirectory() || info.isSymbolicLink() || (info.mode & 0o077) || info.uid !== process.getuid?.()) throw new Error("Unsafe workspace lock directory");
-  const target = join(directory, digestJson(canonical));
+  if (!info.isDirectory() || info.isSymbolicLink() || process.platform !== "win32" && ((info.mode & 0o077) || info.uid !== process.getuid?.())) throw new Error("Unsafe workspace lock directory");
+  const target = join(directory, digestJson(process.platform === "win32" ? canonical.toLowerCase() : canonical));
   const file = await open(target, "a", 0o600); await file.close();
   return target;
 }
