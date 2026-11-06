@@ -1,3 +1,4 @@
+import { fileChangeEvidence } from "../services/git/change-evidence";
 import { mkdir, stat } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 
@@ -163,7 +164,7 @@ export function createWriteTool(
       }
       return { path: value.path, content: value.content };
     },
-    async execute({ path, content }, signal) {
+    async execute({ path, content }, signal, onProgress) {
       const root = resolveWorkspaceRoot(currentWorkspaceRoot(workspaceRoot));
       await assertToolPathInsideAllowedRoots(root, path, "write", additionalRoots());
       const target = resolve(root, path);
@@ -174,6 +175,7 @@ export function createWriteTool(
         const existing = await readExistingTextFile(target, signal);
         if (existing !== undefined) assertFileUnchangedSinceRead(target, existing, readFileState);
         await atomicWriteText(target, content, signal);
+        try { onProgress?.({ fileChange: fileChangeEvidence(target, existing, content) }); } catch { /* Observer cannot undo a write. */ }
         const metadata = await stat(target);
         readFileState.set(target, {
           content,
@@ -237,7 +239,7 @@ export function createEditTool(
       }
       return { path: value.path, oldText: value.oldText, newText: value.newText, replaceAll: value.replaceAll === true };
     },
-    async execute({ path, oldText, newText, replaceAll }, signal) {
+    async execute({ path, oldText, newText, replaceAll }, signal, onProgress) {
       const root = resolveWorkspaceRoot(currentWorkspaceRoot(workspaceRoot));
       await assertToolPathInsideAllowedRoots(root, path, "write", additionalRoots());
       const target = resolve(root, path);
@@ -258,6 +260,7 @@ export function createEditTool(
           ? content.split(oldText).join(newText)
           : `${content.slice(0, first)}${newText}${content.slice(first + oldText.length)}`;
         await atomicWriteText(target, updated, signal);
+        try { onProgress?.({ fileChange: fileChangeEvidence(target, content, updated) }); } catch { /* Observer cannot undo a write. */ }
         const metadata = await stat(target);
         readFileState.set(target, {
           content: updated,
@@ -329,9 +332,9 @@ export function createBashTool(workspaceRoot: string) {
       }
       return { command: value.command };
     },
-    async execute({ command }, signal) {
+    async execute({ command }, signal, onProgress) {
       const manager = new ShellSessionManager({ cwd: root, outputDir: resolve(root, ".tnb", "shell") });
-      try { return await manager.runForeground(command, DEFAULT_BASH_TIMEOUT_MS, signal); }
+      try { return await manager.runForeground(command, DEFAULT_BASH_TIMEOUT_MS, signal, onProgress); }
       finally { await manager.close(); }
     },
   });

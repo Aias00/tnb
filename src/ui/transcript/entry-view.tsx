@@ -32,7 +32,7 @@ export function TranscriptEntryView({
     return (
       <Box marginBottom={1} flexShrink={0} paddingLeft={1} flexDirection="row">
         <Text color={accent} inverse={selected}>{selected ? `${figures.pointer} ` : "  "}</Text>
-        <Box flexDirection="column" flexGrow={1}><Markdown streaming={entry.streaming}>{entry.text}</Markdown></Box>
+        <Box flexDirection="column" flexGrow={1} minWidth={0} maxWidth={112}><Markdown streaming={entry.streaming}>{entry.text}</Markdown></Box>
       </Box>
     );
   }
@@ -49,13 +49,14 @@ function ToolEntryView({
   selected: boolean;
 }) {
   const accent = useAccent();
-  const icon = entry.status === "running" ? figures.ellipsis : entry.status === "completed" ? figures.tick : figures.cross;
-  const color = entry.status === "running" ? accent : entry.status === "completed" ? UI_COLORS.success : UI_COLORS.error;
+  const processReturned = entry.name === "bash" && entry.status === "completed";
+  const icon = processReturned ? figures.bullet : entry.status === "running" ? figures.ellipsis : entry.status === "completed" ? figures.tick : figures.cross;
+  const color = processReturned ? "gray" : entry.status === "running" ? accent : entry.status === "completed" ? UI_COLORS.success : UI_COLORS.error;
   const detail = renderToolUse(entry.name, entry.input, verbose);
   return (
     <Box flexDirection="column" marginBottom={1} paddingLeft={2} flexShrink={0}>
       <Text inverse={selected}>
-        <Text color={color}>{icon} </Text><Text bold>{toolTitle(entry.name)}</Text>{detail ? <Text dimColor> ({detail})</Text> : null}
+        <Text color={color}>{icon} </Text><Text bold>{toolTitle(entry.name)}</Text>{entry.name === "bash" && entry.status !== "running" ? <Text dimColor>{entry.progress?.exitCode !== undefined ? ` · exit ${entry.progress.exitCode}` : " · 工具返回"}</Text> : null}{detail ? <Text dimColor> ({detail})</Text> : null}
       </Text>
       <ToolResponse entry={entry} verbose={verbose} />
     </Box>
@@ -110,6 +111,7 @@ function renderToolResponse(
 }
 
 function renderAgentResponse(entry: ToolEntry, verbose: boolean): React.ReactNode {
+  if (entry.status === "running" && entry.progress?.agentPhase) return <Text dimColor>{entry.progress.agentPhase === "tool" ? "Running tool" : entry.progress.agentPhase === "responding" ? "Writing response" : "Requesting model"}{entry.progress.latestTool ? ` · ${entry.progress.latestTool}` : ""}{entry.progress.elapsedTimeSeconds !== undefined ? ` · ${Math.round(entry.progress.elapsedTimeSeconds)}s` : ""}</Text>;
   if (entry.status === "running") return <Text dimColor>{entry.progress?.message ?? "Initializing…"}</Text>;
   if (entry.status === "failed") return <OutputText content={entry.output ?? "Agent failed"} verbose={verbose} error />;
   const output = cleanOutput(entry.output ?? "");

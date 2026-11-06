@@ -1,52 +1,23 @@
 #!/usr/bin/env bun
 
-import { cp, lstat, mkdir, readlink, rename, rm, symlink } from "node:fs/promises";
 import { homedir, platform } from "node:os";
 import { dirname, join, resolve } from "node:path";
-
 import packageJson from "../package.json";
+import { installLocalBundle, rollbackLocalBundle } from "../src/services/update/local-install";
 
 const root = resolve(import.meta.dir, "..");
 const prefix = resolve(optionValue("--prefix") ?? join(homedir(), ".local"));
 const executableName = platform() === "win32" ? "tnb.exe" : "tnb";
-const versionsRoot = join(prefix, "lib", "tnb");
-const target = join(versionsRoot, packageJson.version);
-const stage = join(versionsRoot, `.install-${packageJson.version}-${process.pid}`);
-const link = join(prefix, "bin", executableName);
-const temporaryLink = `${link}.${process.pid}.tmp`;
 
-if (!process.argv.includes("--skip-build")) await run([process.execPath, "run", "build"]);
-await mkdir(versionsRoot, { recursive: true });
-await mkdir(dirname(link), { recursive: true });
-await rm(stage, { recursive: true, force: true });
-await cp(join(root, "dist"), stage, { recursive: true, force: true });
-await rm(target, { recursive: true, force: true });
-await rename(stage, target);
-
-const previousTarget = await existingLinkTarget(link);
-await rm(temporaryLink, { force: true });
-await symlink(join(target, executableName), temporaryLink);
-await rename(temporaryLink, link);
-if (previousTarget && previousTarget !== join(target, executableName)) {
-  const previousLink = `${link}.previous`;
-  await rm(previousLink, { force: true });
-  await symlink(previousTarget, previousLink);
-}
-
-process.stdout.write(`Installed tnb ${packageJson.version} to ${target}\n`);
-process.stdout.write(`Command: ${link}\n`);
-if (!process.env.PATH?.split(":").includes(dirname(link))) {
-  process.stdout.write(`Add ${dirname(link)} to PATH.\n`);
-}
-
-async function existingLinkTarget(path: string): Promise<string | undefined> {
-  try {
-    const info = await lstat(path);
-    return info.isSymbolicLink() ? resolve(dirname(path), await readlink(path)) : undefined;
-  } catch (error) {
-    if (typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT") return undefined;
-    throw error;
-  }
+if (process.argv.includes("--rollback")) {
+  const result = await rollbackLocalBundle({ prefix, executableName });
+  process.stdout.write(`Restored local installation: ${result.target}\nCommand: ${result.link}\n`);
+} else {
+  if (!process.argv.includes("--skip-build")) await run([process.execPath, "run", "build"]);
+  const result = await installLocalBundle({ prefix, executableName, distribution: join(root, "dist"), version: packageJson.version });
+  process.stdout.write(`Installed tnb ${packageJson.version} to ${result.target}\nCommand: ${result.link}\n`);
+  if (result.previous) process.stdout.write(`Previous installation retained: ${result.previous}\n`);
+  if (!process.env.PATH?.split(":").includes(dirname(result.link))) process.stdout.write(`Add ${dirname(result.link)} to PATH.\n`);
 }
 
 function optionValue(name: string): string | undefined {

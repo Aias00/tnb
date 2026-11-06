@@ -1,0 +1,47 @@
+'use strict';
+// Parse with the bundled dependency; render only explicitly allowed DOM nodes.
+function renderMarkdown(source) {
+  let remaining = 5000;
+  function text(value) { return document.createTextNode(String(value ?? '')); }
+  function element(tag, children) { const node = document.createElement(tag); node.append(...children); return node; }
+  function render(tokens, depth = 0) {
+    if (depth > 20) return [text('[内容层级过深，已省略]')];
+    const nodes = [];
+    for (const token of tokens || []) {
+      if (--remaining < 0) { nodes.push(text('[显示内容已截断，请复制原文查看]')); break; }
+      const inline = () => token.tokens ? render(token.tokens, depth + 1) : [text(token.text)];
+      switch (token.type) {
+        case 'space': break;
+        case 'heading': nodes.push(element('h' + Math.min(6, Math.max(1, token.depth)), inline())); break;
+        case 'paragraph': nodes.push(element('p', inline())); break;
+        case 'strong': nodes.push(element('strong', inline())); break;
+        case 'em': nodes.push(element('em', inline())); break;
+        case 'del': nodes.push(element('del', inline())); break;
+        case 'codespan': nodes.push(element('code', [text(token.text)])); break;
+        case 'code': { const box = element('pre', [element('code', [text(token.text)])]); box.className = 'markdown-code'; nodes.push(box); break; }
+        case 'br': nodes.push(element('br', [])); break;
+        case 'hr': nodes.push(element('hr', [])); break;
+        case 'blockquote': nodes.push(element('blockquote', render(token.tokens, depth + 1))); break;
+        case 'list': { const list = element(token.ordered ? 'ol' : 'ul', token.items.slice(0, 500).map(item => element('li', render(item.tokens, depth + 1)))); if (token.ordered && Number.isSafeInteger(token.start)) list.start = token.start; nodes.push(list); break; }
+        case 'table': {
+          const table = element('table', [element('thead', [element('tr', token.header.slice(0, 32).map(cell => element('th', render(cell.tokens, depth + 1))))]), element('tbody', token.rows.slice(0, 200).map(row => element('tr', row.slice(0, 32).map(cell => element('td', render(cell.tokens, depth + 1))))))]);
+          const wrapper = element('div', [table]); if (token.rows.length > 200 || token.header.length > 32) wrapper.append(text('[表格显示已截断，请复制原文查看]')); wrapper.className = 'markdown-table'; nodes.push(wrapper); break;
+        }
+        case 'link': {
+          const href = String(token.href ?? '').trim();
+          if (/^(?:https?:\/\/|mailto:)/i.test(href) && !/[\x00-\x20\x7f]/.test(href)) { const link = element('a', inline()); link.href = href; link.target = '_blank'; link.rel = 'noopener noreferrer'; nodes.push(link); }
+          else nodes.push(...inline());
+          break;
+        }
+        case 'image': nodes.push(text('[图片：' + (token.text || '未加载') + ']')); break;
+        case 'html': nodes.push(text(token.raw)); break;
+        default: nodes.push(...inline());
+      }
+    }
+    return nodes;
+  }
+  const root = document.createElement('div'); root.className = 'markdown-content';
+  try { root.append(...render(marked.lexer(String(source ?? ''), { gfm: true }))); }
+  catch { root.replaceChildren(text(source)); }
+  return root;
+}

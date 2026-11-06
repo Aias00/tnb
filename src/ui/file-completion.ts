@@ -1,5 +1,6 @@
 import { readdir, realpath } from "node:fs/promises";
-import { basename, join, relative, resolve, sep } from "node:path";
+import { workspaceFileIndex, rankWorkspaceFiles } from "../services/workspace/file-index";
+import { join, relative, resolve, sep } from "node:path";
 
 export type WorkspaceCompletionToken = { start: number; end: number; value: string; at: boolean };
 
@@ -48,10 +49,9 @@ export async function completeWorkspaceFiles(input: string, cwd: string, signal:
     .map(entry => relative(root, join(directory, entry.name)).split(sep).join("/") + (entry.isDirectory() ? "/" : ""));
   if (token.at && separator < 0 && namePrefix) {
     const query = namePrefix.toLocaleLowerCase();
-    const files = await workspaceFiles(root, signal);
-    const matches = files.filter(path => path.toLocaleLowerCase().includes(query));
-    matches.sort((a, b) => Number(basename(b).toLocaleLowerCase().startsWith(query)) - Number(basename(a).toLocaleLowerCase().startsWith(query)) || a.length - b.length || a.localeCompare(b));
-    paths.push(...matches);
+    const files = await workspaceFileIndex.files(root, signal);
+    const ranked = rankWorkspaceFiles([...new Set([...paths, ...files])], query, workspaceFileIndex.recent(root));
+    paths.splice(0, paths.length, ...ranked);
   }
   if (signal.aborted) return [];
   return [...new Set(paths)].slice(0, 40).map(path => {
@@ -60,27 +60,9 @@ export async function completeWorkspaceFiles(input: string, cwd: string, signal:
   });
 }
 
-async function workspaceFiles(cwd: string, signal: AbortSignal): Promise<string[]> {
-  if (signal.aborted) return [];
-  let child;
-  try { child = Bun.spawn(["rg", "--files", "-0", "--glob", "!node_modules/**", "--glob", "!dist/**"], { cwd, stdin: "ignore", stdout: "pipe", stderr: "ignore" }); }
-  catch { return []; }
-  const stop = () => child.kill();
-  signal.addEventListener("abort", stop, { once: true });
-  const reader = child.stdout.getReader();
-  const chunks: Uint8Array[] = [];
-  let length = 0;
-  try {
-    while (!signal.aborted) {
-      const next = await reader.read();
-      if (next.done) break;
-      const remaining = 1024 * 1024 - length;
-      chunks.push(next.value.subarray(0, remaining)); length += Math.min(remaining, next.value.length);
-      if (length >= 1024 * 1024) { child.kill(); break; }
-    }
-    return Buffer.concat(chunks).toString("utf8").split("\0").slice(0, -1).filter(path => path && !/[\r\n"]/.test(path)).slice(0, 10_000);
-  } finally {
-    signal.removeEventListener("abort", stop);
-    child.kill(); await reader.cancel().catch(() => {}); await child.exited;
-  }
+
+export function rememberWorkspaceCompletion(cwd: string, original: string, candidate: string, cursor: number) {
+  const token = workspaceCompletionToken(original, cursor); if (!token) return;
+  const path = completionLabel(original, candidate, cursor).replace(/^@/, "").replace(/^"|"$/g, "");
+  if (!path.endsWith("/")) workspaceFileIndex.remember(resolve(cwd), path);
 }

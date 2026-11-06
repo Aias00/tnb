@@ -43,13 +43,14 @@ test("unknown and slash-only shell commands fail explicitly rather than opening 
   expect((await readdir(directory)).sort()).toEqual(["models.json", "settings.json"]);
 });
 
-test("nested help never executes mutation or remote actions", async () => {
-  for (const argv of [["provider", "remove", "sample", "--help"], ["mcp", "add", "sample", "--help"], ["update", "--rollback", "--help"], ["goal-loop-stop", "sample", "--help"], ["plugins", "init", "sample", "--help"], ["plugins", "test", "sample", "--help"], ["plugins", "remove", "sample", "--help"]]) {
+// Each subprocess keeps its own five-second bound; seven cold starts must not share one test deadline.
+for (const argv of [["provider", "remove", "sample", "--help"], ["mcp", "add", "sample", "--help"], ["update", "--rollback", "--help"], ["goal-loop-stop", "sample", "--help"], ["plugins", "init", "sample", "--help"], ["plugins", "test", "sample", "--help"], ["plugins", "remove", "sample", "--help"]]) {
+  test(`nested help never executes mutation or remote actions: ${argv.join(" ")}`, async () => {
     const result = await cli(argv);
     expect(result.code, result.stderr).toBe(0);
     expect(result.stdout).toContain("Usage:");
-  }
-});
+  });
+}
 
 test("a nested question version is routed to the answer command instead of printing the app version", async () => {
   const result = await cli(["runtime", "answer", "missing-run", "--version", "1"]);
@@ -73,4 +74,18 @@ test("documented top-level commands are registered", () => {
     const command = /^  ([a-z][a-z-]*)/.exec(line)?.[1];
     if (command) expect(CLI_COMMANDS as readonly string[]).toContain(command);
   }
+});
+
+
+test("detailed build identity preserves the plain version contract and does not load settings", async () => {
+  const plain = await cli(["--version"]); expect(plain.stdout.trim()).toMatch(/^\d+\.\d+\.\d+$/);
+  const json = await cli(["--version", "--json"]);
+  expect(json.code).toBe(0);
+  expect(JSON.parse(json.stdout)).toMatchObject({ version: plain.stdout.trim(), mode: "source", sourceDigest: null });
+  const verbose = await cli(["--version", "--verbose"]);
+  expect(verbose.code).toBe(0); expect(verbose.stdout).toContain("not compiled");
+  const runtime = await cli(["runtime", "version"]);
+  expect(runtime.code).toBe(1); expect(runtime.stdout).toBe("");
+  expect(runtime.stderr).not.toContain("Unknown runtime command");
+  expect(runtime.stderr).toContain("stopped or unavailable");
 });

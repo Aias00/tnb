@@ -1,3 +1,7 @@
+import { CompactionNotices } from "../services/compact/notice";
+import { AwayRecap } from "../services/notifications/away-recap";
+import TerminalFocusContext from "./ink/components/TerminalFocusContext";
+import { IdleNotifications, type IdleNotice } from "../services/notifications/idle";
 import React, {
   useCallback,
   useContext,
@@ -21,6 +25,8 @@ import inkInstances from "./ink/instances";
 import { workspaceCompletionToken, completionLabel, completionCursor } from "./file-completion";
 import { filterSessionView } from "./session-filter";
 import { PromptInputController } from "./prompt-input/PromptInput";
+import { applyPromptEditorAction, createPromptEditorState } from "./prompt-input/editor-state";
+import { expandPromptReferences } from "./prompt-input/references";
 import type { PromptEditorState, PromptHistoryEntry, PromptInputSubmit } from "./prompt-input/types";
 import { PermissionController } from "./permission-controller";
 import { QuestionController } from "./question-controller";
@@ -68,9 +74,12 @@ export type TuiTurn = {
   questionPrompt: AskUser;
   onPermissionModeChange(mode: PermissionMode): void;
   onActivity?(phase: "working" | "compacting"): void;
+  onCompaction?(preTokens: number, postTokens: number, info?: import("../services/compact/notice").CompactionInfo): void;
 };
 
 export type TuiAppOptions = {
+  notify?(kind: IdleNotice["kind"]): void;
+  keybindingWarnings?: readonly string[];
   invocationBudgetUsd?: number;
   model: string;
   permissionMode: PermissionMode;
@@ -87,6 +96,7 @@ export type TuiAppOptions = {
   runTurn(turn: TuiTurn): Promise<void>;
   runCommand?(request: SlashCommandRequest): Promise<SlashCommandResult>;
   externalCommands?: readonly ExternalSlashCommand[] | (() => readonly ExternalSlashCommand[]);
+  onCompletionAccepted?(original: string, candidate: string, cursor: number): void;
   completeInput?(input: string, signal: AbortSignal, cursor?: number): Promise<string[]>;
   pasteImage?(): Promise<string | undefined>;
   displayImage?(path: string): Promise<void>;
@@ -222,8 +232,6 @@ export function TuiApp(options: TuiAppOptions) {
   const [shellSelection, setShellSelection] = useState(0);
   const [shellInput, setShellInput] = useState<InputBuffer | undefined>();
   const [shellRuntimes, setShellRuntimes] = useState<ShellRuntimeSnapshot[]>([]);
-  const workItems = useMemo(() => workbenchItems(workbenchTab, { runs: durableRuns, questions: durableQuestions, queue: queuedInputs, tasks, shells: shellRuntimes }),
-    [workbenchTab, durableRuns, durableQuestions, queuedInputs, tasks, shellRuntimes]);
   const initialPromptHistory = useRef(options.initialInputHistory ?? []).current;
   const initialInput = useRef(restoreInputHistory(initialPromptHistory.map(({ display }) => display))).current;
   const [state, dispatch] = useReducer(
@@ -234,6 +242,10 @@ export function TuiApp(options: TuiAppOptions) {
       ...(options.contextWindowTokens ? { contextWindowTokens: options.contextWindowTokens } : {}),
     }),
   );
+  const warningSignature = JSON.stringify(options.keybindingWarnings ?? []);
+  useEffect(() => {
+    for (const warning of options.keybindingWarnings ?? []) dispatch({ type: "notice", noticeId: `keybinding:${warning}`, message: `Shortcut warning: ${warning}` });
+  }, [warningSignature]);
   const [history, setHistory] = useState<string[]>(initialInput.history);
   const [promptHistory, setPromptHistory] = useState<PromptHistoryEntry[]>(initialPromptHistory);
   const transcriptViewportRef = useRef<TranscriptViewportController | null>(null);
@@ -248,6 +260,12 @@ export function TuiApp(options: TuiAppOptions) {
   const [cancelling, setCancelling] = useState(false);
   const [turnStartedAt, setTurnStartedAt] = useState<number>();
   const [phase, setPhase] = useState("Requesting model");
+  const compactionNotices = useRef(new CompactionNotices()).current;
+  const foreground = state.busy ? {
+    title: [...state.transcript].reverse().find(entry => entry.kind === "user")?.text ?? "当前终端执行",
+    phase: cancelling ? "正在取消" : permission ? "等待授权" : question ? "等待回答" : state.activity === "compacting" ? "整理上下文" : phase,
+  } : undefined;
+  const workItems = workbenchItems(workbenchTab, { runs: durableRuns, questions: durableQuestions, queue: queuedInputs, tasks, shells: shellRuntimes, foreground });
   const visibleManagement = management ? filterSessionView(management, sessionFilter) : undefined;
   const queuedPrompts = useMemo(() => queuedInputs.map((item) => item.input), [queuedInputs]);
   const [commandSuggestionIndex, setCommandSuggestionIndex] = useState(0);
@@ -262,6 +280,7 @@ export function TuiApp(options: TuiAppOptions) {
   const [vimInsert, setVimInsert] = useState(!options.vimMode);
   const [promptMouse, setPromptMouse] = useState<{ row: number; column: number; nonce: number; maxVisibleLines?: number } | undefined>();
   const bufferRef = useRef(buffer);
+  const editorSnapshot = useRef<PromptEditorState>(createPromptEditorState(buffer.value));
   const terminalSize = useContext(TerminalSizeContext) ?? { columns: stdout.columns || 80, rows: stdout.rows || 24 };
   const abortController = useRef<AbortController | undefined>(undefined);
   const editorActive = useRef(false);
@@ -350,6 +369,28 @@ export function TuiApp(options: TuiAppOptions) {
     questionUiMounted.current = true;
     return () => { questionUiMounted.current = false; activeDurableQuestion.current?.controller.abort(); };
   }, []);
+  const focus = useContext(TerminalFocusContext);
+  const awayRecap = useRef(new AwayRecap()).current;
+  useEffect(() => {
+    const recap = awayRecap.focus(focus.isTerminalFocused, Number(Boolean(permission)) + Number(Boolean(question)) + durableQuestions.length + runNotifications.length);
+    if (recap) dispatch({ type: "notice", message: recap });
+  }, [focus.isTerminalFocused, awayRecap]);
+  const focusRef = useRef(focus.isTerminalFocused); focusRef.current = focus.isTerminalFocused;
+  const notificationCallback = useRef(options.notify); notificationCallback.current = options.notify;
+  const idleNotifications = useRef(new IdleNotifications(kind => notificationCallback.current?.(kind))).current;
+  const permissionNotice = useRef({ value: permission, id: crypto.randomUUID() });
+  if (permissionNotice.current.value !== permission) permissionNotice.current = { value: permission, id: crypto.randomUUID() };
+  const questionNotice = useRef({ value: question, id: crypto.randomUUID() });
+  if (questionNotice.current.value !== question) questionNotice.current = { value: question, id: crypto.randomUUID() };
+  useEffect(() => {
+    const notices: IdleNotice[] = [];
+    if (permission) notices.push({ id: `permission:${permissionNotice.current.id}`, kind: "permission" });
+    if (question) notices.push({ id: `question:${questionNotice.current.id}`, kind: "question" });
+    if (durableQuestions.length) notices.push({ id: `questions:${durableQuestions.map(item => questionNoticeKey(item)).join(",")}`, kind: "question" });
+    if (runNotifications.length) notices.push({ id: `background:${runNotifications.map(item => item.noticeId).join(",")}`, kind: "background" });
+    idleNotifications.sync(notices);
+  }, [permission, question, durableQuestions, runNotifications, idleNotifications]);
+  useEffect(() => { const timer = setInterval(() => idleNotifications.tick(focusRef.current), 500); return () => { clearInterval(timer); idleNotifications.close(); }; }, [idleNotifications]);
   const preparingTool = useRef<string | undefined>(undefined);
   const invocationSequence = useRef(0);
   const usageSessionEpoch = useRef(0);
@@ -502,6 +543,13 @@ export function TuiApp(options: TuiAppOptions) {
         sessionId: sessionId.current,
         nextSessionId,
       }).then((result) => {
+        if (result.inputReference) {
+          const base = editorSnapshot.current.value === bufferRef.current.value ? editorSnapshot.current : createPromptEditorState(bufferRef.current.value);
+          const value = applyPromptEditorAction({ ...base, cursorOffset: bufferRef.current.cursor }, { type: "paste-text", text: `${base.value ? "\n" : ""}${result.inputReference.text}`, threshold: 0 });
+          const input: PromptInputSubmit = { display: value.value, expanded: expandPromptReferences(value.value, value.pastedContents).expanded, mode: "prompt", pastedContents: value.pastedContents };
+          setRestoredDraft({ input, nonce: crypto.randomUUID() });
+          const next = { ...createInputBuffer(value.value, history), cursor: value.cursorOffset }; bufferRef.current = next; setBuffer(next);
+        }
         if (result.clipboardText !== undefined) {
           stdout.write(`\u001B]52;c;${Buffer.from(result.clipboardText).toString("base64")}\u0007`);
         }
@@ -532,11 +580,12 @@ export function TuiApp(options: TuiAppOptions) {
       return;
     }
     turnRunning.current = true;
+    compactionNotices.reset();
     setCancelling(false);
     setTurnStartedAt(Date.now());
     setPhase("Requesting model");
     preparingTool.current = undefined;
-    dispatch({ type: "submit", text: structured.display });
+    dispatch({ type: "submit", text: structured.display, input: structuredClone(structured) });
     const controller = new AbortController();
     abortController.current = controller;
     const releaseForeground = () => {
@@ -570,6 +619,9 @@ export function TuiApp(options: TuiAppOptions) {
         });
       },
       onModelEvent(event) {
+        if (event.type === "retry") setPhase(event.phase === "waiting"
+          ? `${event.reason === "rate-limit" ? "Rate limited" : event.reason === "connection" ? "Connection failed" : "Provider unavailable"}${event.status ? ` (${event.status})` : ""} · retry ${event.retry}/${event.maxRetries} in ${Math.ceil(event.delayMs / 1000)}s`
+          : `Retrying model · ${event.retry}/${event.maxRetries}`);
         if (event.type === "text") setPhase("Writing response");
         if (event.type === "thinking") setPhase("Thinking");
         if (event.type === "tool-start") { preparingTool.current = event.name; setPhase(`Preparing ${event.name}`); }
@@ -597,6 +649,7 @@ export function TuiApp(options: TuiAppOptions) {
         } else if (event.type === "tool-execution-progress") {
           dispatch({ type: "tool-progress", id: event.id, data: event.data });
         } else {
+          awayRecap.toolFinished(event.isError);
           dispatch({
             type: "tool-finish",
             id: event.id,
@@ -615,13 +668,16 @@ export function TuiApp(options: TuiAppOptions) {
         dispatch({ type: "permission-mode-change", mode });
       },
       onActivity(phase) { dispatch({ type: "activity", phase }); },
+      onCompaction(preTokens, postTokens, info) { const message = compactionNotices.message(preTokens, postTokens, info); if (message) dispatch({ type: "notice", message }); },
     }).then(async () => {
       hasRun.current = true;
       if (queuedId && !controller.signal.aborted) await inputQueue.remove(queuedId);
       releaseForeground();
+      idleNotifications.add({ id: `finished:${invocation}`, kind: "finished" });
       dispatch(controller.signal.aborted ? { type: "turn-error", message: "Interrupted" } : { type: "turn-complete" });
     }).catch((error: unknown) => {
       releaseForeground();
+      idleNotifications.add({ id: `finished:${invocation}`, kind: "finished" });
       dispatch({
         type: "turn-error",
         message: controller.signal.aborted
@@ -692,7 +748,7 @@ export function TuiApp(options: TuiAppOptions) {
   }, [management, permission, question, workbench, queuePanel, shellPanel, historySearch, transcriptSearch, queuedInputs.length, scheduledPrompts, state.busy, submit]);
 
   const controlRun = (action: "pause" | "resume" | "cancel") => {
-    const items = workbenchItems(workbenchTabRef.current, { runs: durableRuns, questions: durableQuestions, queue: queuedInputs, tasks, shells: shellRuntimes });
+    const items = workbenchItems(workbenchTabRef.current, { runs: durableRuns, questions: durableQuestions, queue: queuedInputs, tasks, shells: shellRuntimes, foreground });
     const run = items[Math.min(workbenchSelectionRef.current, Math.max(0, items.length - 1))]?.run;
     if (!run || !options.durableQuestions?.control || workbenchBusyRef.current) return;
     if (action === "resume" && run.reason === "unknown-effects") { setWorkbenchError("先核对未知操作的影响；Enter 查看操作详情，L 准备状态查询命令。"); return; }
@@ -709,6 +765,7 @@ export function TuiApp(options: TuiAppOptions) {
   };
 
   useInput((input, key, event) => {
+    idleNotifications.interaction();
     const promptMode = vimMode ? (vimInsert ? "INSERT" : "NORMAL") : undefined;
     const promptColumns = promptContentColumns(terminalSize.columns, promptMode);
     if (permission) {
@@ -782,7 +839,7 @@ export function TuiApp(options: TuiAppOptions) {
       return;
     }
     if (workbenchRef.current) {
-      const workItems = workbenchItems(workbenchTabRef.current, { runs: durableRuns, questions: durableQuestions, queue: queuedInputs, tasks, shells: shellRuntimes });
+      const workItems = workbenchItems(workbenchTabRef.current, { runs: durableRuns, questions: durableQuestions, queue: queuedInputs, tasks, shells: shellRuntimes, foreground });
       const workbenchSelection = workbenchSelectionRef.current, confirmation = confirmationRef.current;
       const selected = workItems[Math.min(workbenchSelection, Math.max(0, workItems.length - 1))];
       const close = () => { panelRequest.current++; setWorkbench(false); setConfirmation(undefined); };
@@ -879,7 +936,7 @@ export function TuiApp(options: TuiAppOptions) {
       return;
     }
     if (management && visibleManagement) {
-      if (management.kind === "diff") {
+      if (management.kind === "diff" || management.kind === "compactions") {
         if (key.escape && managementDetailOnly) { setManagementDetailOnly(false); return; }
         if (key.return) { setManagementDetailOnly(value => !value); return; }
         if (input.toLowerCase() === "r") { setManagement(undefined); submit(management.refreshCommand ?? "/diff"); return; }
@@ -965,7 +1022,16 @@ export function TuiApp(options: TuiAppOptions) {
       } else if (key.return) {
         if (selected) {
           setManagement(undefined);
-          submit(selected.command);
+          if (selected.draftText !== undefined) {
+            if (bufferRef.current.value) { setCompletionNotice("草稿已有内容，请先保存或清空。"); return; }
+            const next = createInputBuffer(selected.draftText, history); bufferRef.current = next; setBuffer(next);
+            setCompletionNotice("历史文本已放入草稿；不含媒体附件，检查后再发送。");
+          } else if (selected.draftReference) {
+            const value = [bufferRef.current.value, selected.draftReference].filter(Boolean).join(" ");
+            const next = { ...bufferRef.current, value, cursor: value.length };
+            bufferRef.current = next; setBuffer(next);
+            setCompletionNotice("引用已加入草稿；编辑后再发送。");
+          } else submit(selected.command);
         }
       }
       return;
@@ -1046,7 +1112,7 @@ export function TuiApp(options: TuiAppOptions) {
       else if (key.downArrow) setShellSelection((value) => Math.min(Math.max(0, shellRuntimes.length - 1), value + 1));
       else if (input.toLowerCase() === "i" && selected?.kind === "pty" && selected.alive) setShellInput(createInputBuffer());
       else if (input.toLowerCase() === "k" && selected) {
-        const items = workbenchItems("tasks", { runs: durableRuns, questions: durableQuestions, queue: queuedInputs, tasks, shells: shellRuntimes });
+        const items = workbenchItems("tasks", { runs: durableRuns, questions: durableQuestions, queue: queuedInputs, tasks, shells: shellRuntimes, foreground });
         const index = items.findIndex((item) => item.shell === selected);
         setShellPanel(false); setWorkbench(true); setWorkbenchTab("tasks"); setWorkbenchSelection(Math.max(0, index)); setWorkbenchDetail(false);
         if (items[index]) setConfirmation({ kind: "shell", id: items[index]!.id });
@@ -1086,6 +1152,28 @@ export function TuiApp(options: TuiAppOptions) {
     if (matchesKeybinding(keybindings, "promptQueue", input, key)) {
       setConfirmation(undefined); setCompletionNotice(undefined); setQueueSelection(0); setQueuePanel(true); return;
     }
+    if (matchesKeybinding(keybindings, "previousMessage", input, key) || matchesKeybinding(keybindings, "nextMessage", input, key)) {
+      const entries = state.transcript;
+      if (!entries.length) return;
+      const current = entries.findIndex(entry => entry.id === selectedTranscriptEntryId);
+      const previous = matchesKeybinding(keybindings, "previousMessage", input, key);
+      const index = current < 0 ? entries.length - 1 : (current + (previous ? -1 : 1) + entries.length) % entries.length;
+      const id = entries[index]!.id; setSelectedTranscriptEntryId(id); transcriptViewportRef.current?.reveal(id); return;
+    }
+    if (matchesKeybinding(keybindings, "editMessage", input, key)) {
+      const selected = state.transcript.find(entry => entry.id === selectedTranscriptEntryId);
+      if (selected?.kind !== "user") { setCompletionNotice("先选择一条用户消息再编辑复用。"); return; }
+      if (bufferRef.current.value) { setCompletionNotice("草稿已有内容，请先保存或清空。"); return; }
+      if (!selected.input && /\[(?:Pasted|Image)/i.test(selected.text)) { setCompletionNotice("这条历史消息缺少附件快照，请从输入历史恢复。"); return; }
+      const next = createInputBuffer(selected.text, history); bufferRef.current = next; setBuffer(next);
+      if (selected.input) setRestoredDraft({ input: structuredClone(selected.input), nonce: crypto.randomUUID() });
+      setCompletionNotice("消息已放回草稿；原对话保留，发送后作为新输入。"); return;
+    }
+    if (matchesKeybinding(keybindings, "copyToolInput", input, key)) {
+      const selected = state.transcript.find(entry => entry.id === selectedTranscriptEntryId);
+      if (selected?.kind === "tool") stdout.write(`\u001B]52;c;${Buffer.from(typeof selected.input === "string" ? selected.input : JSON.stringify(selected.input) ?? "").toString("base64")}\u0007`);
+      return;
+    }
     if (matchesKeybinding(keybindings, "previousTool", input, key) || matchesKeybinding(keybindings, "nextTool", input, key)) {
       const tools = state.transcript.filter(entry => entry.kind === "tool");
       if (!tools.length) return;
@@ -1110,6 +1198,7 @@ export function TuiApp(options: TuiAppOptions) {
         setInputCompletions(current => current ? { ...current, index: (current.index + direction + current.values.length) % current.values.length } : current);
       } else {
         const value = inputCompletions.values[inputCompletions.index]!;
+        try { options.onCompletionAccepted?.(inputCompletions.original, value, inputCompletions.cursor); } catch { /* Ranking cannot block input. */ }
         const next = { ...createInputBuffer(value, history), cursor: completionCursor(inputCompletions.original, value, inputCompletions.cursor) };
         bufferRef.current = next; setBuffer(next);
         dismissedCompletion.current = value.slice(0, next.cursor).endsWith("/") ? undefined : `${next.cursor}:${value}`;
@@ -1256,6 +1345,7 @@ export function TuiApp(options: TuiAppOptions) {
   });
 
   const updatePromptEditor = (editor: PromptEditorState) => {
+    editorSnapshot.current = structuredClone(editor);
     const next: InputBuffer = { ...bufferRef.current, value: editor.value, cursor: editor.cursorOffset };
     bufferRef.current = next;
     setBuffer(next);

@@ -8,7 +8,7 @@ export type QueuedInput = { id: string; sessionId: string; workspace: string; in
 export type WorkbenchTab = "tasks" | "decisions" | "queue";
 export type WorkbenchItem = { id: string; title: string; summary: string; lines: string[]; run?: RunPresentation; decision?: InboxQuestion; queued?: QueuedInput; shell?: ShellRuntimeSnapshot };
 const clean = (value: string) => displayQuestionText(value);
-export function workbenchItems(tab: WorkbenchTab, data: { runs: readonly RunPresentation[]; questions: readonly InboxQuestion[]; queue: readonly QueuedInput[]; tasks: readonly TaskRecord[]; shells: readonly ShellRuntimeSnapshot[] }): WorkbenchItem[] {
+export function workbenchItems(tab: WorkbenchTab, data: { runs: readonly RunPresentation[]; questions: readonly InboxQuestion[]; queue: readonly QueuedInput[]; tasks: readonly TaskRecord[]; shells: readonly ShellRuntimeSnapshot[]; foreground?: { title: string; phase: string } }): WorkbenchItem[] {
   if (tab === "decisions") return data.questions.map((decision) => {
     const question = durableUserQuestion(decision);
     return { id: questionNoticeKey(decision), title: clean(question.header), summary: clean(question.question), decision,
@@ -17,6 +17,7 @@ export function workbenchItems(tab: WorkbenchTab, data: { runs: readonly RunPres
   if (tab === "queue") return data.queue.map((queued) => ({ id: queued.id, title: clean(queued.input.display), summary: queued.state === "uncertain" ? "上次派发未确认，请先核对会话历史" : queued.state === "draft" ? "已取回编辑，原输入仍保存" : "已保存排队，等待当前对话结束", queued,
     lines: [queued.input.display, `会话：${queued.sessionId}`, `工作区：${queued.workspace}`, "E 取回编辑 · D 删除；不会作为补充发给后台任务", ...(queued.state === "uncertain" ? ["上次派发结果未确认，不自动重做；先核对历史，取回编辑不会执行。"] : [])] }));
   return [
+    ...(data.foreground ? [{ id: "foreground", title: `前台对话 · ${clean(data.foreground.title)}`, summary: clean(data.foreground.phase), lines: [clean(data.foreground.title), `状态：${clean(data.foreground.phase)}`, "前台执行随当前终端会话运行，使用当前终端本轮预算。", "Esc 返回对话后可中断；不会创建或控制后台长任务。"] }] : []),
     ...data.runs.map((run) => ({ id: `run:${run.runId}`, title: clean(run.title), summary: `${run.mode} · ${run.phase}`, run,
       lines: [`任务：${run.runId}`, `工作区：${run.workspace}`, `模式：${run.mode} · ${run.phase}`, `模型：${run.provider ?? "默认"}/${run.model ?? "默认"}`,
         `后台独立用量：${run.budget.requests}/${run.budget.limit ?? "—"} 请求 · ${run.budget.priced ? `已报告 $${run.budget.reported.toFixed(4)} · 预留 $${run.budget.reserved.toFixed(4)}` : "未配置或未确认计价，不能视为零费用"}`,

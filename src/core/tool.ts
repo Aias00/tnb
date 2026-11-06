@@ -12,9 +12,16 @@ export type ToolOutput =
       attachments: MediaBlock[];
     };
 
+export type FileChangeEvidence = { path: string; beforeHash: string | null; afterHash: string; before?: string | null; after?: string; truncated: boolean };
+
+export type WorkspaceObservation = { changes: Array<{ path: string; before: string | null; after: string | null; window: "during-command" | "between-commands" }>; partial: boolean };
+
 export type ToolProgressData = {
+  workspaceObservation?: WorkspaceObservation;
+  fileChange?: FileChangeEvidence;
   output?: string;
   fullOutput?: string;
+  exitCode?: number;
   elapsedTimeSeconds?: number;
   totalLines?: number;
   totalBytes?: number;
@@ -22,6 +29,8 @@ export type ToolProgressData = {
   taskId?: string;
   progress?: number;
   progressTotal?: number;
+  agentPhase?: "requesting" | "tool" | "responding";
+  latestTool?: string;
   message?: string;
 };
 

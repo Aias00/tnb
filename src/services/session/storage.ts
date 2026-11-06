@@ -16,6 +16,8 @@ import type { PersistedPromptInput, PromptHistoryEntry, StoredPastedContent } fr
 import { PromptPasteStore } from "./prompt-paste-store";
 import { CallJournal } from "./call-journal";
 
+const sessionIndex = new Map<string, { signature: string; value: SessionInfo }>();
+
 const sessionWriteQueues = new Map<string, Promise<void>>();
 const pendingSessionWrites = new Set<Promise<void>>();
 
@@ -33,6 +35,7 @@ type MessageRecord = SessionRecordBase & {
 };
 
 type CompactBoundaryRecord = SessionRecordBase & {
+  strategy?: import("../compact/notice").CompactionInfo["strategy"];
   type: "compact_boundary";
   messages: ConversationMessage[];
   preTokens: number;
@@ -77,6 +80,8 @@ export type SessionStoreOptions = {
 };
 
 export type SessionState = {
+  recordedInputs?: string[];
+  historyTruncated?: boolean;
   messages: ConversationMessage[];
   promptHistory?: PromptHistoryEntry[];
   permissionMode?: PermissionMode;
@@ -90,6 +95,7 @@ export type SessionState = {
 };
 
 export type SessionInfo = {
+  historyTruncated?: boolean;
   sessionId: string;
   lastModified: number;
   fileSize: number;
@@ -143,6 +149,7 @@ export class SessionStore {
   }
 
   async appendCompactBoundary(input: {
+    strategy?: import("../compact/notice").CompactionInfo["strategy"];
     messages: ConversationMessage[];
     preTokens: number;
     postTokens: number;
@@ -153,6 +160,7 @@ export class SessionStore {
       {
         version: 1,
         type: "compact_boundary",
+        ...(input.strategy ? { strategy: input.strategy } : {}),
         sessionId: this.sessionId,
         timestamp: new Date().toISOString(),
         messages: structuredClone(input.messages),
@@ -250,7 +258,7 @@ export class SessionStore {
     return (await this.readState()).messages;
   }
 
-  async readState(): Promise<SessionState> {
+  async readState(options: { resolvePromptHistory?: boolean } = {}): Promise<SessionState> {
     await flushSessionWrites(this.filePath);
     const text = await readFile(this.filePath, "utf8");
     const messages: ConversationMessage[] = [];
@@ -287,9 +295,18 @@ export class SessionStore {
         messages.push(value.message);
       }
     }
+    const recordedInputs: string[] = []; let historyBytes = 0, historyTruncated = false;
+    if (options.resolvePromptHistory === false) for (const value of [...records].reverse()) {
+      if (!isSessionRecord(value) || value.type !== "message" || value.message.role !== "user" || value.message.content.some(block => block.type === "tool-result")) continue;
+      const input = value.message.content.filter(block => block.type === "text").map(block => block.text).join("\n").trim();
+      if (!input) continue;
+      if (Buffer.byteLength(input) > 32768 || historyBytes + Buffer.byteLength(input) > 256 * 1024 || recordedInputs.length >= 1000) { historyTruncated = true; continue; }
+      recordedInputs.unshift(input); historyBytes += Buffer.byteLength(input);
+    }
     return {
       messages,
-      promptHistory: await sessionPromptHistory(messages, new PromptPasteStore(this.projectDir)),
+      ...(options.resolvePromptHistory === false ? { recordedInputs, historyTruncated } : {}),
+      ...(options.resolvePromptHistory === false ? {} : { promptHistory: await sessionPromptHistory(messages, new PromptPasteStore(this.projectDir)) }),
       ...(permissionMode ? { permissionMode } : {}),
       ...(prePlanMode ? { prePlanMode } : {}),
       ...(worktree ? { worktree } : {}),
@@ -327,10 +344,21 @@ export class SessionStore {
     return latest ? basename(latest, ".jsonl") : undefined;
   }
 
+  async audit(): Promise<{ messages: ConversationMessage[]; compactions: Array<{ strategy?: string; timestamp: string; preTokens: number; postTokens: number; summary: string }> }> {
+    await flushSessionWrites(this.filePath);
+    const info = await stat(this.filePath).catch(error => { if (isMissing(error)) return undefined; throw error; });
+    if (!info) return { messages: [], compactions: [] };
+    if (info.size > 32 * 1024 * 1024) throw new Error("Session audit exceeds 32 MiB; export the session for offline review");
+    const records = parseJsonl<unknown>(await readFile(this.filePath, "utf8")).filter(isSessionRecord).filter(record => record.sessionId === this.sessionId);
+    return { messages: records.flatMap(record => record.type === "message" ? [record.message] : []),
+      compactions: records.flatMap(record => record.type === "compact_boundary" ? [{ strategy: record.strategy, timestamp: record.timestamp, preTokens: record.preTokens, postTokens: record.postTokens, summary: record.strategy === "microcompact" || record.strategy === "context-collapse" ? "" : record.messages.flatMap(message => message.content.filter(block => block.type === "text").map(block => block.text)).slice(0, 1).join("") }] : []) };
+  }
+
   static async list(options: {
     configDir: string;
     cwd: string;
     limit?: number;
+    metadataOnly?: boolean;
   }): Promise<SessionInfo[]> {
     const directory = projectSessionDirectory(options.configDir, options.cwd);
     let names: string[];
@@ -340,23 +368,26 @@ export class SessionStore {
       if (isMissing(error)) return [];
       throw error;
     }
-    const candidates = await Promise.all(
-      names
-        .filter((name) => name.endsWith(".jsonl"))
-        .map(async (name) => {
+    const files = await Promise.all(names.filter(name => name.endsWith(".jsonl")).map(async name => ({ name, metadata: await stat(join(directory, name)) })));
+    files.sort((a, b) => b.metadata.mtimeMs - a.metadata.mtimeMs);
+    const selected = options.limit === undefined ? files : files.slice(0, options.limit);
+    const candidates = await Promise.all(selected.map(async ({ name, metadata }) => {
           const sessionId = basename(name, ".jsonl");
           const file = join(directory, name);
-          const metadata = await stat(file);
+          if (options.metadataOnly) return { sessionId, lastModified: metadata.mtimeMs, fileSize: metadata.size, messageCount: 0 } satisfies SessionInfo;
+          const signature = `${metadata.size}:${metadata.mtimeMs}:${metadata.ctimeMs}:${metadata.ino}`;
+          const cached = sessionIndex.get(file);
+          if (cached?.signature === signature) return structuredClone(cached.value);
           try {
             const state = await new SessionStore({
               configDir: options.configDir,
               cwd: options.cwd,
               sessionId,
-            }).readState();
+            }).readState({ resolvePromptHistory: false });
             const prompts = userPrompts(state.messages);
             const firstPrompt = prompts[0];
             const lastPrompt = prompts.at(-1);
-            return {
+            const value = {
               sessionId,
               lastModified: metadata.mtimeMs,
               fileSize: metadata.size,
@@ -367,8 +398,12 @@ export class SessionStore {
               ...(state.parentSessionId ? { parentSessionId: state.parentSessionId } : {}),
               ...(firstPrompt ? { firstPrompt } : {}),
               ...(lastPrompt ? { lastPrompt } : {}),
-              ...(prompts.length ? { userInputs: prompts } : {}),
+              ...(state.recordedInputs !== undefined ? { userInputs: state.recordedInputs } : prompts.length ? { userInputs: prompts } : {}),
+              ...(state.historyTruncated ? { historyTruncated: true } : {}),
             } satisfies SessionInfo;
+            sessionIndex.delete(file); sessionIndex.set(file, { signature, value });
+            if (sessionIndex.size > 128) sessionIndex.delete(sessionIndex.keys().next().value!);
+            return structuredClone(value);
           } catch (error) {
             return {
               sessionId,

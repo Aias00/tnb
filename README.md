@@ -652,3 +652,10 @@ TypeScript 作者可用 `--language typescript` 创建项目，通过 `bun run c
 持久任务可通过 `--skill NAME`、`--mcp-tool NAME` 显式选择额外能力，详见 [长任务 skills 与 MCP](docs/guides/durable-capabilities.md)。
 
 网页工作台：`tnb web` 默认进入 Coding 对话，支持连续提问、流式回复、工具执行和逐次审批，也可切换历史对话或转为后台任务。原有实时问题提醒、任务控制和结果查看仍保留，见 [使用说明](docs/guides/web-workbench.md)。
+
+
+Build details are available with `tnb --version --verbose` or `--json`.
+`tnb runtime version` compares the CLI with the running background service.
+Local source installs retain separate bundles even for the same version;
+`bun run install:local -- --rollback` switches back to the previous bundle.
+See [build identity and rollback](docs/commands.md#build-identity-and-local-installation-rollback).

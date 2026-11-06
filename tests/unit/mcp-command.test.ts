@@ -103,3 +103,13 @@ test("MCP command requests resource-template argument completions", async () => 
   })).toBe(0);
   expect(JSON.parse(stdout)).toEqual({ values: ["main"], total: 1, hasMore: false });
 });
+
+test("MCP list prints a helpful empty state and readable server details", async () => {
+  const { configDir } = await fixture(); let stdout = "";
+  const options = { argv: ["mcp", "list"], configDir, env: {}, stdout: { columns: 40, write: (text: string) => { stdout += text; } }, stderr: { write() {} } };
+  expect(await runMcpCommand(options)).toBe(0);
+  expect(stdout).toContain("MCP servers (1)"); expect(stdout).toContain("fixture"); expect(stdout).toContain("Target:"); expect(stdout).not.toContain("\t");
+  await writeFile(join(configDir, "mcp.json"), JSON.stringify({ mcpServers: {} })); stdout = "";
+  expect(await runMcpCommand(options)).toBe(0);
+  expect(stdout).toContain("No MCP servers configured.");
+});

@@ -22,10 +22,10 @@ test("queues prompts without losing drafts and navigates slash commands", async 
   const turns: TuiTurn[] = [];
   const commands: string[] = [];
   const finish: Array<() => void> = [];
-  const app = await render(<TuiApp model="test-model" permissionMode="default" sessionIdFactory={() => "test"} runCommand={async (request) => { commands.push(request.name); return { message: "command complete" }; }} stdout={stdout as unknown as NodeJS.WriteStream} runTurn={(turn) => {
+  const app = await render(<AlternateScreen><TuiApp model="test-model" permissionMode="default" sessionIdFactory={() => "test"} runCommand={async (request) => { commands.push(request.name); return { message: "command complete" }; }} stdout={stdout as unknown as NodeJS.WriteStream} runTurn={(turn) => {
     turns.push(turn);
     return new Promise<void>((resolve) => finish.push(resolve));
-  }} />, { stdin: stdin as unknown as NodeJS.ReadStream, stdout: stdout as unknown as NodeJS.WriteStream, patchConsole: false, exitOnCtrlC: false });
+  }} /></AlternateScreen>, { stdin: stdin as unknown as NodeJS.ReadStream, stdout: stdout as unknown as NodeJS.WriteStream, patchConsole: false, exitOnCtrlC: false });
   const send = async (text: string) => { stdin.write(text); await Bun.sleep(40); };
   try {
     await send("first"); await send("\r");
@@ -434,4 +434,185 @@ test("a restored ledger rejects late snapshots from a previous activation of the
     turns[1]!.onUsage(snapshot(0.5));
     await until(() => ui.screen().includes("会话 $6.5000"));
   } finally { for (const finish of finishes) finish(); ui.close(); }
+});
+
+test("real retry events switch the TUI between backoff, retry dispatch and normal output", async () => {
+  let turn: TuiTurn | undefined, finish = () => {};
+  const ui = await interactive({ runTurn: value => { turn = value; return new Promise<void>(resolve => { finish = resolve; }); } });
+  try {
+    await ui.send("retry test"); await ui.send("\r");
+    turn!.onModelEvent({ type: "retry", phase: "waiting", retry: 2, maxRetries: 10, delayMs: 5000, status: 429, reason: "rate-limit" });
+    await until(() => ui.screen().includes("Rate limited (429) · retry 2/10 in"));
+    turn!.onModelEvent({ type: "retry", phase: "requesting", retry: 2, maxRetries: 10, delayMs: 5000, reason: "rate-limit" });
+    await until(() => ui.screen().includes("Retrying model · 2/10"));
+    turn!.onModelEvent({ type: "text", index: 0, text: "recovered" });
+    await until(() => ui.screen().includes("Writing response"));
+  } finally { finish(); ui.close(); }
+});
+
+test("reserved Ctrl+C still interrupts when a custom shortcut tries to claim it", async () => {
+  const { DEFAULT_KEYBINDINGS } = await import("../../src/ui/keybindings");
+  let turn: TuiTurn | undefined, finish = () => {};
+  const ui = await interactive({ keybindings: { ...DEFAULT_KEYBINDINGS, pasteImage: "ctrl+c", historySearch: "ctrl+c" }, runTurn: value => { turn = value; return new Promise<void>(resolve => { finish = resolve; }); }, pasteImage: async () => { throw new Error("reserved key must not paste"); } });
+  try {
+    await ui.send("cancel test"); await ui.send("\r");
+    await until(() => Boolean(turn));
+    await ui.send("\u0003");
+    expect(turn!.signal.aborted).toBe(true);
+  } finally { finish(); ui.close(); }
+});
+
+test("IDE selection attaches to an editable draft without sending or losing existing paste data", async () => {
+  const turns: TuiTurn[] = [];
+  let resolveCommand!: (result: import("../../src/ui/slash-commands").SlashCommandResult) => void;
+  const ui = await interactive({ runCommand: () => new Promise(resolve => { resolveCommand = resolve; }), runTurn: async turn => { turns.push(turn); } });
+  try {
+    await ui.send("/ide attach"); await ui.send("\r");
+    await until(() => Boolean(resolveCommand));
+    await ui.send("\u001b[200~draft one\ndraft two\ndraft three\ndraft four\u001b[201~");
+    resolveCommand({ inputReference: { label: "src/demo.ts:1-2", text: "IDE selection snapshot · src/demo.ts:1-2\nselected code\nEnd IDE selection snapshot" }, message: "IDE selection added to draft" });
+    await until(() => ui.screen().includes("IDE selection added to draft"));
+    expect(turns).toHaveLength(0);
+    await ui.send("\r"); await until(() => turns.length === 1);
+    expect(turns[0]!.input.expanded).toContain("draft one\ndraft two\ndraft three\ndraft four");
+    expect(turns[0]!.input.expanded).toContain("selected code");
+    expect(Object.keys(turns[0]!.input.pastedContents)).toHaveLength(2);
+  } finally { ui.close(); }
+});
+
+test("permission Diff stays pending during paging and preserves approval controls", async () => {
+  const { PermissionController } = await import("../../src/ui/permission-controller");
+  const controller = new PermissionController();
+  const ui = await interactive({ permissionController: controller });
+  const decision = controller.request({ tool: { name: "edit", risk: "write", isReadOnly: () => false }, input: { path: "src/demo.ts", oldText: "unchanged\nold value", newText: "unchanged\nnew value" }, message: "Approve patch" });
+  try {
+    await until(() => ui.screen().includes("修改预览"));
+    expect(ui.screen()).toContain("- old value"); expect(ui.screen()).toContain("+ new value");
+    await ui.send("\u001b[6~");
+    expect(controller.current()).toBeDefined();
+    await ui.send("\r"); expect(await decision).toBe("allow");
+  } finally { controller.resolve("deny"); await decision; ui.close(); }
+});
+
+test("an unfocused terminal gets one generic idle approval notification", async () => {
+  const { PermissionController } = await import("../../src/ui/permission-controller");
+  const controller = new PermissionController(), seen: string[] = [];
+  const ui = await interactive({ permissionController: controller, notify: kind => seen.push(kind) });
+  const decision = controller.request({ tool: { name: "bash", risk: "execute", isReadOnly: () => false }, input: { command: "SECRET_COMMAND_CONTENT" }, message: "Approve" });
+  try {
+    await ui.send("\u001b[O");
+    await until(() => seen.length === 1);
+    expect(seen).toEqual(["permission"]);
+    await Bun.sleep(600); expect(seen).toHaveLength(1);
+    await ui.send("\u001b[I");
+  } finally { controller.resolve("deny"); await decision; ui.close(); }
+});
+
+test("content search selection returns a reference to the draft without running a turn", async () => {
+  const turns: TuiTurn[] = [];
+  const ui = await interactive({ runTurn: async turn => { turns.push(turn); }, runCommand: async () => ({ management: { kind: "search", title: "Search matches", items: [{ id: "one", label: "a.ts:2", preview: ["2: target"], command: "", draftReference: '@"a.ts":2' }] } }) });
+  try {
+    await ui.send("/search target"); await ui.send("\r");
+    await until(() => ui.screen().includes("Search matches"));
+    await ui.send("\r"); await until(() => ui.screen().includes("引用已加入草稿"));
+    expect(turns).toHaveLength(0); expect(ui.screen()).toContain('@"a.ts":2');
+  } finally { ui.close(); }
+});
+
+test("selected user message is reused without auto-submit or overwriting a draft", async () => {
+  const { DEFAULT_KEYBINDINGS } = await import("../../src/ui/keybindings");
+  const turns: TuiTurn[] = [];
+  const ui = await interactive({ keybindings: { ...DEFAULT_KEYBINDINGS, previousMessage: "meta+j" }, runTurn: async turn => { turns.push(turn); } });
+  try {
+    await ui.send("reuse this"); await ui.send("\r"); await until(() => turns.length === 1 && ui.screen().includes("enter send"));
+    await ui.send("\u001bj"); await ui.send("\u001be");
+    await until(() => ui.screen().includes("消息已放回草稿"));
+    expect(turns).toHaveLength(1);
+    await ui.send("\u001be"); await until(() => ui.screen().includes("草稿已有内容"));
+    expect(turns).toHaveLength(1);
+  } finally { ui.close(); }
+});
+
+test("child progress renders real tool state and return recap preserves the ongoing turn", async () => {
+  let turn: TuiTurn | undefined, finish = () => {};
+  const ui = await interactive({ runTurn: current => { turn = current; return new Promise<void>(resolve => { finish = resolve; }); } });
+  try {
+    await ui.send("work"); await ui.send("\r"); await until(() => Boolean(turn));
+    turn!.onToolEvent({ type: "tool-execution-start", id: "child", name: "agent", input: { description: "Read files" }, startedAt: Date.now() });
+    turn!.onToolEvent({ type: "tool-execution-progress", id: "child", name: "agent", data: { agentPhase: "tool", latestTool: "read", elapsedTimeSeconds: 3 } });
+    await until(() => ui.screen().includes("Running tool") && ui.screen().includes("read"));
+    await ui.send("\u001b[O");
+    turn!.onToolEvent({ type: "tool-execution-end", id: "child", name: "agent", output: "done", isError: false, durationMs: 3000 });
+    await ui.send("\u001b[I"); await until(() => ui.screen().includes("离开期间：1 次工具执行完成"));
+    expect(turn!.signal.aborted).toBe(false);
+  } finally { finish(); ui.close(); }
+});
+
+test("message reuse restores the original paste snapshot rather than a display placeholder", async () => {
+  const { DEFAULT_KEYBINDINGS } = await import("../../src/ui/keybindings");
+  const turns: TuiTurn[] = [];
+  const ui = await interactive({ keybindings: { ...DEFAULT_KEYBINDINGS, previousMessage: "meta+j" }, runTurn: async turn => { turns.push(turn); } });
+  try {
+    await ui.send("\u001b[200~alpha\nbeta\ngamma\ndelta\u001b[201~"); await ui.send("\r");
+    await until(() => turns.length === 1 && ui.screen().includes("enter send"));
+    await ui.send("\u001bj"); await ui.send("\u001be"); await until(() => ui.screen().includes("消息已放回草稿"));
+    await ui.send("\r"); await until(() => turns.length === 2);
+    expect(turns[1]!.input.expanded).toBe(turns[0]!.input.expanded);
+    expect(turns[1]!.input.pastedContents).toEqual(turns[0]!.input.pastedContents);
+  } finally { ui.close(); }
+});
+
+test("history text selection does not auto-submit and compaction completion is visible", async () => {
+  const turns: TuiTurn[] = [];
+  const ui = await interactive({ runTurn: async turn => { turns.push(turn); turn.onCompaction?.(12000, 2000, { strategy: "full" }); }, runCommand: async () => ({ management: { kind: "search", title: "Workspace input history", items: [{ id: "old", label: "middle historical input", draftText: "middle historical input", command: "" }] } }) });
+  try {
+    await ui.send("/history middle"); await ui.send("\r"); await until(() => ui.screen().includes("Workspace input history"));
+    await ui.send("\r"); await until(() => ui.screen().includes("历史文本已放入草稿"));
+    expect(turns).toHaveLength(0); expect(ui.screen()).toContain("middle historical input");
+    await ui.send("\r"); await until(() => turns.length === 1 && ui.screen().includes("已生成上下文摘要"));
+    expect(ui.screen()).toContain("12,000 → 2,000");
+  } finally { ui.close(); }
+});
+
+test("compaction summaries have a readable preview and expand without submitting another command", async () => {
+  let commands = 0;
+  const ui = await interactive({ runCommand: async () => { commands++; return { management: { kind: "compactions", title: "Context compaction boundaries", items: [{ id: "one", label: "Recorded boundary", description: "12000 → 2000 estimated tokens", details: ["## Preserved decisions\nKeep the original budget boundary."], command: "" }] } }; } });
+  try {
+    await ui.send("/compactions"); await ui.send("\r"); await until(() => ui.screen().includes("Preserved decisions"));
+    expect(ui.screen()).toContain("Keep the original budget boundary.");
+    await ui.send("\r"); expect(commands).toBe(1); expect(ui.screen()).toContain("Preserved decisions");
+    await ui.send("\u001b"); expect(commands).toBe(1);
+  } finally { ui.close(); }
+});
+
+test("task workbench includes the active foreground turn and removes it after completion", async () => {
+  let turn: TuiTurn | undefined, finish = () => {};
+  const ui = await interactive({ runTurn: current => { turn = current; return new Promise<void>(resolve => { finish = resolve; }); } });
+  try {
+    await ui.send("inspect the current repository"); await ui.send("\r"); await until(() => Boolean(turn));
+    await ui.send("\u0014"); await until(() => ui.screen().includes("任务工作台"));
+    expect(ui.screen()).toContain("前台对话"); expect(ui.screen()).toContain("inspect the current repository");
+    expect(ui.screen()).not.toContain("当前没有任务");
+    await ui.send("\r"); await until(() => ui.screen().includes("前台执行随当前终端会话运行"));
+    finish(); await Bun.sleep(80); await ui.send("\u001b");
+    await until(() => ui.screen().includes("当前没有后台任务或运行中的前台执行"));
+    expect(turn!.signal.aborted).toBe(false);
+  } finally { finish(); ui.close(); }
+});
+
+test("footer separates session totals from model context and silent cleanup does not add transcript notices", async () => {
+  let turn: TuiTurn | undefined, finish = () => {};
+  const ui = await interactive({ runTurn: current => { turn = current; return new Promise<void>(resolve => { finish = resolve; }); } });
+  try {
+    await ui.send("check footer"); await ui.send("\r"); await until(() => Boolean(turn));
+    expect(ui.screen()).toContain("上下文 待获取"); expect(ui.screen()).toContain("会话累计"); expect(ui.screen()).not.toContain("前台 ↑");
+    const rows = ui.screen().split("\n");
+    expect(rows.findIndex(row => row.includes("test · default"))).not.toBe(rows.findIndex(row => row.includes("会话累计")));
+    for (let i = 0; i < 5; i++) turn!.onCompaction?.(5000 - i, 4000 - i, { strategy: "microcompact" });
+    await Bun.sleep(40); expect(ui.screen()).not.toContain("上下文已压缩"); expect(ui.screen()).not.toContain("查看摘要");
+    turn!.onCompaction?.(12000, 2000, { strategy: "full" }); await until(() => ui.screen().includes("已生成上下文摘要"));
+    turn!.onCompaction?.(12000, 2000, { strategy: "full" }); await Bun.sleep(40);
+    expect(ui.screen().match(/已生成上下文摘要/g)).toHaveLength(1);
+    await ui.resize(42, 12); expect(ui.screen()).toContain("enter queue"); expect(ui.screen().split("\n").at(-1)).toContain("test");
+  } finally { finish(); ui.close(); }
 });

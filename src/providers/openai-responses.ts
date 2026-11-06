@@ -22,9 +22,9 @@ export function createOpenAIResponsesTransport(
   const fetcher = options.fetch ?? globalThis.fetch;
   return {
     async *stream(request, signal) {
-      yield* streamWithRetry(
+      yield* streamWithRetry<ModelEvent>(
         () => streamOpenAIResponses(fetcher, options, request, signal),
-        { maxRetries: options.maxRetries, ...(signal ? { signal } : {}) },
+        { maxRetries: options.maxRetries, progress: event => event, ...(signal ? { signal } : {}) },
       );
     },
   };

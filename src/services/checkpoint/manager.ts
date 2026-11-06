@@ -116,7 +116,7 @@ export class CheckpointManager {
     return record;
   }
 
-  private async get(root: string, id: string): Promise<CheckpointRecord> {
+  async get(root: string, id: string): Promise<CheckpointRecord> {
     if (!/^[A-Za-z0-9_-]+$/.test(id)) throw new Error(`Invalid checkpoint id: ${id}`);
     const record = JSON.parse(await readFile(join(this.directory(root), `${id}.json`), "utf8")) as CheckpointRecord;
     if (record.version !== 1 || record.id !== id || record.root !== root) throw new Error(`Invalid checkpoint: ${id}`);

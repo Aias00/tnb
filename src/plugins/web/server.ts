@@ -2,9 +2,9 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { digestJson } from "../../services/runtime/json";
 import type { TaskService, WorkspaceTaskService } from "../../agent/task-service";
 import type { ChatService, WorkspaceChatService } from "../../agent/chat-service";
-import { page, script, style } from "./assets";
+import { page, script, style, markdownParser, markdownRenderer } from "./assets";
 
-type Session = { scope: string; expires: number; controller: AbortController; expiry: AbortSignal; streams: Set<AbortController> };
+type Session = { scope: string; expires: number; controller: AbortController; expiry: AbortSignal; streams: Set<AbortController>; search?: AbortController };
 const key = () => randomBytes(32).toString("hex");
 const same = (left: string, right: string) => { const a = Buffer.from(left), b = Buffer.from(right); return a.length === b.length && timingSafeEqual(a, b); };
 const headers = { "cache-control": "no-store", "x-content-type-options": "nosniff", "referrer-policy": "no-referrer",
@@ -19,7 +19,7 @@ export function createWebWorkbench(options: { tasks: TaskService; chats?: ChatSe
   const pending = new Set<Promise<Response>>();
   let server: ReturnType<typeof Bun.serve> | undefined, origin = "", closing = false;
   let closingPromise: Promise<void> | undefined;
-  const removeSession = (token: string) => { sessions.get(token)?.controller.abort(); sessions.delete(token); };
+  const removeSession = (token: string) => { sessions.get(token)?.controller.abort(); sessions.get(token)?.search?.abort(); sessions.delete(token); };
   const prune = () => {
     for (const [token, session] of sessions) if (session.expires <= now()) removeSession(token);
     for (const [token, ticket] of tickets) if (ticket.expires <= now()) tickets.delete(token);
@@ -36,8 +36,8 @@ export function createWebWorkbench(options: { tasks: TaskService; chats?: ChatSe
     const match = /^\/w\/([a-f0-9]{32})\/(.*)$/.exec(url.pathname);
     const scope = match?.[1] ?? "", resource = match?.[2] ?? "", tasks = scopes.get(scope);
     if (!match) return json({ error: "未知工作台入口" }, 404);
-    if (request.method === "GET" && ["", "app.js", "app.css"].includes(resource)) return new Response(resource === "" ? page : resource === "app.js" ? script : style,
-      { headers: { ...headers, "content-type": resource === "" ? "text/html; charset=utf-8" : resource === "app.js" ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8" } });
+    if (request.method === "GET" && ["", "app.js", "app.css", "markdown-parser.js", "markdown.js"].includes(resource)) return new Response(resource === "" ? page : resource === "app.js" ? script : resource === "markdown-parser.js" ? markdownParser : resource === "markdown.js" ? markdownRenderer : style,
+      { headers: { ...headers, "content-type": resource === "" ? "text/html; charset=utf-8" : resource.endsWith(".js") ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8" } });
     if (!tasks) return json({ error: "工作区入口已失效，请重新运行 tnb web" }, 404);
     if (request.method === "POST" && resource === "auth/exchange") {
       const input = await request.json() as { code?: unknown };
@@ -87,6 +87,23 @@ export function createWebWorkbench(options: { tasks: TaskService; chats?: ChatSe
       if (detail) return json(detail[2] ? tasks.events(decodeURIComponent(detail[1]!), Number(url.searchParams.get("after") ?? 0)) : await tasks.detail(decodeURIComponent(detail[1]!)));
     }
     if (request.method === "POST" && resource === "api/command") return json(await tasks.command(await request.json(), requestSignal));
+    if (request.method === "POST" && resource === "api/inspect") {
+      const chats = conversations.get(scope); if (!chats?.inspect) return json({ error: "检查服务不可用，请更新运行时" }, 503);
+      const input = await request.json();
+      if (!input || typeof input.kind !== "string" || !["history", "changes", "compactions", "mcp", "mcp-reconnect"].includes(input.kind) || Object.keys(input).some(key => !["kind", "chatId", "query", "server"].includes(key)) || ["chatId", "query", "server"].some(key => input[key] !== undefined && typeof input[key] !== "string") || (input.query?.length ?? 0) > 1024) return json({ error: "无效检查请求" }, 400);
+      const view = await chats.inspect(input, requestSignal);
+      let bytes = 0; const items = [];
+      for (const item of view.items.slice(0, 200)) { const bounded = { ...item, body: item.body.length > 32768 ? item.body.slice(0, 32768) + "\n[预览已截断]" : item.body }; bytes += Buffer.byteLength(JSON.stringify(bounded)); if (bytes > 1024 * 1024) break; items.push(bounded); }
+      return json({ ...view, items, description: view.description + (items.length < view.items.length ? " · 显示结果已截断" : "") });
+    }
+    if (request.method === "POST" && resource === "api/search") {
+      const chats = conversations.get(scope); if (!chats?.search) return json({ error: "内容检索服务不可用" }, 503);
+      const input = await request.json();
+      if (!input || typeof input.query !== "string" || !input.query.trim() || input.query.length > 1024 || Object.keys(input).some(key => key !== "query")) return json({ error: "请输入不超过 1024 字符的检索内容" }, 400);
+      session.search?.abort(); const search = new AbortController(); session.search = search;
+      try { return json(await chats.search(input.query, AbortSignal.any([requestSignal, search.signal]))); }
+      finally { if (session.search === search) session.search = undefined; }
+    }
     if (request.method === "POST" && resource === "api/chat/command") {
       const chats = conversations.get(scope); if (!chats) return json({ error: "会话服务不可用" }, 503);
       return json(await chats.command(await request.json()));

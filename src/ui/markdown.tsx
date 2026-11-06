@@ -12,12 +12,18 @@ export const Markdown = memo(function Markdown({ children }: MarkdownProps) {
   const tokens = useMemo(() => marked.lexer(children, { gfm: true }), [children]);
   return (
     <Box flexDirection="column">
-      {tokens.map((token, index) => (
-        <MarkdownBlock key={`${token.type}-${index}`} token={token} />
-      ))}
+      <MarkdownBlocks tokens={tokens} />
     </Box>
   );
 });
+
+function MarkdownBlocks({ tokens, spaced = true }: { tokens: Token[]; spaced?: boolean }) {
+  return tokens.filter(token => token.type !== "space").map((token, index) => (
+    <Box key={`${token.type}-${index}`} flexDirection="column" flexShrink={0} marginTop={spaced && index > 0 ? 1 : 0}>
+      <MarkdownBlock token={token} />
+    </Box>
+  ));
+}
 
 function MarkdownBlock({ token }: { token: Token }): React.ReactNode {
   const accent = useAccent();
@@ -53,7 +59,7 @@ function MarkdownBlock({ token }: { token: Token }): React.ReactNode {
       const quote = token as Tokens.Blockquote;
       return (
         <Box borderStyle="single" borderTop={false} borderBottom={false} borderRight={false} paddingLeft={1}>
-          <Box flexDirection="column">{quote.tokens.map((child, index) => <MarkdownBlock key={index} token={child} />)}</Box>
+          <Box flexDirection="column"><MarkdownBlocks tokens={quote.tokens} /></Box>
         </Box>
       );
     }
@@ -62,10 +68,10 @@ function MarkdownBlock({ token }: { token: Token }): React.ReactNode {
       return (
         <Box flexDirection="column">
           {list.items.map((item, index) => (
-            <Box key={index} paddingLeft={1}>
+            <Box key={index} paddingLeft={1} marginTop={list.loose && index > 0 ? 1 : 0}>
               <Text color={accent}>{list.ordered ? `${Number(list.start) + index}.` : "•"} </Text>
-              <Box flexDirection="column" flexGrow={1}>
-                {item.tokens.map((child, childIndex) => <MarkdownBlock key={childIndex} token={child} />)}
+              <Box flexDirection="column" flexGrow={1} minWidth={0}>
+                <MarkdownBlocks tokens={item.tokens} />
               </Box>
             </Box>
           ))}

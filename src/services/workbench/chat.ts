@@ -1,3 +1,5 @@
+import { createWorkspaceInspection } from "./inspection";
+import { searchWorkspaceContent } from "../workspace/content-search";
 import { randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -31,6 +33,7 @@ export function createChatService(options: { store: RuntimeStore; configDir: str
   const { store } = options, controller = new AbortController();
   const signal = AbortSignal.any([controller.signal, ...(options.signal ? [options.signal] : [])]);
   const live = new Map<string, LiveTurn>(), listeners = new Map<string, Set<() => void>>();
+  const inspections = new Map<string, ReturnType<typeof createWorkspaceInspection>>();
   let closing: Promise<void> | undefined;
   const assertLive = () => signal.throwIfAborted();
   const emit = (id: string) => { for (const listener of listeners.get(id) ?? []) listener(); };
@@ -84,9 +87,18 @@ export function createChatService(options: { store: RuntimeStore; configDir: str
           if (event?.type === "text" && typeof event.text === "string") turn.message.text = clipped(turn.message.text + event.text);
         }
         if (message.type === "tool_event") {
-          const event = message.event as { type: string; id: string; name: string; output?: string; isError?: boolean };
+          const event = message.event as { type: string; id: string; name: string; output?: string; isError?: boolean; data?: { exitCode?: number; agentPhase?: string; latestTool?: string; elapsedTimeSeconds?: number } };
           if (event?.type === "tool-execution-start") {
             turn.message.tools ??= []; if (turn.message.tools.length < 64) turn.message.tools.push({ id: String(event.id).slice(0, 128), name: String(event.name).slice(0, 128), status: "running" });
+          }
+          if (event?.type === "tool-execution-progress") {
+            const tool = turn.message.tools?.find(item => item.id === event.id), data = event.data;
+            if (tool && data) {
+              if (Number.isSafeInteger(data.exitCode)) tool.exitCode = data.exitCode;
+              if (["requesting", "tool", "responding"].includes(data.agentPhase ?? "")) tool.phase = data.agentPhase;
+              if (typeof data.latestTool === "string") tool.latestTool = data.latestTool.slice(0, 128);
+              if (typeof data.elapsedTimeSeconds === "number" && Number.isFinite(data.elapsedTimeSeconds) && data.elapsedTimeSeconds >= 0) tool.elapsedSeconds = data.elapsedTimeSeconds;
+            }
           }
           if (event?.type === "tool-execution-end") {
             const tool = turn.message.tools?.find(item => item.id === event.id); if (tool) { tool.status = event.isError ? "failed" : "complete"; tool.output = clipped(event.output ?? "", 4096); }
@@ -121,13 +133,17 @@ export function createChatService(options: { store: RuntimeStore; configDir: str
   const service: ChatService = { async open(path) {
     assertLive(); const workspace = await realpath(text(path, "workspace", 4096)); if (!(await stat(workspace)).isDirectory()) throw new Error("Workspace must be a directory"); assertLive();
     const scoped = (id: string) => { assertLive(); text(id, "conversation", 128); const row = read(id); if (row.value.workspace !== workspace) throw new Error("Conversation is outside this workspace"); return row.value; };
+    let inspection = inspections.get(workspace);
+    if (!inspection) { inspection = createWorkspaceInspection({ workspace, configDir: options.configDir, env: options.env, signal, assertChat: id => { scoped(id); } }); inspections.set(workspace, inspection); }
     return { workspace,
+      inspect(input, requestSignal) { return inspection!.inspect(input, requestSignal); },
       list() { assertLive(); const result: ChatSummary[] = []; let after = "";
         for (;;) { const rows = store.applicationRecords<ChatSummary>(CHATS, after, 256); for (const row of rows) if (row.value.workspace === workspace) result.push(row.value);
           if (rows.length < 256) break; after = rows.at(-1)!.id; if (result.length > 1000) throw new Error("Conversation inventory limit reached"); }
         return result.sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 100);
       },
       detail(id) { scoped(id); return snapshot(id); },
+      async search(query, searchSignal) { assertLive(); text(query, "search query", 1024); return searchWorkspaceContent(workspace, query, AbortSignal.any([signal, ...(searchSignal ? [searchSignal] : [])])); },
       async command(value) {
         assertLive(); if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid conversation command");
         const input = value as Record<string, unknown>, action = input.action;
@@ -201,6 +217,6 @@ export function createChatService(options: { store: RuntimeStore; configDir: str
       },
     };
   } };
-  const close = () => closing ??= (async () => { controller.abort(); for (const turn of live.values()) turn.controller.abort(); await Promise.allSettled([...live.values()].map(turn => turn.done)); })();
+  const close = () => closing ??= (async () => { controller.abort(); for (const turn of live.values()) turn.controller.abort(); await Promise.allSettled([...live.values()].map(turn => turn.done)); await Promise.allSettled([...inspections.values()].map(inspection => inspection.close())); inspections.clear(); })();
   return { service, close };
 }

@@ -133,3 +133,11 @@ function fakeTool(name: string, access: "read" | "write" | "execute" | "network"
     access,
   });
 }
+
+test("agent tool forwards actual child progress without changing execution result", async () => {
+  const progress: unknown[] = [];
+  const tool = createAgentTool({ runAgent: async task => { task.onProgress?.({ agentPhase: "tool", latestTool: "read" }); return "done"; } });
+  const result = await tool.execute(tool.validate({ description: "Read source", prompt: "Read source" }), new AbortController().signal, event => progress.push(event));
+  expect(result).toBe("done");
+  expect(progress).toEqual([{ agentPhase: "requesting", message: "Starting agent" }, { agentPhase: "tool", latestTool: "read" }]);
+});

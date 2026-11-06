@@ -24,7 +24,7 @@ export function WorkbenchView({ tab, items, selection, detail, offset, height, w
         : items.length ? items.slice(listStart, listStart + Math.max(1, Math.floor(rows / 2))).map((item, index) => <Box flexDirection="column" key={item.id}>
           <Text color={listStart + index === selection ? "cyan" : undefined} bold={listStart + index === selection}>{listStart + index === selection ? "› " : "  "}{item.title.slice(0, width - 6)}</Text>
           <Text dimColor>  {item.summary.slice(0, width - 6)}</Text>
-        </Box>) : <Text dimColor>{tab === "tasks" ? "当前没有任务。用 /task 下发长任务；已有后台任务请确认服务已更新。" : tab === "decisions" ? "没有待处理问题" : "没有排队输入"}</Text>}
+        </Box>) : <Text dimColor>{tab === "tasks" ? "当前没有后台任务或运行中的前台执行。普通对话完成后不会保留为后台任务；可用 /task 创建长任务。" : tab === "decisions" ? "没有待处理问题" : "没有排队输入"}</Text>}
     </Box>
     {confirming ? <Text color="red">{confirming} · Y 确认 / Esc 取消</Text>
       : <Text dimColor>{lines ? `↑/↓ 滚动 · PgUp/PgDn 翻页 · ${start + 1}/${lines.length}` : `↑/↓ 选择 · Enter ${tab === "decisions" ? "回答" : "查看"} · ${items.length} 项（长任务显示最近 32 项）`}</Text>}

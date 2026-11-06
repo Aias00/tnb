@@ -56,3 +56,18 @@ test("@ filename search discovers nested files and ignores symlink escapes", asy
     expect(await completeWorkspaceFiles("@widget", cwd, aborted.signal)).toEqual([]);
   } finally { await rm(cwd, { recursive: true, force: true }); await rm(outside, { recursive: true, force: true }); }
 });
+
+test("recent accepted choices rank root filenames as well as indexed nested files", async () => {
+  const { rm, realpath } = await import("node:fs/promises");
+  const { rememberWorkspaceCompletion } = await import("../../src/ui/file-completion");
+  const { workspaceFileIndex } = await import("../../src/services/workspace/file-index");
+  const root = await mkdtemp(join(tmpdir(), "tnb-recent-completion-"));
+  try {
+    const cwd = await realpath(root);
+    await writeFile(join(cwd, "model-a.ts"), ""); await writeFile(join(cwd, "model-b.ts"), "");
+    rememberWorkspaceCompletion(cwd, "@model", "@model-b.ts", 6);
+    const values = await completeWorkspaceFiles("@model", cwd, new AbortController().signal);
+    expect(values[0]).toBe("@model-b.ts");
+    workspaceFileIndex.invalidate(cwd);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});

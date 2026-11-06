@@ -19,9 +19,9 @@ export function createAnthropicTransport(options: AnthropicTransportOptions): Mo
   const fetcher = options.fetch ?? globalThis.fetch;
   return {
     async *stream(request, signal) {
-      yield* streamWithRetry(
+      yield* streamWithRetry<ModelEvent>(
         () => streamAnthropic(fetcher, options, request, signal),
-        { maxRetries: options.maxRetries, ...(signal ? { signal } : {}) },
+        { maxRetries: options.maxRetries, progress: event => event, ...(signal ? { signal } : {}) },
       );
     },
   };

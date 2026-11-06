@@ -5,7 +5,7 @@ import type { TaskService, WorkspaceTaskService } from "../../src/agent/task-ser
 
 const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
-function fixture(options: { now?: () => number; sessionTtlMs?: number } = {}) {
+function fixture(options: { now?: () => number; sessionTtlMs?: number; chats?: import("../../src/agent/chat-service").ChatService } = {}) {
   let calls = 0, streams = 0;
   const tasks: TaskService = { async open(workspace) { return { workspace, info: async () => ({ workspace, coding: true, models: [], defaults: { provider: "fixture", model: "fixture" } }),
     list: () => [], detail: async () => { throw new Error("not found"); }, events: () => [], command: async () => { calls++; return { ok: true }; },
@@ -81,4 +81,28 @@ test("a browser session bounds concurrent attention streams and releases its slo
   const end = Date.now() + 1000; while (f.streams() === 4 && Date.now() < end) await Bun.sleep(5);
  expect(f.streams()).toBe(3);
   for (const client of clients) client.abort(); await f.host.close(); expect(f.streams()).toBe(0);
+});
+
+test("a new workspace search cancels the previous request and logout cancels outstanding search", async () => {
+  let active: AbortSignal | undefined;
+  const f = fixture({ chats: { async open(workspace) { return { workspace, list: () => [], detail: () => { throw new Error("unused"); }, command: async () => ({}), watch: () => new Response(),
+    async search(query, signal) {
+      if (query === "ready") return { matches: [], truncated: false };
+      active = signal;
+      return new Promise((_resolve, reject) => signal!.addEventListener("abort", () => reject(new Error("Search cancelled")), { once: true }));
+    },
+  }; } } });
+  const session = await login(await f.host.launch("workspace-a"));
+  const post = (resource: string, input: unknown) => fetch(session.base + resource, { method: "POST", headers: { cookie: session.cookie, origin: session.origin, "content-type": "application/json" }, body: JSON.stringify(input) });
+  const pending = post("api/search", { query: "wait" });
+  for (let i = 0; i < 100 && !active; i++) await Bun.sleep(10);
+  expect(active).toBeDefined();
+  const previous = active!;
+  expect((await post("api/search", { query: "ready" })).status).toBe(200);
+  expect(previous.aborted).toBe(true); expect((await pending).status).toBe(400);
+  active = undefined;
+  const outstanding = post("api/search", { query: "wait" });
+  for (let i = 0; i < 100 && !active; i++) await Bun.sleep(10);
+  expect(active).toBeDefined(); const last = active!;
+  await post("auth/logout", {}); expect(last.aborted).toBe(true); expect((await outstanding).status).toBe(400);
 });

@@ -8,13 +8,13 @@ import { Markdown } from "./markdown";
 import type { UsageTotals } from "../services/usage/cost";
 import type { TuiState } from "./tui-state";
 import { TranscriptViewport, type TranscriptViewportController } from "./transcript/TranscriptViewport";
-import { measureTranscriptHeight } from "./transcript/layout";
+import { measureTranscriptHeight, statusLineRows } from "./transcript/layout";
 import type { RefObject } from "react";
 import { TranscriptEntryView } from "./transcript/entry-view";
 import type { UserQuestion } from "../tools/interaction";
 import type { TaskRecord } from "../services/tasks/manager";
 import { WorkbenchView } from "./workbench-view";
-import { permissionDetails } from "./permission-details";
+import { permissionPreview } from "./permission-details";
 import { parseRecommendedLabel } from "./question-label";
 import wrapAnsi from "wrap-ansi";
 import type { ExternalSlashCommand, SLASH_COMMANDS } from "./slash-commands";
@@ -166,9 +166,9 @@ export const TuiView = memo(function TuiView({
     + (tasks.length ? Math.min(3, tasks.length) + 4 + Number(tasks.length > 3) : 0);
   const activityRows = Number(state.busy) + Number(Boolean(state.busy && mcpActivity && !permission && !question && !activityLabel.startsWith("Cancelling")));
   const infoRows = Number(Boolean(backgroundSummary)) + Number(Boolean(durableQuestionCount)) + Number(Boolean(inputTarget)) + Number(Boolean(runtimeConnectionMessage));
-  const activityBudget = Math.max(0, Math.min(taskRows + activityRows + infoRows, rows - suggestionRows - queueRows - 7));
+  const activityBudget = Math.max(0, Math.min(taskRows + activityRows + infoRows, rows - suggestionRows - queueRows - (5 + statusLineRows(rows))));
   const auxiliaryRows = 1 + activityBudget + (transcriptSearch ? 3 : 0) + (historySearch ? 3 : 0);
-  const maxPromptLines = Math.max(1, Math.min(6, Math.floor(rows / 3), rows - suggestionRows - queueRows - auxiliaryRows - 5));
+  const maxPromptLines = Math.max(1, Math.min(6, Math.floor(rows / 3), rows - suggestionRows - queueRows - auxiliaryRows - (3 + statusLineRows(rows))));
   const promptLayout = buildPromptLayout({
     text: input,
     offset: cursor,
@@ -203,7 +203,7 @@ export const TuiView = memo(function TuiView({
         </Box>
       ) : null}
       {permission ? (
-        <PermissionDialog request={permission} selection={permissionSelection} offset={permissionOffset} width={columns} height={rows} />
+        <PermissionDialog request={permission} selection={permissionSelection} offset={permissionOffset} width={columns} height={rows - (statusLineRows(rows) - 2)} />
       ) : question ? (
         <QuestionDialog
           question={question}
@@ -211,14 +211,14 @@ export const TuiView = memo(function TuiView({
           selected={questionSelected}
           {...(questionOtherInput !== undefined ? { otherInput: questionOtherInput } : {})}
         />
-      ) : workbench ? <WorkbenchView {...workbench} width={Math.max(12, columns - 2)} height={Math.max(8, rows - 2)} /> : management ? (
+      ) : workbench ? <WorkbenchView {...workbench} width={Math.max(12, columns - 2)} height={Math.max(8, rows - statusLineRows(rows))} /> : management ? (
         <ManagementDialog
           view={management}
           selection={managementSelection}
           {...(sessionAction ? { sessionAction } : {})}
           maxItems={Math.max(3, Math.min(7, rows - 16))}
           columns={columns}
-          height={Math.max(6, rows - 2)}
+          height={Math.max(6, rows - statusLineRows(rows))}
           filter={sessionFilter}
           filterEditing={sessionFilterEditing}
           detailOnly={managementDetailOnly}
@@ -248,6 +248,7 @@ export const TuiView = memo(function TuiView({
         </>
       )}
       <StatusLine
+        rows={rows}
         invocationUsage={state.invocationUsage}
         invocationBudgetUsd={invocationBudgetUsd}
         model={state.model}
@@ -289,14 +290,14 @@ function QueuePanel({ prompts, states, confirming, selection, columns, rows, not
   });
   const itemRefs = useRef(new Map<number, DOMElement>());
   useEffect(() => { const element = itemRefs.current.get(selection); if (element) listRef.current?.scrollToElement(element); previewRef.current?.scrollTo(0); }, [selection, prompts]);
-  return <Box height={Math.max(6, rows - 2)} borderStyle="round" borderColor={UI_COLORS.border} paddingX={1} flexDirection="column">
+  return <Box height={Math.max(6, rows - statusLineRows(rows))} borderStyle="round" borderColor={UI_COLORS.border} paddingX={1} flexDirection="column">
     <Text bold color={accent}>Queued prompts · {prompts.length} saved</Text>
     <Text dimColor wrap="truncate-end">Execution pauses here after the current turn finishes.</Text>
-    <ScrollBox ref={listRef} height={Math.max(1, Math.floor((rows - 7 - Number(Boolean(notice))) / 2))} flexDirection="column">
+    <ScrollBox ref={listRef} height={Math.max(1, Math.floor((rows - (5 + statusLineRows(rows)) - Number(Boolean(notice))) / 2))} flexDirection="column">
       {prompts.map((prompt, index) => <Box key={index} ref={element => { if (element) itemRefs.current.set(index, element); else itemRefs.current.delete(index); }}><Text wrap="truncate-end" color={selection === index ? accent : undefined}>{selection === index ? figures.pointer : " "} {index + 1}. {states[index] === "uncertain" ? "[未确认，先核对] " : states[index] === "draft" ? "[编辑中，原输入保留] " : ""}{prompt.display.replace(/\s+/g, " ").slice(0, Math.max(10, columns - 12))}</Text></Box>)}
       {!prompts.length ? <Text dimColor>No pending prompts.</Text> : null}
     </ScrollBox>
-    {prompts[selection] ? <ScrollBox ref={previewRef} height={Math.max(1, Math.ceil((rows - 7 - Number(Boolean(notice))) / 2))}><Text>{prompts[selection]!.expanded}</Text></ScrollBox> : null}
+    {prompts[selection] ? <ScrollBox ref={previewRef} height={Math.max(1, Math.ceil((rows - (5 + statusLineRows(rows)) - Number(Boolean(notice))) / 2))}><Text>{prompts[selection]!.expanded}</Text></ScrollBox> : null}
     {notice ? <Text color="yellow" wrap="truncate-end">{notice}</Text> : null}
     <Text dimColor={!confirming} color={confirming ? "red" : undefined} wrap="truncate-end">{confirming ? "删除这条排队输入？ · Y 确认 / Esc 取消" : `↑/↓ select · Enter/E edit · D/Delete remove · PgUp/PgDn preview · ${queueKey}/Esc close`}</Text>
   </Box>;
@@ -401,7 +402,7 @@ function ManagementDialog({
     if (element) itemScrollRef.current?.scrollToElement(element, -1);
     previewScrollRef.current?.scrollTo(0);
   }, [selection, view.items]);
-  const listWidth = (view.kind === "sessions" || view.kind === "diff") && columns >= 80
+  const listWidth = (view.kind === "sessions" || view.kind === "diff" || view.kind === "search" || view.kind === "compactions") && columns >= 80
     ? Math.max(28, Math.floor(columns * 0.38))
     : columns - 4;
   const showSidePreview = columns >= 80 && !detailOnly;
@@ -443,7 +444,7 @@ function ManagementDialog({
       {sessionAction?.type === "delete" ? <Text color="red">Delete this session? y/Enter confirm · n/Esc cancel</Text> : null}
       <Text dimColor wrap="truncate-end">
         {view.items.length
-          ? `${managementActions(view.kind, selected)}↑/↓ select · Enter ${managementEnterLabel(view.kind)} · Esc close${view.items.length > maxItems ? ` · ${selection + 1}/${view.items.length}` : ""}`
+          ? `${managementActions(view.kind, selected)}↑/↓ select · Enter ${managementEnterLabel(view.kind, selected)} · Esc close${view.items.length > maxItems ? ` · ${selection + 1}/${view.items.length}` : ""}`
           : "Esc close"}
       </Text>
     </Box>
@@ -466,7 +467,10 @@ function managementActions(kind: ManagementView["kind"], item?: ManagementView["
   return parts.length ? `${parts.join(" · ")} · ` : "";
 }
 
-function managementEnterLabel(kind: ManagementView["kind"]): string {
+function managementEnterLabel(kind: ManagementView["kind"], item?: ManagementView["items"][number]): string {
+  if (kind === "search" && item?.draftText !== undefined) return "reuse text";
+  if (kind === "compactions") return "expand";
+  if (kind === "search") return "add reference";
   if (kind === "diff") return "expand";
   if (kind === "mcp" || kind === "plugins") return "toggle";
   if (kind === "marketplace") return "install";
@@ -483,6 +487,14 @@ function ManagementDetail({
   item: ManagementView["items"][number];
 }) {
   const accent = useAccent();
+  if (view.kind === "compactions") return <Box flexDirection="column"><Text bold>{item.label}</Text><Text dimColor>{item.description}</Text><Markdown>{item.details?.join("\n") ?? "No summary recorded."}</Markdown></Box>;
+  if (view.kind === "checkpoints" && ["both", "files", "conversation"].includes(item.id)) return <Box flexDirection="column">
+    <Text bold>{item.label}</Text>
+    {item.description ? <Text>{item.description}</Text> : null}
+    <Text bold>Restore impact</Text>
+    {item.details?.map((detail, index) => <Text key={index}>{detail}</Text>)}
+    <Text color="yellow">Enter confirms this scope · Esc cancels without changes</Text>
+  </Box>;
   if (view.kind === "diff") return <Box flexDirection="column">
     <Text bold>{item.label}</Text>
     {item.description ? <Text dimColor>{item.description}</Text> : null}
@@ -491,7 +503,7 @@ function ManagementDetail({
   const previewLabel = item.transcriptPreview?.length
     ? "Conversation preview"
     : item.preview?.length
-      ? "Session input history"
+      ? view.kind === "search" ? item.draftText !== undefined ? "Historical input" : "Match context" : "Session input history"
       : undefined;
   return (
     <Box flexDirection="column">
@@ -687,12 +699,12 @@ function PermissionDialog({ request, selection, offset, width, height }: { reque
     typeof (request.input as { plan?: unknown }).plan === "string"
     ? (request.input as { plan: string }).plan
     : undefined;
-  const lines = permissionDetails(request).flatMap((line) => wrapAnsi(line, Math.max(8, width - 6), { hard: true, wordWrap: false }).split("\n"));
+  const lines = permissionPreview(request).flatMap(line => wrapAnsi(line.text, Math.max(8, width - 6), { hard: true, wordWrap: false }).split("\n").map(text => ({ ...line, text })));
   const page = Math.max(2, height - 10), start = Math.min(offset, Math.max(0, lines.length - page));
   return (
     <Box flexDirection="column" borderStyle="round" borderColor="yellow" paddingX={1}>
       <Text bold color="yellow">Permission required</Text>
-      {lines.slice(start, start + page).map((line, index) => <Text key={index}>{line || " "}</Text>)}
+      {lines.slice(start, start + page).map((line, index) => <Text key={index} color={line.kind === "added" ? "green" : line.kind === "removed" ? "red" : undefined} dimColor={line.kind === "context"}>{line.text || " "}</Text>)}
       {plan ? <Text dimColor>计划内容可用 PgUp/PgDn 查看；不会因未显示的内容自动批准。</Text> : null}
       <Box marginTop={1} gap={2}>
         <Text {...(selection === "allow" ? { color: "green" as const } : {})} bold={selection === "allow"}>
@@ -718,6 +730,7 @@ function PermissionDialog({ request, selection, offset, width, height }: { reque
 }
 
 function StatusLine({
+  rows,
   invocationUsage,
   invocationBudgetUsd,
   model,
@@ -732,6 +745,7 @@ function StatusLine({
   workspaceLabel,
   queuedPromptCount,
 }: {
+  rows: number;
   invocationUsage: UsageTotals;
   invocationBudgetUsd?: number;
   model: string;
@@ -752,26 +766,29 @@ function StatusLine({
   const inputTokens = usage.inputTokens + usage.cacheReadInputTokens + usage.cacheCreationInputTokens;
   const cost = invocationBudgetUsd !== undefined || usage.costUsd || invocationUsage.costUsd ? ` · 本轮 $${invocationUsage.costUsd.toFixed(4)}${invocationBudgetUsd !== undefined ? `/$${invocationBudgetUsd.toFixed(2)}` : ""} · 会话 $${usage.costUsd.toFixed(4)}` : "";
   const context = contextLabel(lastInputTokens, contextWindowTokens);
-  return (
+  const hints = modal ? "follow dialog controls"
+    : transcriptOffset > 0 ? `PgUp/PgDn · Shift+↑/↓ · Ctrl+End latest · ${transcriptOffset} newer`
+    : busy ? `enter queue · esc interrupt · ${queuedPromptCount} queued · ${queueKey} manage`
+    : `enter send · ${toggleKey} tool · ${allKey} all · ${queueKey} queue`;
+  const metadata = <Text wrap="truncate-end"><Text bold>{model}</Text><Text dimColor> · {permissionMode} · {context}{workspaceLabel ? ` · ${workspaceLabel}` : ""}</Text></Text>;
+  return statusLineRows(rows) === 3 ? (
+    <Box flexShrink={0} height={3} flexDirection="column">
+      {metadata}
+      <Text dimColor wrap="truncate-end">{cost ? cost.replace(/^ · /, "") + " · " : ""}会话累计 ↑{inputTokens.toLocaleString()} ↓{usage.outputTokens.toLocaleString()} tokens</Text>
+      <Text dimColor wrap="truncate-end">{hints}</Text>
+    </Box>
+  ) : (
     <Box flexShrink={0} height={2} flexDirection="column">
-      <Text dimColor wrap="truncate-end">
-        {modal
-          ? "follow dialog controls"
-          : transcriptOffset > 0
-            ? `PgUp/PgDn · Shift+↑/↓ · Ctrl+End latest · ${transcriptOffset} newer`
-            : busy
-              ? `enter queue · esc interrupt · ${queuedPromptCount} queued · ${queueKey} manage`
-              : `enter send · ${toggleKey} tool · ${allKey} all · ${queueKey} queue`}
-      </Text>
-      <Text wrap="truncate-end"><Text bold>{model}</Text><Text dimColor> · {permissionMode}{cost} · {context} · 前台 ↑{inputTokens.toLocaleString()} ↓{usage.outputTokens.toLocaleString()}{workspaceLabel ? ` · ${workspaceLabel.slice(-36)}` : ""}</Text></Text>
+      <Text dimColor wrap="truncate-end">{hints}</Text>
+      <Text wrap="truncate-end"><Text bold>{model}</Text><Text dimColor>{cost} · {context} · {permissionMode}</Text></Text>
     </Box>
   );
 }
 
 function contextLabel(input: number, window: number): string {
-  if (!input || !window) return "ctx —";
+  if (!input || !window) return "上下文 待获取";
   const percentage = Math.min(100, input / window * 100);
-  return `ctx ${percentage > 0 && percentage < 1 ? "<1" : percentage.toFixed(0)}%`;
+  return `上下文 ${percentage > 0 && percentage < 1 ? "<1" : percentage.toFixed(0)}%`;
 }
 
 function compactJson(value: unknown): string {

@@ -19,7 +19,7 @@ export function createFallbackTransport(options: {
       let emitted = false;
       try {
         for await (const event of options.primary.stream(request, signal)) {
-          emitted = true;
+          if (event.type !== "retry") emitted = true;
           yield event;
         }
       } catch (error) {

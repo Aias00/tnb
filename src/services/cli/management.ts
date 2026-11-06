@@ -1,4 +1,7 @@
-import { builtinPluginScope, pluginActivationNotice } from "../plugins/builtin-scope";
+import { formatSummaryList, outputColumns, type ListSummary } from "./list-format";
+import { formatPluginList } from "./plugin-list";
+import packageJson from "../../../package.json";
+import { BUILTIN_PLUGIN_SCOPES, builtinPluginScope, pluginActivationNotice } from "../plugins/builtin-scope";
 import { randomUUID } from "node:crypto";
 import { cp, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -148,10 +151,8 @@ export async function runRollbackCommand(options: ManagementCommandOptions): Pro
     if (!id || id === "list") {
       const records = await manager.list(options.cwd);
       if (options.argv.includes("--json")) options.stdout.write(`${JSON.stringify(records, null, 2)}\n`);
-      else if (!records.length) options.stdout.write("No checkpoints found.\n");
-      else for (const record of records) {
-        options.stdout.write(`${record.id}\t${record.createdAt}\t${record.automatic ? "automatic" : "manual"}\t${record.label}\n`);
-      }
+      else options.stdout.write(formatSummaryList("Checkpoints", records.map(record => ({ title: record.label,
+        details: [`ID: ${record.id}`, `${record.createdAt} · ${record.automatic ? "automatic" : "manual"}`] })), outputColumns(options.stdout), "No checkpoints found."));
       return 0;
     }
     if (id === "--help" || id === "-h" || id === "help") {
@@ -209,14 +210,8 @@ Options:
       const jobs = await listManagedWorktreeJobs(options.cwd);
       if (options.argv.includes("--json") || optionValue(options.argv, "--output-format") === "json") {
         options.stdout.write(`${JSON.stringify(jobs, null, 2)}\n`);
-      } else if (jobs.length === 0) {
-        options.stdout.write("No local worktree jobs.\n");
-      } else {
-        options.stdout.write("ID\tCHANGES\tCOMMITS\tBRANCH\tPATH\n");
-        for (const job of jobs) {
-          options.stdout.write(`${job.id}\t${job.changedFiles}\t${job.uniqueCommits}\t${job.branch}\t${job.path}\n`);
-        }
-      }
+      } else options.stdout.write(formatSummaryList("Local worktree jobs", jobs.map(job => ({ title: job.id,
+        details: [`Branch: ${job.branch}`, `Changes: ${job.changedFiles} · Unique commits: ${job.uniqueCommits}`, `Path: ${job.path}`] })), outputColumns(options.stdout), "No local worktree jobs."));
       return 0;
     }
     if (action === "show") {
@@ -369,7 +364,7 @@ function formatSandboxStatus(value: SandboxSettings | undefined): string {
 
 export async function runProviderCommand(options: ManagementCommandOptions): Promise<number> {
   try {
-    const action = options.argv[1] ?? "list";
+    const action = !options.argv[1] || options.argv[1] === "--json" ? "list" : options.argv[1];
     if (action === "--help" || action === "-h" || action === "help") {
       options.stdout.write(`Usage: tnb provider <list|show|add|set|use|test|remove|model> [id] [options]
 
@@ -629,7 +624,7 @@ async function runProviderModelCommandUnlocked(
       maxTokens: model.maxTokens ?? 16_384,
       default: index === 0,
     }));
-    writeRows(options, rows, (model) => `${model.id}${model.default ? " *" : ""}\t${String(model.contextWindow)}\t${String(model.maxTokens)}`);
+    writeRows(options, rows, model => ({ title: `${model.id}${model.default ? " · default" : ""}`, details: [`Context: ${model.contextWindow} tokens · Max output: ${model.maxTokens} tokens`] }), "Provider models");
     return 0;
   }
   const modelId = options.argv[4];
@@ -683,7 +678,7 @@ async function runProviderList(options: ManagementCommandOptions): Promise<numbe
     baseUrl: provider.baseUrl,
     models: provider.models.map(({ id }) => id),
   }));
-  writeRows(options, rows, (row) => `${row.id}\t${row.api}\t${row.models.join(", ")}\t${row.baseUrl}`);
+  writeRows(options, rows, row => ({ title: `${row.id} · ${row.name}`, details: [`API: ${row.api}`, `Models: ${row.models.join(", ")}`, `Endpoint: ${row.baseUrl}`] }), "Providers");
   return 0;
 }
 
@@ -739,7 +734,7 @@ export async function runDoctorCommand(options: ManagementCommandOptions): Promi
   const checks = await collectDoctorChecks(options);
   const json = options.argv.includes("--json") || optionValue(options.argv, "--output-format") === "json";
   if (json) options.stdout.write(`${JSON.stringify(checks, null, 2)}\n`);
-  else for (const check of checks) options.stdout.write(`${check.status.toUpperCase().padEnd(7)} ${check.name}: ${check.detail}\n`);
+  else options.stdout.write(formatSummaryList("Diagnostics", checks.map(check => ({ title: `${check.name} · ${check.status.toUpperCase()}`, details: [check.detail] })), outputColumns(options.stdout)));
   return checks.some(({ status }) => status === "error") ? 1 : 0;
 }
 
@@ -748,7 +743,7 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
     const configDir = resolveConfigDir(options);
     const command = options.argv[0];
     if (command === "sessions") {
-      const action = options.argv[1] ?? "list";
+      const action = !options.argv[1] || options.argv[1] === "--json" ? "list" : options.argv[1];
       if (action === "--help" || action === "-h" || action === "help") {
         options.stdout.write(`Usage: tnb sessions [list|show|delete] [session-id]
 
@@ -781,11 +776,11 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
       if (action !== "list") throw new Error(`Unknown sessions command: ${action}`);
       const sessions = await SessionStore.list({ configDir, cwd: options.cwd });
       if (options.argv.includes("--json")) options.stdout.write(`${JSON.stringify(sessions, null, 2)}\n`);
-      else for (const session of sessions) options.stdout.write(`${session.sessionId}\t${new Date(session.lastModified).toISOString()}\t${session.lastPrompt ?? session.firstPrompt ?? ""}\n`);
+      else options.stdout.write(formatSummaryList("Workspace sessions", sessions.map(session => ({ title: session.title || session.firstPrompt || session.sessionId, details: [`ID: ${session.sessionId}`, `Updated: ${new Date(session.lastModified).toLocaleString()} · ${session.messageCount} messages`, ...(session.lastPrompt && session.lastPrompt !== session.firstPrompt ? [`Last prompt: ${session.lastPrompt}`] : []), ...(session.error ? [`Error: ${session.error}`] : [])] })), outputColumns(options.stdout), "No sessions found for this workspace."));
       return 0;
     }
     if (command === "skills") {
-      const action = options.argv[1] ?? "list";
+      const action = !options.argv[1] || options.argv[1] === "--json" ? "list" : options.argv[1];
       if (action === "install" || action === "remove") {
         const sourceOrName = options.argv[2];
         if (!sourceOrName) throw new Error(`skills ${action} requires ${action === "install" ? "a source directory" : "a skill name"}`);
@@ -831,11 +826,11 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
         options.stdout.write(`${JSON.stringify({ ...skill, filePath: join(skill.baseDir, "SKILL.md") }, null, 2)}\n`);
         return 0;
       }
-      writeRows(options, rows, (row) => `${row.name}\t${row.source}\t${row.description}`);
+      writeRows(options, rows, row => ({ title: `${row.name} · ${row.source}`, details: [row.description] }), "Skills");
       return 0;
     }
     if (command === "plugins") {
-      const action = options.argv[1] ?? "list";
+      const action = !options.argv[1] || options.argv[1] === "--json" ? "list" : options.argv[1];
       if (["init", "validate", "test"].includes(action)) return await runPluginDevelopmentCommand(options);
       if (["--help", "-h", "help"].includes(action) || options.argv.includes("--help") || options.argv.includes("-h")) { options.stdout.write(PLUGIN_DEVELOPMENT_HELP + "\nInstalled plugins: list, show, install, update, remove, enable, disable, trust, untrust, marketplace, search.\n"); return 0; }
       if (action === "marketplace" || action === "search") {
@@ -865,9 +860,11 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
             installedScope: existing?.source,
             runtimeStatus: runtime?.latest.status,
           };
-        }), (plugin) =>
-          `${plugin.name}\t${plugin.version}\t${plugin.marketplace}\t${plugin.installed ? `${plugin.installedScope}:${plugin.installedVersion ?? "-"}` : "-"}\t${plugin.runtimeStatus ?? "-"}\t${plugin.description ?? plugin.repository}`
-        );
+        }), plugin => ({ title: `${plugin.name} · ${plugin.version}`, details: [
+          plugin.description ?? plugin.repository ?? "", `Marketplace: ${plugin.marketplace}`,
+          plugin.installed ? `Installed: ${plugin.installedScope} · ${plugin.installedVersion ?? "unknown version"}` : "Not installed",
+          ...(plugin.runtimeStatus ? [`Cached runtime: ${plugin.runtimeStatus}`] : []),
+        ] }), "Marketplace plugins");
         for (const error of result.errors) options.stderr.write(`tnb: ${error.source}: ${error.error}\n`);
         return result.errors.length && !rows.length ? 1 : 0;
       }
@@ -1012,8 +1009,9 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
         { directory: join(options.cwd, ".tnb", "plugins"), source: "project" },
       ], settings.enabledPlugins, { trustStorePath: pluginTrustStorePath(configDir), includeDisabled: true, blockedFingerprints: settings.blockedPluginFingerprints });
       const runtimeCache = await loadPluginRuntimeCache(join(configDir, "plugins", ".runtime"));
-      const rows = result.plugins.map((plugin) => ({
+      const installedRows = result.plugins.map((plugin) => ({
         name: plugin.name,
+        enabled: settings.enabledPlugins?.[plugin.name] !== false && settings.enabledPlugins?.[plugin.name.toLowerCase()] !== false,
         version: plugin.version ?? null,
         source: plugin.source,
         scope: plugin.source,
@@ -1027,9 +1025,14 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
         manifestPath: plugin.manifestPath ?? null,
         description: plugin.description ?? plugin.root,
       }));
-      writeRows(options, rows, (plugin) =>
-        `${plugin.name}\t${plugin.version ?? "-"}\t${plugin.scope}\t${plugin.trust}\t${plugin.state}\t${plugin.activation}/${plugin.start}/${plugin.reload}\t${plugin.runtimeStatus ?? "-"}\t${plugin.description}`
-      );
+      const builtins = Object.entries(BUILTIN_PLUGIN_SCOPES)
+        .filter(([name]) => !result.plugins.some(plugin => plugin.name.toLowerCase() === name))
+        .map(([name, description]) => ({ name, version: packageJson.version, source: "builtin", scope: "builtin",
+          enabled: settings.enabledPlugins?.[name] !== false, state: "host", activation: "host", start: "owner", reload: "restart",
+          runtimeStatus: "not-queried", trust: "host-provided", policy: undefined, manifestPath: null, description }));
+      const rows = [...installedRows, ...builtins];
+      if (options.argv.includes("--json")) options.stdout.write(`${JSON.stringify(rows, null, 2)}\n`);
+      else options.stdout.write(formatPluginList(rows, (options.stdout as { columns?: number }).columns ?? process.stdout.columns ?? 80));
       for (const error of result.errors) options.stderr.write(`tnb: ${error.path}: ${error.error}\n`);
       return result.errors.length ? 1 : 0;
     }
@@ -1040,7 +1043,7 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
         { directory: join(options.cwd, ".tnb", "agents"), source: "project" },
       ]);
       const rows = result.agents.map(({ name, description, source, filePath }) => ({ name, description, source, filePath }));
-      writeRows(options, rows, (row) => `${row.name}\t${row.source}\t${row.description}`);
+      writeRows(options, rows, row => ({ title: `${row.name} · ${row.source}`, details: [row.description] }), "Agents");
       for (const error of result.errors) options.stderr.write(`tnb: ${error.path}: ${error.error}\n`);
       return result.errors.length ? 1 : 0;
     }
@@ -1053,7 +1056,7 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
           handler: hook.type === "command" ? hook.command : hook.type === "http" ? hook.url : `${hook.type}: ${hook.prompt}`,
         })))
       );
-      writeRows(options, rows, (row) => `${row.event}\t${row.matcher}\t${row.handler}`);
+      writeRows(options, rows, row => ({ title: row.event, details: [`Matcher: ${row.matcher}`, `Handler: ${row.handler}`] }), "Hooks");
       return 0;
     }
     throw new Error(`Unknown resource command: ${command}`);
@@ -1303,9 +1306,9 @@ function commandCheck(name: string, executable: string, missingDetail: string) {
     : { name, status: "warning" as const, detail: missingDetail };
 }
 
-function writeRows<T>(options: ManagementCommandOptions, rows: T[], format: (row: T) => string): void {
+function writeRows<T>(options: ManagementCommandOptions, rows: T[], format: (row: T) => ListSummary, title: string): void {
   if (options.argv.includes("--json")) options.stdout.write(`${JSON.stringify(rows, null, 2)}\n`);
-  else for (const row of rows) options.stdout.write(`${format(row)}\n`);
+  else options.stdout.write(formatSummaryList(title, rows.map(format), outputColumns(options.stdout)));
 }
 
 function errorMessage(error: unknown): string {

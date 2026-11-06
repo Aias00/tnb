@@ -1,3 +1,4 @@
+import { formatSummaryList, outputColumns } from "../cli/list-format";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -57,9 +58,8 @@ export async function runIdeCommand(options: IdeCommandOptions): Promise<number>
       } else if (!descriptors.length) {
         options.stdout.write("No IDE bridges found. Start one with tnb remote-control --socket ~/.tnb/ide/editor.sock\n");
       } else {
-        for (const descriptor of descriptors) {
-          options.stdout.write(`${descriptor.active ? "active" : "stale"}\t${descriptor.pid ?? "?"}\t${descriptor.workspace ?? "?"}\t${descriptor.path}\n`);
-        }
+        options.stdout.write(formatSummaryList("IDE bridges", descriptors.map(descriptor => ({ title: `${descriptor.active ? "active" : "stale"} · PID ${descriptor.pid ?? "?"}`,
+          details: [`Workspace: ${descriptor.workspace ?? "?"}`, `Descriptor: ${descriptor.path}`] })), outputColumns(options.stdout)));
       }
       return 0;
     }

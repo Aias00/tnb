@@ -56,3 +56,19 @@ test("workspace branch presentation follows worktree metadata without spawning g
     expect(values).toContain("next");
   } finally { close(); }
 });
+
+test("edit permission preview reuses real line diff with context and scope warning", async () => {
+  const { permissionPreview } = await import("../../src/ui/permission-details");
+  const rows = permissionPreview({ tool: { name: "edit", risk: "write", isReadOnly: () => false }, input: { path: "src/a.ts", oldText: "same\nold", newText: "same\nnew", replaceAll: true }, message: "Review", suggestedRule: "Edit(src/a.ts)" });
+  expect(rows.some(row => row.kind === "context" && row.text.includes("same"))).toBe(true);
+  expect(rows.find(row => row.kind === "removed")?.text).toContain("- old");
+  expect(rows.find(row => row.kind === "added")?.text).toContain("+ new");
+  expect(rows.map(row => row.text).join("\n")).toContain("替换所有匹配");
+});
+
+test("write approval renders proposed additions without inventing an existing-file diff", async () => {
+  const { permissionPreview } = await import("../../src/ui/permission-details");
+  const rows = permissionPreview({ tool: { name: "write", risk: "write", isReadOnly: () => false }, input: { path: "new.ts", content: "const newValue = 1;" }, message: "Review" });
+  expect(rows.some(row => row.kind === "added" && row.text.includes("+ const newValue"))).toBe(true);
+  expect(rows.map(row => row.text).join("\n")).toContain("不代表完整覆盖差异");
+});

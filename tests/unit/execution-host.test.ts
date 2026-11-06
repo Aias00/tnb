@@ -103,3 +103,13 @@ test("file access roots do not implicitly become search roots", async () => {
   expect(await tools.read.execute(tools.read.validate({ path: join(external, "memory.txt") }), signal)).toContain("approved file content");
   await expect(tools.glob.execute(tools.glob.validate({ pattern: "*.txt", path: external }), signal)).rejects.toThrow();
 });
+
+test("retry metadata does not prevent fallback after the primary exhausts its transport retries", async () => {
+  const { createFallbackTransport } = await import("../../src/providers/fallback");
+  const { ProviderHttpError } = await import("../../src/providers/retry");
+  const transport = createFallbackTransport({ primary: { async *stream() {
+    yield { type: "retry", phase: "waiting", retry: 1, maxRetries: 1, delayMs: 0, status: 503, reason: "server" };
+    throw new ProviderHttpError(503, "unavailable", new Headers());
+  } }, fallback: { async *stream() { yield { type: "text", index: 0, text: "fallback-after-retry" }; } }, fallbackModel: "other" });
+  expect((await collect(transport)).at(-1)).toEqual({ type: "text", index: 0, text: "fallback-after-retry" });
+});

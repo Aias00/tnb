@@ -181,7 +181,10 @@ describe("command hooks", () => {
     runner.setObserver((event) => events.push(event.type));
     await runner.start("startup");
     await writeFile(join(directory, "watched.txt"), "changed\n");
-    for (let attempt = 0; attempt < 40; attempt += 1) {
+    // fs.watch delivery plus debounce and a subprocess can exceed one second under suite load.
+    // Keep the test's five-second deadline and wait for the actual hook result within it.
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline) {
       if (events.includes("response") && await readFile(log, "utf8").catch(() => "")) break;
       await Bun.sleep(25);
     }

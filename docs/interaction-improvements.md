@@ -105,3 +105,61 @@ Regression coverage includes cursor-position completion, paths with spaces,
 symlink confinement, nested filename matching, stale completion responses,
 paste retention, selecting beyond the first visible menu page, 42×12-to-90×24
 resizing, narrow diff browsing, and Git status equality before/after reviewing.
+
+## Next reference adoption increment
+
+The plan in `superpowers/plans/2026-11-06-reference-capability-adoption.md` assigns
+Provider events to transport, context analysis to a shared service, restore policy
+to checkpoint/session services and diagnostics to terminal configuration. This
+increment implements retry progress, checkpoint preview/scopes, context categories
+and keybinding warnings. It does not copy reference product source files, change
+Web, add dependencies or move Coding filesystem policy into the generic kernel.
+
+Tests exercise sanitized retry metadata, cancellation during backoff, fallback
+after metadata-only retries, read-only and stale restore previews, all restore
+scopes, context/media accounting, keyboard collisions and TUI phase transitions.
+File index caching, richer approval Diff, idle notifications and IDE selections
+are delivered in the follow-up below.
+
+## Remaining four capabilities delivered
+
+The follow-up implements the workspace index cache/ranking, approval Diff, host
+idle notifications, and explicit IDE selection references from the adoption plan.
+TUI consumes workspace/IDE/notification services; generic Core and Coding authority
+remain unchanged. Web is untouched. The IDE host can share published context across
+authenticated connections without sharing per-connection authentication state.
+See `docs/commands.md` for commands, controls, size limits and notification behavior.
+
+Focused tests cover cache expiry/coalescing/cancellation/ranking, edit/write preview
+semantics and non-approving pagination, idle focus/dedupe/privacy, IDE range/size/
+workspace confinement, two authenticated connections, and preserved structured
+paste payloads when attaching to a draft. These capabilities have intentionally
+bounded behavior rather than unbounded file watchers or automatic editor capture.
+
+## Web 同步吸收
+
+聊天页新增工作区内容搜索、消息复制与空草稿复用、结构化子 Agent 进度、标签页返回摘要。搜索结果用文本节点呈现，加入草稿后由用户决定是否发送；用户输入与工具结果不作为 HTML 注入。桌面和 390px 移动视口已做浏览器交互验证，摘要通过模拟 visibilitychange 验证，无额外模型请求。
+
+## 恢复、审阅和历史（第三批）
+
+交互 MCP 连接按服务隔离，支持指定服务重连和真实连接状态；新增 native 记录驱动的 `/changes` 分轮审阅、跨会话 `/history`、按需 `/session-preview` 和 `/compactions` 摘要浏览。默认会话列表限制为最近一页并复用文件版本缓存。Web 回答现在使用已有 marked 与受控 DOM 渲染 Markdown，保持原文复制、授权和预算归属。
+
+## 阅读密度与任务空状态修正
+
+Markdown 顶层段落、标题、列表和代码块之间保留一行间距，紧凑列表不额外拉开；长回答在宽终端中限制为 112 列内容宽度，窄终端继续按可用宽度换行。此调整仅影响显示，不修改回答或复制内容。
+
+任务工作台补充当前前台执行，显示当前指令与真实运行阶段，完成后移除；前台仍使用当前终端预算，不创建后台 Run。空状态明确区分已完成的普通对话与后台任务，不再无依据地提示更新服务。
+
+## 状态与上下文提示修正
+
+正常高度的终端使用三行页脚：模型/权限/上下文/目录、费用与会话累计 tokens、快捷键；低于 18 行时使用两行紧凑布局。上下文数据不可用时显示“待获取”，不将会话累计输入称为“前台上下文”。各面板与滚动区使用相同页脚高度预留。
+
+轻量旧工具输出清理不再向对话插入黄色提示，但仍保存整理记录；完整摘要与较早对话折叠使用不同提示。`/compactions` 展示真实类型，轻量清理不会把保留的用户文本当成生成摘要。重复通知在当前调用内去重。
+
+Bash 完成使用中性标记和实际进程退出码，不以绿勾暗示任务目标验收；非零退出仍显示失败，并保留退出码与原输出。输出中出现 error 不会被启发式重判，管道与目标程序是否成功需要依据实际执行结果核对。Web 工具卡同步显示已知退出码。
+
+## Web 检查、全文历史与观测补齐
+
+Web 增加历史全文、分轮改动、压缩记录和 MCP 诊断入口，共用工作区约束的 host inspection service。历史覆盖原生用户输入/回答/工具输出，命中结果带来源，超大文本仅展示片段；Web 和 TUI 均保持草稿确认后再发送。
+
+Shell 版本观测与精确编辑证据分别呈现。窗口内观察和命令间观察都不声明修改者；大文件、非 Git、采样间隙等覆盖边界见 commands.md。MCP 检查明确是独立诊断连接，保留运行中对话的连接与权限语义。

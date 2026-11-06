@@ -1,3 +1,4 @@
+import { withoutFileChangeEvidence } from "./message";
 import type {
   ConversationMessage,
   MediaBlock,
@@ -310,7 +311,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<{
 }
 
 function providerMessages(messages: ConversationMessage[]): ConversationMessage[] {
-  return messages.map((message) => {
+  return withoutFileChangeEvidence(messages).map((message) => {
     if (message.role !== "user" || message.promptInput === undefined) return structuredClone(message);
     return { role: "user", content: structuredClone(message.content) };
   });

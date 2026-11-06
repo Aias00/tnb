@@ -31,6 +31,6 @@ describe("TranscriptViewport", () => {
       terminalRows: 20,
       promptLayout,
       suggestionRows: 1,
-    })).toBe(20 - promptLayout.promptRowsUsed - 2 - 1);
+    })).toBe(20 - promptLayout.promptRowsUsed - 3 - 1);
   });
 });

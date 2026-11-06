@@ -99,7 +99,7 @@ export async function collectSamplingResponse(
       stopReason = event.reason;
       break;
     }
-    if (event.type === "usage") continue;
+    if (event.type === "usage" || event.type === "retry") continue;
     if (event.type === "text") {
       const position = byIndex.get(event.index);
       if (position === undefined) {

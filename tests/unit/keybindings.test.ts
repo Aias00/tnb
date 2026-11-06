@@ -41,3 +41,14 @@ describe("TUI keybindings", () => {
     }
   });
 });
+
+test("diagnoses duplicate and reserved bindings without modifying the configured map", async () => {
+  const { diagnoseKeybindings } = await import("../../src/ui/keybindings");
+  expect(diagnoseKeybindings(DEFAULT_KEYBINDINGS)).toEqual([]);
+  const map = { ...DEFAULT_KEYBINDINGS, pasteImage: "ctrl+c", externalEditor: "ctrl+q" };
+  const snapshot = { ...map };
+  const warnings = diagnoseKeybindings(map);
+  expect(warnings.join("\n")).toContain("fixed cancel/exit");
+  expect(warnings.join("\n")).toContain("externalEditor, promptQueue");
+  expect(map).toEqual(snapshot);
+});

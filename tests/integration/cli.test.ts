@@ -1029,7 +1029,7 @@ describe("tnb print mode", () => {
         },
       }),
     );
-    let stdout = "";
+    let stdout = "", stderr = "";
 
     try {
       expect(await runCli({
@@ -1038,9 +1038,9 @@ describe("tnb print mode", () => {
         cwd,
         configDir,
         stdout: { write: (value) => { stdout += value; } },
-        stderr: { write: () => undefined },
+        stderr: { write: value => { stderr += value; } },
         sessionIdFactory: () => "responses-session",
-      })).toBe(0);
+      }), stderr).toBe(0);
     } finally {
       server.stop(true);
     }
@@ -2678,4 +2678,16 @@ test("restored session spending does not consume a new invocation's separate cei
   expect(code).toBe(0);
   expect(invocationCost).toBeGreaterThan(0); expect(invocationCost).toBeLessThan(1);
   expect(sessionCost).toBeGreaterThan(100);
+});
+
+test("model list uses readable labels while JSON keeps the original model records", async () => {
+  const configDir = await workspace(); let output = "";
+  const common = { configDir, env: {}, stdout: { columns: 50, write: (text: string) => { output += text; } }, stderr: { write() {} } };
+  expect(await runModelsCli({ ...common, argv: ["models"] })).toBe(0);
+  expect(output).toContain("Models ("); expect(output).toContain("Context:"); expect(output).toContain("API:"); expect(output).not.toContain("\t");
+  output = "";
+  expect(await runModelsCli({ ...common, argv: ["models", "--json"] })).toBe(0);
+  const models = JSON.parse(output);
+  expect(models.length).toBeGreaterThan(0);
+  expect(models[0]).toMatchObject({ provider: expect.any(String), model: expect.any(String), contextWindow: expect.any(Number) });
 });

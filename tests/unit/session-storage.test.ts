@@ -304,3 +304,25 @@ describe("JSONL session storage", () => {
     await expect(source.forkTo("forked-session")).rejects.toMatchObject({ code: "EEXIST" });
   });
 });
+
+test("session indexes refresh after append and preserve pre-compaction middle inputs for history search", async () => {
+  const root = await temporaryDirectory();
+  const store = new SessionStore({ configDir: root, cwd: root, sessionId: "indexed" });
+  await store.append([{ role: "user", content: [{ type: "text", text: "first" }] }, { role: "user", content: [{ type: "text", text: "middle NEEDLE" }] }]);
+  expect((await SessionStore.list({ configDir: root, cwd: root, limit: 20 }))[0]?.userInputs).toContain("middle NEEDLE");
+  await store.appendCompactBoundary({ messages: [{ role: "user", content: [{ type: "text", text: "Conversation summary: retained" }] }], preTokens: 1000, postTokens: 100 });
+  await store.append([{ role: "user", content: [{ type: "text", text: "latest" }] }]);
+  const indexed = await SessionStore.list({ configDir: root, cwd: root, limit: 20 });
+  expect(indexed[0]?.userInputs).toEqual(["first", "middle NEEDLE", "latest"]);
+  indexed[0]!.userInputs!.push("mutated caller");
+  expect((await SessionStore.list({ configDir: root, cwd: root }))[0]?.userInputs).not.toContain("mutated caller");
+  const audit = await store.audit(); expect(audit.compactions[0]).toMatchObject({ preTokens: 1000, postTokens: 100, summary: "Conversation summary: retained" });
+  expect(audit.messages).toHaveLength(3);
+});
+
+test("light context cleanup records its strategy without pretending retained text is a generated summary", async () => {
+  const root = await temporaryDirectory();
+  const store = new SessionStore({ configDir: root, cwd: root, sessionId: "micro-audit" });
+  await store.appendCompactBoundary({ strategy: "microcompact", preTokens: 4800, postTokens: 4400, messages: [{ role: "user", content: [{ type: "text", text: "ordinary retained user input" }] }] });
+  expect((await store.audit()).compactions[0]).toMatchObject({ strategy: "microcompact", summary: "", preTokens: 4800, postTokens: 4400 });
+});

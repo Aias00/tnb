@@ -41,6 +41,7 @@ export const BUILT_IN_AGENT_PROFILES: AgentProfile[] = [
 ];
 
 export type AgentTask = {
+  onProgress?: import("../core/tool").ToolProgressReporter;
   description: string;
   prompt: string;
   subagentType: string;
@@ -153,8 +154,9 @@ export function createAgentTool(options: {
         ...(resume ? { resume } : {}),
       };
     },
-    execute(input, signal) {
-      return options.runAgent({ ...input, signal });
+    execute(input, signal, onProgress) {
+      onProgress?.({ agentPhase: "requesting", message: "Starting agent" });
+      return options.runAgent({ ...input, signal, onProgress });
     },
     access: "execute",
     isReadOnly: () => false,

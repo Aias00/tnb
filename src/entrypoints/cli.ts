@@ -1,5 +1,13 @@
 #!/usr/bin/env bun
+import { compactionInfo, compactionLabel } from "../services/compact/notice";
+import { connectMcpPool } from "../services/mcp/pool";
 
+import { loadIdeSelection } from "../services/remote-control/ide-selection";
+import { terminalNotice } from "../services/notifications/idle";
+import { previewRestore, restoreCheckpoint, type RestoreScope } from "../services/checkpoint/restore";
+import { contextReport, formatContextReport, type ContextReport } from "../services/compact/context-report";
+import { formatSummaryList, outputColumns } from "../services/cli/list-format";
+import { buildInfo } from "../services/update/build-info";
 import { BUILTIN_PLUGIN_SCOPES, builtinPluginScope, pluginActivationNotice } from "../services/plugins/builtin-scope";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -189,8 +197,9 @@ import { FileInputQueueStorage } from "../ui/input-queue";
 import { formatResumeHint, runTui } from "../ui/app";
 import { editPromptInExternalEditor } from "../ui/external-editor";
 import { CLI_COMMANDS, isUnknownCliCommand, SIMPLE_COMMAND_HELP } from "../services/cli/commands";
-import { loadKeybindings } from "../ui/keybindings";
-import { completeWorkspaceFiles } from "../ui/file-completion";
+import { loadKeybindings, diagnoseKeybindings } from "../ui/keybindings";
+import { workspaceFileIndex } from "../services/workspace/file-index";
+import { completeWorkspaceFiles, rememberWorkspaceCompletion } from "../ui/file-completion";
 import { renderTerminalImage } from "../ui/terminal-image";
 import { selectSession, assertSessionIdAvailable, prepareInteractiveSession } from "../services/session/bootstrap";
 export { prepareInteractiveSession } from "../services/session/bootstrap";
@@ -227,6 +236,7 @@ export type CliOptions = {
   transport?: ModelTransport;
   /** Route requests from shared MCP connections through the current invocation ledger. */
   onInvocationTransport?(transport: ModelTransport | undefined): void;
+  onContextReport?(report: ContextReport): void;
   onInvocationUsage?(usage: import("../services/usage/cost").UsageTotals, sessionUsage?: import("../services/usage/cost").UsageTotals): void;
   shellManager?: ShellSessionManager;
   mcpConnections?: McpConnections;
@@ -249,6 +259,7 @@ export type CliOptions = {
   signal?: AbortSignal;
   onEvent?(event: ModelEvent): void;
   onActivity?(phase: "working" | "compacting"): void;
+  onCompaction?(preTokens: number, postTokens: number, info?: import("../services/compact/notice").CompactionInfo): void;
   onToolEvent?(event: ToolExecutionEvent): void;
   onPermissionModeChange?(mode: PermissionMode): void;
   teamRecoveryActive?: boolean;
@@ -910,12 +921,9 @@ export async function runModelsCli(options: ModelsCliOptions): Promise<number> {
       options.stdout.write(`${JSON.stringify(models, null, 2)}\n`);
       return 0;
     }
-    options.stdout.write("PROVIDER\tMODEL\tAPI\tCONTEXT\tMAX OUTPUT\tREASONING\n");
-    for (const model of models) {
-      options.stdout.write(
-        `${model.provider}\t${model.model}${model.default ? " *" : ""}\t${model.api}\t${model.contextWindow}\t${model.maxTokens}\t${model.reasoning ? "yes" : "no"}\n`,
-      );
-    }
+    options.stdout.write(formatSummaryList("Models", models.map(model => ({ title: `${model.provider}/${model.model}${model.default ? " · default" : ""}`,
+      details: [`API: ${model.api}`, `Context: ${model.contextWindow.toLocaleString()} tokens · Max output: ${model.maxTokens.toLocaleString()} tokens`, `Reasoning: ${model.reasoning ? "yes" : "no"}`],
+    })), outputColumns(options.stdout)));
     return 0;
   } catch (error) {
     options.stderr.write(`tnb: ${error instanceof Error ? error.message : String(error)}\n`);
@@ -1139,7 +1147,9 @@ export async function runCli(options: CliOptions): Promise<number> {
       selection: route, transport: raw, budget, workspace: options.cwd,
     }).transport;
     const { transport } = createModelExecution({ selection, fallbackSelection, reasoningEffort: parsed.thinking,
-      fastMode: effectiveFastMode, transport: options.transport, budget, workspace: options.cwd });
+      fastMode: effectiveFastMode, transport: options.transport, budget, workspace: options.cwd,
+      onRequest: request => { if (options.onContextReport) options.onContextReport(contextReport({ request, messages: [], contextWindow: selection.model.contextWindow, maxOutputTokens: selection.model.maxTokens })); },
+    });
     options.onInvocationTransport?.(transport);
     const hooks = options.hookRunner ?? new HookRunner({
         ...(Object.keys(effectiveHooks).length ? { hooks: effectiveHooks } : {}),
@@ -1465,7 +1475,7 @@ export async function runCli(options: CliOptions): Promise<number> {
         enabledTools.some((tool) => tool.name === "durable_task") ? DURABLE_CONVERSATION_INSTRUCTIONS : undefined].filter(Boolean).join("\n\n");
     };
     const runAgentTask = async ({
-      prompt, description, profile, model, runInBackground, name, teamName, taskId, resume, signal, existingRuntimeTaskId, existingAgentId, restoreTranscript,
+      prompt, description, profile, model, runInBackground, name, teamName, taskId, resume, signal, existingRuntimeTaskId, existingAgentId, restoreTranscript, onProgress,
     }: AgentTask): Promise<string> => {
         const resumedTask = resume
           ? taskManager.restartableAgent(resume) ?? taskManager.list().find((task) => task.type === "agent" && task.metadata?.agentId === resume)
@@ -1550,7 +1560,14 @@ export async function runCli(options: CliOptions): Promise<number> {
             agent_type: profile.name,
           }, agentSignal);
           try {
+            const progressStartedAt = Date.now();
             const result = await runAgentLoop({
+              onEvent(event) {
+                if (!runInBackground && (event.type === "text" || event.type === "thinking")) onProgress?.({ agentPhase: "responding", elapsedTimeSeconds: (Date.now() - progressStartedAt) / 1000 });
+              },
+              onToolEvent(event) {
+                if (!runInBackground) onProgress?.({ agentPhase: event.type === "tool-execution-end" ? "requesting" : "tool", latestTool: event.name, elapsedTimeSeconds: (Date.now() - progressStartedAt) / 1000 });
+              },
               transport,
               model: nestedModel,
               prompt: shouldRestoreTranscript || runtimeTaskId
@@ -2118,18 +2135,21 @@ export async function runCli(options: CliOptions): Promise<number> {
         } else if (compactContext.length) {
           hooks.queueSessionContext(compactContext);
         }
-        return result;
+        return { ...result, details: { strategy: result.strategy, prunedToolResults: result.prunedToolResults, collapsedMessages: result.collapsedMessages } };
         } finally { try { options.onActivity?.("working"); } catch { /* UI observer only. */ } }
       },
-      onCompact: ({ messages, preTokens, postTokens }) => {
+      onCompact: async ({ messages, preTokens, postTokens, details }) => {
+        const info = compactionInfo(details);
         const mode = permissionModeState.snapshot();
-        return session.appendCompactBoundary({
+        await session.appendCompactBoundary({
           messages,
           preTokens,
           postTokens,
+          strategy: info.strategy,
           permissionMode: mode.mode,
           ...(mode.prePlanMode ? { prePlanMode: mode.prePlanMode } : {}),
         });
+        try { options.onCompaction?.(preTokens, postTokens, info); } catch { /* UI observer only. */ }
       },
       authorize: (tool, input, { toolUseId, preApproved }) =>
         authorizeToolWithDeniedHook(checkPermission, hooks, tool, input, toolUseId, options.signal, preApproved),
@@ -2366,7 +2386,7 @@ export async function runInteractiveCli(options: InteractiveCliOptions): Promise
       env: options.env,
       plugin: pluginMcpConfig,
     });
-    interactiveMcp = await connectMcpServers(mcpConfig, {
+    interactiveMcp = await connectMcpPool(mcpConfig, {
       cwd: options.cwd,
       workspaceRoot: workspaceState.current,
       configDir,
@@ -2568,6 +2588,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
       : undefined;
     let activeReasoningEffort = parsed.thinking;
     let activeContextWindow = activeSelection.model.contextWindow;
+    let lastContextReport: { sessionId: string; report: ContextReport } | undefined;
     let activeTransport = options.transport ?? createConfiguredTransportWithFallback(
       activeSelection,
       fallbackSelection,
@@ -2669,7 +2690,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
       onAsk: permissionController.request,
       sessionAllowRules: permissionSessionRules,
     });
-    const connectInteractiveMcp = async () => connectMcpServers(
+    const connectInteractiveMcp = async () => connectMcpPool(
       await resolveRuntimeMcpConfig({
         parsed,
         configDir,
@@ -2713,6 +2734,8 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
       : undefined;
     const tuiExitCode = await runTui({
       invocationBudgetUsd: parsed.maxBudgetUsd,
+      ...(settings.ui?.notifications === false ? {} : { notify: (kind: import("../services/notifications/idle").IdleNotice["kind"]) => { if (options.stdout.isTTY) options.stdout.write(terminalNotice(kind, options.env)); } }),
+      keybindingWarnings: diagnoseKeybindings(keybindings),
       model: activeSelection.model.id,
       contextWindowTokens: activeContextWindow,
       permissionMode: activePermissionMode,
@@ -2800,6 +2823,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
           description: prompt.definition.description ?? `MCP prompt from ${prompt.serverName}`,
         })),
       ],
+      onCompletionAccepted: (original, candidate, cursor) => rememberWorkspaceCompletion(activeWorkspaceState.current(), original, candidate, cursor),
       async completeInput(input, signal, cursor) {
         try {
           const mcpValues = (await completeMcpPromptInput(input, mcp.prompts, mcp.clients, signal))?.values ?? [];
@@ -2830,10 +2854,13 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
           currentReasoningEffort: () => activeReasoningEffort,
           currentFastMode: () => activeFastMode,
           currentContextWindow: () => activeContextWindow,
+          currentContextReport: id => lastContextReport?.sessionId === id ? lastContextReport.report : undefined,
           currentHooks: () => activeHooks!,
           currentPlugins: () => interactiveResources.plugins,
           currentMcpTools: () => mcp.tools.map((tool) => tool.name),
           currentMcpClients: () => mcp.clients,
+          currentMcpStatuses: () => (mcp as Awaited<ReturnType<typeof connectMcpPool>>).statuses ?? {},
+          async reconnectMcp(name) { const pool = mcp as Awaited<ReturnType<typeof connectMcpPool>>; if (!pool.reconnect) throw new Error("Reconnect unavailable"); await pool.reconnect(name); },
           currentWorkspaceRoots: () => activeWorkspaceState.roots(),
           teamManager,
           taskManager,
@@ -3050,9 +3077,11 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
             askUser: turn.questionPrompt,
             quiet: true,
             signal: turn.signal,
+            onContextReport: report => { lastContextReport = { sessionId: turn.sessionId, report }; },
             onInvocationUsage: turn.onUsage,
             onEvent: turn.onModelEvent,
             onActivity: turn.onActivity,
+            onCompaction: turn.onCompaction,
             onToolEvent: turn.onToolEvent,
             onPermissionModeChange(mode) {
               activePermissionMode = mode;
@@ -3093,8 +3122,11 @@ type InteractiveSlashCommandContext = {
   currentReasoningEffort(): ReasoningEffort | undefined;
   currentFastMode(): boolean;
   currentContextWindow(): number;
+  currentContextReport?(sessionId: string): ContextReport | undefined;
   currentHooks(): HookRunner;
   currentPlugins(): Awaited<ReturnType<typeof loadPlugins>>["plugins"];
+  currentMcpStatuses?(): Record<string, import("../services/mcp/pool").McpConnectionStatus>;
+  reconnectMcp?(name: string): Promise<void>;
   currentMcpTools(): string[];
   currentMcpClients(): Readonly<Record<string, import("../services/mcp/client").McpClient>>;
   currentWorkspaceRoots(): string[];
@@ -3166,7 +3198,7 @@ function resolveMainAgentSelection(
   return resolveProviderSelection(catalog, provider ?? "anthropic", settings.model);
 }
 
-async function runInteractiveSlashCommand(
+export async function runInteractiveSlashCommand(
   command: SlashCommandRequest,
   context: InteractiveSlashCommandContext,
 ): Promise<SlashCommandResult> {
@@ -3182,6 +3214,7 @@ async function runInteractiveSlashCommand(
     const current = context.currentSelection();
     return { message: [
       `tnb ${packageJson.version}`,
+      `Build: ${buildInfo().mode} · ${buildInfo().commit?.slice(0, 12) ?? "unknown commit"}${buildInfo().dirty ? " (dirty)" : ""} · ${buildInfo().builtAt ?? "not compiled"}`,
       `Runtime: Bun ${Bun.version} · ${platform()} ${arch()}`,
       `Model: ${current.provider.id}/${current.model.id}`,
       `Workspace: ${context.cwd}`,
@@ -3189,6 +3222,7 @@ async function runInteractiveSlashCommand(
   }
   if (command.name === "reload") {
     requireNoCommandArgument(command);
+    workspaceFileIndex.invalidate(context.cwd);
     await context.refreshExtensions(true);
     await context.reloadMcp();
     return { message: "Reloaded Skills, Agents, commands, Plugins, and MCP servers." };
@@ -3420,6 +3454,9 @@ async function runInteractiveSlashCommand(
       "Enter          Submit, or queue while the Agent is working",
       "Ctrl+Q         Preview queued prompts; Enter/E edit, D/Delete remove",
       "Alt+Up/Down    Select a tool card",
+      "Ctrl+Shift+Up/Down Select any message",
+      "Alt+E         Reuse selected user message in an empty draft",
+      "Alt+P         Copy selected tool input",
       "Alt+Enter      Expand/collapse the selected tool card (click also works)",
       "Shift+Enter    Insert newline",
       "Tab            Complete slash commands or MCP prompt arguments",
@@ -3446,6 +3483,7 @@ async function runInteractiveSlashCommand(
       "Vim mode       i/I/a/A, h/l, b/w, x/X, D/C, 0/$",
       "",
       `Customize:     ${join(context.configDir, "keybindings.json")}`,
+      ...diagnoseKeybindings(await loadKeybindings(context.configDir)).map(warning => `Warning: ${warning}`),
       `Configured:    ${Object.entries(await loadKeybindings(context.configDir)).map(([action, binding]) => `${action}=${binding ?? "disabled"}`).join(" · ")}`,
     ].join("\n") };
   }
@@ -3707,6 +3745,10 @@ async function runInteractiveSlashCommand(
   }
   if (command.name === "mcp") {
     const words = splitCommandWords(command.argument);
+    if (words[0] === "reconnect") {
+      if (words.length !== 2 || !context.reconnectMcp) throw new Error("Usage: /mcp reconnect <server>");
+      await context.reconnectMcp(words[1]!); return { message: `Reconnected MCP server ${words[1]}.` };
+    }
     if (words.length === 1 && words[0] === "reload") {
       await context.reloadMcp();
       return { message: "Reloaded MCP configuration and connections." };
@@ -3719,9 +3761,10 @@ async function runInteractiveSlashCommand(
         management: {
           kind: "mcp",
           title: "MCP servers",
-          description: "Enter toggles a configured server and reconnects the active MCP catalog.",
+          description: "Enter toggles configuration. /mcp reconnect <server> recovers one connection.",
           items: Object.entries(config.mcpServers).map(([name, server]) => {
             const enabled = server.enabled !== false;
+            const connection = context.currentMcpStatuses?.()[name];
             const target = "command" in server
               ? `${server.command} ${(server.args ?? []).join(" ")}`.trim()
               : server.url;
@@ -3730,7 +3773,7 @@ async function runInteractiveSlashCommand(
             return {
               id: name,
               label: name,
-              description: `${server.type ?? "stdio"} · ${enabled ? "enabled" : "disabled"} · ${target}`,
+              description: `${server.type ?? "stdio"} · ${connection?.state ?? (enabled ? "not-observed" : "disabled")} · ${target}${connection?.lastError ? " · last reconnect failed" : ""}`,
               command: `/mcp ${enabled ? "disable" : "enable"} ${name}`,
               active: enabled,
               ...(oauthConfigured
@@ -3863,19 +3906,54 @@ async function runInteractiveSlashCommand(
     if (exitCode !== 0) throw new Error(stderr.trim().replace(/^tnb:\s*/, "") || "Update check failed");
     return { message: stdout.trim() };
   }
+  if (command.name === "search") {
+    const { searchWorkspaceContent } = await import("../services/workspace/content-search");
+    const result = await searchWorkspaceContent(context.currentWorkspaceRoots()[0] ?? context.cwd, command.argument);
+    return { management: { kind: "search", title: "Workspace content search", description: `${result.matches.length} matches${result.truncated ? " · truncated" : ""} · Enter adds reference to draft`,
+      items: result.matches.map((match, index) => ({ id: String(index), label: `${match.file}:${match.line}`.replace(/[\x00-\x1f\x7f]/g, " "), description: match.text.replace(/[\x00-\x1f\x7f]/g, " "), preview: match.preview.map(line => line.replace(/[\x00-\x1f\x7f]/g, " ")), draftReference: `@${JSON.stringify(match.file)}:${match.line}`, command: "" })) } };
+  }
+  if (command.name === "changes") {
+    const { reviewTurns } = await import("../services/git/turn-review");
+    const { buildLineDiff } = await import("../services/git/line-diff");
+    const audit = await new SessionStore({ configDir: context.configDir, cwd: context.cwd, sessionId: command.sessionId }).audit();
+    const turns = reviewTurns(audit.messages);
+    const requested = command.argument ? Number(command.argument) : turns.at(-1)?.turn;
+    if (command.argument && (!Number.isSafeInteger(requested) || requested! < 1)) throw new Error("Usage: /changes [positive turn number]");
+    const turn = turns.find(item => item.turn === requested);
+    return { management: { kind: "diff", title: "Recorded turn changes", refreshCommand: command.argument ? `/changes ${command.argument}` : "/changes",
+      description: turn ? `Turn ${turn.turn} · ${turn.prompt.slice(0, 100)} · ${turn.unattributed} tool result(s) without attributable snapshots; no changes inferred. Includes recorded history before rewind/compaction; current Git diff is separate.` : "No recorded turn. Older sessions may not have change evidence.",
+      items: [...(turn?.changes ?? []).slice(0, 200).map((change, index) => ({ id: String(index), label: change.path, description: `${change.beforeHash === null ? "Created" : "Edited"} · ${change.afterHash.slice(0, 12)}`,
+        diffPreview: change.truncated || change.after === undefined ? "Snapshot exceeded 32 KiB; hashes recorded. No exact diff is available." : buildLineDiff(change.before ?? "", change.after).map(row => `${row.kind === "added" ? "+" : row.kind === "removed" ? "-" : " "}${row.text}`).join("\n"), command: "" })), ...(turn?.observations ?? []).flatMap((observation, index) => observation.changes.map(change => ({ id: `observation:${index}:${change.path}`, label: change.path,
+          description: `${change.window === "during-command" ? "命令窗口内" : "两次命令之间"}观察 · 来源未确认${observation.partial ? " · 覆盖不完整" : ""}`,
+          diffPreview: `文件版本观察（不证明修改者）\n${change.before ?? "不存在"} → ${change.after ?? "不存在"}`, command: "" })))].slice(0, 200) } };
+  }
+  if (command.name === "compactions") {
+    requireNoCommandArgument(command);
+    const audit = await new SessionStore({ configDir: context.configDir, cwd: context.cwd, sessionId: command.sessionId }).audit();
+    return { management: { kind: "compactions", title: "Context compaction boundaries", refreshCommand: "/compactions", description: "Recorded summaries only; opening this view never calls the model.",
+      items: audit.compactions.map((boundary, index) => ({ id: String(index), label: boundary.timestamp, description: `${compactionLabel(boundary.strategy)} · ${boundary.preTokens.toLocaleString()} → ${boundary.postTokens.toLocaleString()} estimated tokens`, details: [boundary.summary ? boundary.summary.slice(0, 32768) : "此记录未生成对话摘要。"], command: "" })) } };
+  }
+  if (command.name === "history") {
+    const { searchSessionHistory } = await import("../services/session/history-search");
+    const result = await searchSessionHistory({ configDir: context.configDir, cwd: context.cwd, query: command.argument });
+    return { management: { kind: "search", title: "Workspace history search", description: `用户输入 / 回答 / 工具输出${result.truncated ? " · 扫描或结果已截断" : ""} · 输入仅放入空草稿，回答/工具输出以引用加入草稿。`,
+      items: result.matches.map(match => ({ id: match.id, label: `${match.role} · ${match.preview.split("\n")[0]!.slice(0, 90)}`, description: `${match.sessionId}${match.partial ? " · 命中片段" : " · 文本，不含媒体"}`, preview: match.preview.split("\n").slice(0, 30),
+        ...(match.role === "user" && !match.partial ? { draftText: match.text } : { draftReference: `历史引用 ${match.id}（${match.role}）：\n${match.preview}\n引用结束` }), command: "" })) } };
+  }
+  if (command.name === "session-preview") {
+    const id = command.argument.trim(); if (!id) throw new Error("Usage: /session-preview <id>");
+    const state = await new SessionStore({ configDir: context.configDir, cwd: context.cwd, sessionId: id }).readState();
+    return { management: { kind: "sessions", title: "Session preview", description: "Enter resumes this session; Esc returns without switching.", items: [{ id, label: state.title || id, transcriptPreview: conversationDisplayTranscript(state.messages), command: `/resume ${id}` }] } };
+  }
   if (command.name === "context") {
     requireNoCommandArgument(command);
     const state = await readInteractiveSessionState(context, command.sessionId);
-    const estimated = estimateConversationTokens(state.messages);
-    const limit = context.currentContextWindow();
-    const percent = limit > 0 ? Math.min(100, estimated / limit * 100) : 0;
-    return { message: [
-      `Conversation: ~${estimated.toLocaleString()} tokens`,
-      `Model context: ${limit.toLocaleString()} tokens`,
-      `Estimated use: ${percent.toFixed(1)}%`,
-      "System prompt and the next model output reserve are not included in this estimate.",
-    ].join("\n") };
+    const captured = context.currentContextReport?.(command.sessionId);
+    const report = captured ? { ...captured, contextWindow: context.currentContextWindow() }
+      : contextReport({ messages: state.messages, contextWindow: context.currentContextWindow() });
+    return { message: formatContextReport(report) };
   }
+
   if (command.name === "diff") {
     let path = command.argument ? unquoteCommandArgument(command.argument) : undefined;
     if (command.argument.startsWith('"')) {
@@ -3931,7 +4009,7 @@ async function runInteractiveSlashCommand(
         management: {
           kind: "checkpoints",
           title: "Rollback checkpoint",
-          description: "Enter restores workspace files and the linked conversation boundary.",
+          description: "Enter previews affected files and lets you choose the restore scope. No changes occur while browsing.",
           items: records.map((record) => ({
             id: record.id,
             label: record.label,
@@ -3943,26 +4021,35 @@ async function runInteractiveSlashCommand(
     }
     const id = words.find((word) => !word.startsWith("-"));
     if (!id) throw new Error("Usage: /rollback <checkpoint-id> [--files-only] [--force]");
-    const record = await manager.rollback(context.cwd, id, words.includes("--force"));
-    if (words.includes("--files-only") || record.sessionId !== command.sessionId || record.messageCount === undefined) {
-      return { message: `Restored workspace checkpoint ${record.id}: ${record.label}` };
+    const options = { configDir: context.configDir, cwd: context.cwd, sessionId: command.sessionId, checkpointId: id };
+    if (!words.includes("--confirm")) {
+      const preview = await previewRestore(options);
+      const details = [preview.fileSummary, ...preview.untrackedFiles.slice(0, 30).map(file => `Untracked path may be removed/restored: ${file}`),
+        ...(preview.untrackedFiles.length > 30 ? [`+${preview.untrackedFiles.length - 30} untracked paths`] : []),
+        preview.canRestoreConversation ? `Conversation messages removed: ${preview.messagesRemoved}` : "No linked conversation boundary for this session.",
+        ...(preview.headChanged ? ["HEAD changed since checkpoint. File restoration requires explicit --force after reviewing the newer commits."] : []),
+        "Restoration is not a new Git commit. Files outside the snapshot may be overwritten or removed."];
+      const scopes: RestoreScope[] = preview.canRestoreConversation ? ["both", "files", "conversation"] : ["files"];
+      return { management: { kind: "checkpoints", title: `Restore preview · ${preview.checkpoint.label}`,
+        description: "Choose scope and press Enter to confirm restoration; Esc cancels. PgUp/PgDn scrolls the preview.",
+        items: scopes.filter(scope => !words.includes("--files-only") || scope === "files").map(scope => ({ id: scope,
+          label: scope === "both" ? "Confirm: restore files and conversation" : scope === "files" ? "Confirm: restore files only" : "Confirm: restore conversation only",
+          description: scope === "conversation" ? "Workspace files stay unchanged." : "Review affected paths before confirming.", details,
+          command: `/rollback ${id} --confirm --scope ${scope} --expected ${preview.expected}${words.includes("--force") ? " --force" : ""}`,
+        })),
+      } };
     }
-    const session = new SessionStore({ configDir: context.configDir, cwd: context.cwd, sessionId: command.sessionId });
-    const state = await session.readState();
-    if (record.messageCount > state.messages.length) throw new Error("Checkpoint conversation boundary is newer than the session transcript");
-    const messages = state.messages.slice(0, record.messageCount);
-    await session.appendRewindBoundary(messages);
-    await context.resetSession(command.sessionId, "resume");
-    return {
-      resetSession: true,
-      resumeSession: messages.length > 0,
-      sessionId: command.sessionId,
-      restoredTranscript: conversationDisplayTranscript(messages),
-      restoredUsage: state.usage ?? { ...EMPTY_USAGE },
-      restoredInputHistory: sessionInputHistory(messages),
-      permissionMode: context.currentPermissionMode(),
-      message: `Restored checkpoint ${record.id}: ${record.label}. Workspace and conversation were rewound together.`,
-    };
+    const scope = optionValue(words, "--scope") as RestoreScope | undefined;
+    const expected = optionValue(words, "--expected");
+    if (!scope || !expected) throw new Error("Open /rollback <id> to preview and confirm a scope first");
+    const result = await restoreCheckpoint({ ...options, scope, expected, force: words.includes("--force") });
+    if (!result.conversationRestored) return { message: `Restored files from checkpoint ${id}; conversation unchanged.` };
+    try { await context.resetSession(command.sessionId, "resume"); }
+    catch (error) { throw new Error(`Restoration completed, but reloading the active session failed: ${String(error)}`); }
+    return { resetSession: true, resumeSession: result.messages!.length > 0, sessionId: command.sessionId,
+      restoredTranscript: conversationDisplayTranscript(result.messages!), restoredUsage: result.usage ?? { ...EMPTY_USAGE },
+      restoredInputHistory: sessionInputHistory(result.messages!), permissionMode: context.currentPermissionMode(),
+      message: `Restored ${scope === "both" ? "files and conversation" : "conversation only"} from checkpoint ${id}.` };
   }
   if (command.name === "copy") {
     requireNoCommandArgument(command);
@@ -4208,17 +4295,25 @@ async function runInteractiveSlashCommand(
     return { message: confirmation };
   }
   if (command.name === "ide") {
-    requireNoCommandArgument(command);
     const descriptors = await readIdeDescriptors(join(context.configDir, "ide"));
+    const words = splitCommandWords(command.argument);
+    if (words[0] === "attach") {
+      if (words.length > 2) throw new Error("Usage: /ide attach [descriptor-path]");
+      const matching = descriptors.filter(item => item.active && item.workspace && resolve(item.workspace) === resolve(context.cwd));
+      if (!words[1] && matching.length !== 1) throw new Error(matching.length ? "Multiple IDE bridges match; use /ide attach <descriptor-path>" : "No active IDE bridge for this workspace");
+      const reference = await loadIdeSelection(context.cwd, words[1] ? resolve(context.cwd, words[1]) : matching[0]!.path);
+      return { inputReference: reference, message: `IDE selection added to draft: ${reference.label}. Review it before sending.` };
+    }
+    requireNoCommandArgument(command);
     return { management: {
       kind: "ide",
       title: "IDE Bridges",
-      description: "Local Unix-socket discovery descriptors; start one with tnb remote-control --socket ~/.tnb/ide/editor.sock.",
+      description: "Enter attaches the selected IDE text to the draft. Start a bridge with tnb remote-control --socket ~/.tnb/ide/editor.sock.",
       items: descriptors.map((descriptor) => ({
         id: descriptor.path,
         label: `${descriptor.active ? "active" : "stale"} · PID ${descriptor.pid ?? "?"}`,
         description: `${descriptor.workspace ?? "unknown workspace"} · ${descriptor.socketPath ?? descriptor.path}`,
-        command: "/ide",
+        command: descriptor.active ? `/ide attach ${JSON.stringify(descriptor.path)}` : "/ide",
         active: descriptor.active,
       })),
     } };
@@ -4284,6 +4379,7 @@ async function runInteractiveSlashCommand(
     const sessions = await SessionStore.list({
       configDir: context.configDir,
       cwd: context.cwd,
+      limit: command.argument ? undefined : 20,
     });
     const query = command.argument.toLowerCase();
     const filtered = query
@@ -4293,21 +4389,23 @@ async function runInteractiveSlashCommand(
           session.summary?.toLowerCase().includes(query) ||
           session.strategicIntent?.toLowerCase().includes(query) ||
           session.firstPrompt?.toLowerCase().includes(query) ||
-          session.lastPrompt?.toLowerCase().includes(query)
+          session.lastPrompt?.toLowerCase().includes(query) ||
+          session.userInputs?.some(input => input.toLowerCase().includes(query))
         )
       : sessions;
     return {
       management: {
         kind: "sessions",
         title: query ? `Sessions matching “${command.argument}”` : "Recent sessions",
-        description: "Enter resumes the selected conversation. / filters this list; /sessions <query> also searches older history.",
+        description: "Enter resumes; I loads full preview. / filters this page; /sessions <query> searches older and intermediate inputs.",
         items: await Promise.all(filtered.slice(0, 20).filter((session) => !session.error).map(async (session) => ({
           id: session.sessionId,
           label: session.title || session.firstPrompt || session.sessionId,
           sessionMetadata: { messageCount: session.messageCount, lastModified: session.lastModified },
           description: `${session.sessionId} · ${session.messageCount} messages · ${new Date(session.lastModified).toLocaleString()}${session.summary ? ` · ${session.summary}` : session.lastPrompt && session.lastPrompt !== session.firstPrompt ? ` · ${session.lastPrompt}` : ""}`,
           ...(session.userInputs?.length ? { preview: sessionInputPreview(session.userInputs) } : {}),
-          transcriptPreview: conversationDisplayTranscript((await new SessionStore({ configDir: context.configDir, cwd: context.cwd, sessionId: session.sessionId }).readState()).messages),
+          inspectCommand: `/session-preview ${session.sessionId}`,
+          inspectLabel: "Load full conversation preview",
           command: `/resume ${session.sessionId}`,
           active: session.sessionId === command.sessionId,
         }))),
@@ -4490,6 +4588,7 @@ async function runInteractiveSlashCommand(
       messages: result.messages,
       preTokens: result.preTokens,
       postTokens: result.postTokens,
+      strategy: "full",
       permissionMode: context.currentPermissionMode(),
     });
     return {
@@ -4559,6 +4658,8 @@ export async function createResumeManagement(
       description: `${session.sessionId} · ${session.messageCount} messages · ${new Date(session.lastModified).toLocaleString()}`,
       ...(session.userInputs?.length ? { preview: sessionInputPreview(session.userInputs) } : {}),
       command: `/resume ${session.sessionId}`,
+      inspectCommand: `/session-preview ${session.sessionId}`,
+      inspectLabel: "Load full conversation preview",
     })),
   };
 }
@@ -5945,7 +6046,10 @@ if (import.meta.main) {
     process.stderr.write(`tnb: Unknown command '${argv[0]}'. Run tnb --help for CLI commands; /commands such as /diff are entered inside tnb.\n`);
     process.exitCode = 1;
   } else if (argv[0] === "--version" || argv[0] === "-V") {
-    process.stdout.write(`${packageJson.version}\n`);
+    const info = buildInfo();
+    process.stdout.write(argv.includes("--json") ? `${JSON.stringify(info, null, 2)}\n`
+      : argv.includes("--verbose") ? `${info.version} · ${info.mode} · ${info.commit?.slice(0, 12) ?? "commit unknown"}${info.dirty ? " (dirty)" : ""} · built ${info.builtAt ?? "not compiled"} · Bun ${info.bun} · ${info.platform}/${info.arch}\n`
+      : `${packageJson.version}\n`);
   } else if (argv[0] === "collaboration") {
     const { runCollaborationCommand } = await import("./collaboration");
     process.exitCode = await runCollaborationCommand({ argv, cwd: process.cwd(), env: process.env, stdout: process.stdout, stderr: process.stderr });
@@ -6114,6 +6218,7 @@ async function runRemoteControlSocketCli(options: {
   runtimeArguments: string[];
   signal: AbortSignal;
 }): Promise<number> {
+  const contextState = { value: { openFiles: [], diagnostics: [] } as import("../services/remote-control/ide-jsonrpc").IdeEditorContext };
   await serveRemoteControlSocket({
     socketPath: options.socketPath,
     ...(options.descriptorPath ? { descriptorPath: options.descriptorPath } : {}),
@@ -6129,6 +6234,7 @@ async function runRemoteControlSocketCli(options: {
         if (first.done) return;
         if (isIdeJsonRpcLine(first.value)) {
           const bridge = new IdeJsonRpcBridge({
+            contextState,
             cwd: process.cwd(),
             ownerToken: descriptor.ownerToken,
             async query(prompt, context, sessionId) {

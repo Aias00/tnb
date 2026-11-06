@@ -1,3 +1,4 @@
+import type { PromptInputSubmit } from "./prompt-input/types";
 import type { PermissionMode } from "../core/permissions";
 import type { ModelEvent } from "../providers/types";
 import { addUsage, EMPTY_USAGE, type UsageTotals } from "../services/usage/cost";
@@ -47,7 +48,7 @@ export type TuiAction =
   | { type: "ledger-usage"; usage: UsageTotals; delta: UsageTotals; sessionUsage?: UsageTotals; currentInvocation: boolean }
   | { type: "activity"; phase: "working" | "compacting" }
   | { type: "notice"; message: string; noticeId?: string }
-  | { type: "submit"; text: string }
+  | { type: "submit"; text: string; input?: PromptInputSubmit }
   | { type: "command-start"; text: string }
   | {
       type: "command-complete";
@@ -146,7 +147,7 @@ export function reduceTuiState(state: TuiState, action: TuiAction): TuiState {
   if (action.type === "submit") {
     return {
       ...state,
-      ...appendTranscript(state, { kind: "user", text: action.text }),
+      ...appendTranscript(state, { kind: "user", text: action.text, ...(action.input ? { input: action.input } : {}) }),
       messages: [...state.messages, { role: "user", text: action.text }],
       streamingText: "",
       invocationUsage: { ...EMPTY_USAGE },

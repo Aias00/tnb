@@ -1,3 +1,4 @@
+import { formatSummaryList, outputColumns } from "../cli/list-format";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -59,12 +60,11 @@ Use -- before command arguments that begin with a dash.
     }
     if (action === "list") {
       const config = await loadRawMcpConfig(configPath);
-      for (const [name, server] of Object.entries(config.mcpServers)) {
-        const target = "command" in server
-          ? `${server.command} ${(server.args ?? []).join(" ")}`.trim()
-          : server.url;
-        options.stdout.write(`${name}\t${server.enabled === false ? "disabled" : "enabled"}\t${server.type ?? "stdio"}\t${target}\n`);
-      }
+      const rows = Object.entries(config.mcpServers).map(([name, server]) => {
+        const target = "command" in server ? `${server.command} ${(server.args ?? []).join(" ")}`.trim() : server.url;
+        return { title: `${name} · ${server.enabled === false ? "disabled" : "enabled"} · ${server.type ?? "stdio"}`, details: [`Target: ${target}`] };
+      });
+      options.stdout.write(formatSummaryList("MCP servers", rows, outputColumns(options.stdout), "No MCP servers configured."));
       return 0;
     }
     const serverName = options.argv[2];

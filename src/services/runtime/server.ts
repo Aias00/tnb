@@ -1,3 +1,4 @@
+import { buildInfo } from "../update/build-info";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmod, mkdir, readFile, writeFile, unlink, lstat, realpath } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -89,7 +90,7 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
               if (store.record<{ workspace: string }>("configuration", runId)?.value.workspace !== workspace) throw new Error("Task is outside the current workspace");
               return Response.json(await presentRunDetail(runtime, runId));
             }
-            if (url.pathname === "/health") return Response.json({ ready: ready && !runtime.lastError, pid: process.pid, error: runtime.lastError, capabilities: RUNTIME_CAPABILITIES });
+            if (url.pathname === "/health") return Response.json({ ready: ready && !runtime.lastError, pid: process.pid, build: buildInfo(), error: runtime.lastError, capabilities: RUNTIME_CAPABILITIES });
             if (url.pathname === "/routing") {
               const workspace = await realpath(url.searchParams.get("workspace") ?? "");
               if (url.searchParams.has("inputId")) {

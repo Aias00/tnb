@@ -121,7 +121,8 @@ describe("Ink TUI view", () => {
       },
     });
     const frame = renderToString(<TuiView state={state} input="" cursor={0} columns={100} />);
-    expect(frame).toContain("ctx 45%");
+    expect(frame).toContain("上下文 45%");
+    expect(frame).toContain("会话累计 ↑90,000 ↓2,000 tokens");
     expect(frame).toContain("↑90,000");
   });
 

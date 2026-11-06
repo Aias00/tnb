@@ -1,10 +1,11 @@
-import { chmod, copyFile, cp, mkdir, readdir, rm } from "node:fs/promises";
+import { chmod, copyFile, cp, mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { arch, platform } from "node:os";
 import { join, resolve } from "node:path";
 import { codingPluginFingerprint } from "../src/adapters/coding/identity";
 import { buildCodingRecoveryPackage } from "../src/adapters/coding/recovery-package";
 import { unpackPlugin } from "../src/agent/packed-plugin";
 import { buildChannelsRecoveryPackage } from "../src/plugins/channels/recovery-package";
+import packageJson from "../package.json";
 import { buildPluginSdk } from "./build-plugin-sdk";
 
 const root = resolve(import.meta.dir, "..");
@@ -25,9 +26,19 @@ await mkdir(outputDirectory, { recursive: true });
 await buildPluginSdk(root, outputDirectory);
 const codingPackage = await buildCodingRecoveryPackage(root);
 const channelsPackage = await buildChannelsRecoveryPackage(root);
+const gitValue = async (args: string[]) => {
+  const child = Bun.spawn(["git", ...args], { cwd: root, stdout: "pipe", stderr: "ignore" });
+  const text = (await new Response(child.stdout).text()).trim();
+  return await child.exited === 0 ? text : null;
+};
+const commit = await gitValue(["rev-parse", "HEAD"]);
+const changed = await gitValue(["status", "--porcelain", "--untracked-files=normal"]);
+const sourceDigest = await codingPluginFingerprint(root);
+const info = { version: packageJson.version, mode: "compiled", commit, dirty: changed === null ? null : Boolean(changed), builtAt: new Date().toISOString(), sourceDigest, bun: Bun.version, platform: process.platform, arch: process.arch };
 const build = await Bun.build({ entrypoints: [join(root, "src/entrypoints/cli.ts")], target: "bun", compile: { outfile: join(outputDirectory, cliName) },
-  define: { TNB_BUILD_SOURCE_SHA256: JSON.stringify(await codingPluginFingerprint(root)), TNB_CODING_PACKAGE: JSON.stringify(codingPackage), TNB_CHANNELS_PACKAGE: JSON.stringify(channelsPackage) } });
+  define: { TNB_BUILD_INFO: JSON.stringify(info), TNB_BUILD_SOURCE_SHA256: JSON.stringify(sourceDigest), TNB_CODING_PACKAGE: JSON.stringify(codingPackage), TNB_CHANNELS_PACKAGE: JSON.stringify(channelsPackage) } });
 if (!build.success) throw new AggregateError(build.logs, "CLI compilation failed");
+await writeFile(join(outputDirectory, "build-info.json"), JSON.stringify(info, null, 2) + "\n");
 const pluginRoot = join(outputDirectory, "plugins", "tnb-coding");
 await mkdir(pluginRoot, { recursive: true });
 // The distributable package and embedded default contain the same bytes.

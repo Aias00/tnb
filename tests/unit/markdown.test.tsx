@@ -63,3 +63,25 @@ test("narrow tables wrap cell content within terminal width", () => {
   expect(frame).toContain("JavaScript");
   for (const line of frame.split("\n")) expect(stringWidth(line)).toBeLessThanOrEqual(26);
 });
+
+test("Markdown separates sections while retaining compact tight lists", () => {
+  const { renderToString } = require("../../src/ui/ink/index");
+  const frame = renderToString(<Markdown>{"Introduction\n\n## Heading\n\n- first item\n- second item\n\nConclusion"}</Markdown>, { columns: 80 });
+  const rows = frame.split("\n").map((row: string) => row.trim());
+  const position = (text: string) => rows.findIndex((row: string) => row.includes(text));
+  expect(position("Heading") - position("Introduction")).toBeGreaterThanOrEqual(2);
+  expect(position("first item") - position("Heading")).toBeGreaterThanOrEqual(2);
+  expect(position("second item") - position("first item")).toBe(1);
+  expect(position("Conclusion") - position("second item")).toBeGreaterThanOrEqual(2);
+});
+
+test("wide terminal answers keep a readable line length without clipping text", () => {
+  const { renderToString } = require("../../src/ui/ink/index");
+  const { TranscriptEntryView } = require("../../src/ui/transcript/entry-view");
+  const { createTranscriptEntry } = require("../../src/ui/transcript/model");
+  const { stringWidth } = require("../../src/ui/ink/stringWidth");
+  const text = "Readable text ".repeat(30) + "TAIL_MARKER";
+  const frame = renderToString(<TranscriptEntryView entry={createTranscriptEntry(1, { kind: "assistant", text })} />, { columns: 220 });
+  expect(frame).toContain("TAIL_MARKER");
+  expect(Math.max(...frame.split("\n").map((row: string) => stringWidth(row)))).toBeLessThanOrEqual(116);
+});

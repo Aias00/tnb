@@ -176,6 +176,7 @@ export class McpClient {
   private nextProgressToken = 1;
   private started = false;
   private connected = false;
+  get isConnected(): boolean { return this.connected; }
   private executionRevisionValue = 0;
   get executionRevision(): number { return this.executionRevisionValue; }
   private capabilities: Record<string, unknown> = {};

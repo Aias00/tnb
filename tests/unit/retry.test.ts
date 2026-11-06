@@ -72,3 +72,25 @@ describe("provider retry", () => {
     expect(attempts).toBe(1);
   });
 });
+
+test("retry progress is sanitized and does not count as streamed response output", async () => {
+  let attempts = 0;
+  const events: unknown[] = [];
+  for await (const event of streamWithRetry<unknown>(async function* () {
+    if (++attempts <= 2) throw new ProviderHttpError(429, "SECRET_PROVIDER_BODY", new Headers({ "retry-after": "2" }));
+    yield "done";
+  }, { maxRetries: 2, sleep: async () => {}, progress: progress => progress, random: () => 0 })) events.push(event);
+  expect(events).toHaveLength(5);
+  expect(events[0]).toMatchObject({ type: "retry", phase: "waiting", retry: 1, maxRetries: 2, delayMs: 2000, status: 429, reason: "rate-limit" });
+  expect(events[3]).toMatchObject({ phase: "requesting", retry: 2 });
+  expect(events[4]).toBe("done"); expect(JSON.stringify(events)).not.toContain("SECRET_PROVIDER_BODY");
+});
+
+test("cancellation during visible backoff cannot dispatch the next attempt", async () => {
+  const controller = new AbortController(); let attempts = 0;
+  const iterator = streamWithRetry<unknown>(async function* () { attempts++; throw new TypeError("network"); }, { signal: controller.signal, progress: value => value });
+  expect((await iterator.next()).value).toMatchObject({ phase: "waiting" });
+  controller.abort(new Error("cancel retry"));
+  await expect(iterator.next()).rejects.toThrow("cancel retry");
+  expect(attempts).toBe(1);
+});

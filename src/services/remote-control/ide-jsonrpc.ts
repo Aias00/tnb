@@ -19,7 +19,9 @@ type JsonRpcRequest = { jsonrpc: "2.0"; id?: string | number; method: string; pa
 
 export class IdeJsonRpcBridge {
   private initialized = false;
-  private context: IdeEditorContext = { openFiles: [], diagnostics: [] };
+  private localContext: IdeEditorContext = { openFiles: [], diagnostics: [] };
+  private get context(): IdeEditorContext { return this.options.contextState?.value ?? this.localContext; }
+  private set context(value: IdeEditorContext) { if (this.options.contextState) this.options.contextState.value = value; else this.localContext = value; }
   private readonly shell: ShellSessionManager;
   private ownsShell: boolean;
 
@@ -28,6 +30,8 @@ export class IdeJsonRpcBridge {
     ownerToken: string;
     query(prompt: string, context: IdeEditorContext, sessionId?: string): Promise<unknown>;
     shellManager?: ShellSessionManager;
+    /** Shared by authenticated connections to this workspace-scoped host only. */
+    contextState?: { value: IdeEditorContext };
   }) {
     this.shell = options.shellManager ?? new ShellSessionManager({
       cwd: options.cwd,

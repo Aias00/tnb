@@ -1,3 +1,4 @@
+import { WorkspaceChangeObserver } from "../git/observe";
 import { existsSync, realpathSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { platform } from "node:os";
@@ -116,6 +117,7 @@ type PtyBridge = {
 
 export class ShellSessionManager {
   #cwd: string;
+  #changeObserver = new WorkspaceChangeObserver();
   readonly #env: Record<string, string | undefined>;
   readonly #outputDir: string;
   readonly #sandbox: SandboxRuntime | undefined;
@@ -172,6 +174,7 @@ export class ShellSessionManager {
     signal.throwIfAborted();
     await this.#ensureSandbox(cwd);
     signal.throwIfAborted();
+    const observation = onProgress ? await this.#changeObserver.begin(cwd, signal).catch(() => ({ between: [] })) : undefined;
     await mkdir(this.#outputDir, { recursive: true });
     const log = await this.#createLog(`foreground_${randomUUID()}`);
     if (signal.aborted) { await log.finish(); signal.throwIfAborted(); }
@@ -185,7 +188,8 @@ export class ShellSessionManager {
     let totalLines = 0;
     let truncated = false;
     const startedAt = Date.now();
-    const report = () => onProgress?.({
+    const report = (exitCode?: number) => onProgress?.({
+      ...(exitCode === undefined ? {} : { exitCode }),
       output: liveOutput,
       fullOutput: liveOutput,
       elapsedTimeSeconds: Math.max(0, Math.floor((Date.now() - startedAt) / 1000)),
@@ -215,6 +219,7 @@ export class ShellSessionManager {
     const progressTimer = onProgress ? setInterval(report, 1_000) : undefined;
     progressTimer?.unref?.();
 
+    let reportedExitCode: number | undefined;
     let timedOut = false;
     const timeout = setTimeout(() => {
       timedOut = true;
@@ -225,19 +230,22 @@ export class ShellSessionManager {
     if (signal.aborted) abort();
     try {
       const exitCode = await childExit(child);
+      reportedExitCode = exitCode;
       await log.finish();
+      try { report(exitCode); } catch { /* Display observers cannot change process effects. */ }
       if (signal.aborted) throw signal.reason ?? new Error("Command was interrupted");
       if (timedOut) throw new Error(`Command timed out after ${timeoutMs}ms`);
       const notice = truncated || log.truncated || log.error
         ? `\n[Output preview truncated: ${truncated}. Log: ${log.path}. ${log.error ? `Log write failed: ${log.error}.` : log.truncated ? "Log quota reached; only a prefix was saved." : "Complete output saved."}]` : "";
       const output = formatCommandOutput(stdout, stderr) + notice;
-      if (exitCode !== 0) throw new Error(output || `Command exited with code ${exitCode}`);
+      if (exitCode !== 0) throw new Error(`Command exited with code ${exitCode}${output ? `\n${output}` : ""}`);
       return output || "Command completed successfully with no output";
     } finally {
       clearTimeout(timeout);
       if (progressTimer) clearInterval(progressTimer);
       signal.removeEventListener("abort", abort);
       await log.finish();
+      if (onProgress && observation) { try { onProgress({ output: liveOutput, fullOutput: liveOutput, totalBytes, totalLines, elapsedTimeSeconds: Math.max(0, Math.floor((Date.now() - startedAt) / 1000)), timeoutMs, ...(reportedExitCode === undefined ? {} : { exitCode: reportedExitCode }), workspaceObservation: await this.#changeObserver.end(cwd, observation, signal) }); } catch { /* Observational evidence cannot change command effects. */ } }
     }
   }
 

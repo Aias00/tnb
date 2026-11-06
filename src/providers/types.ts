@@ -10,7 +10,10 @@ export type TokenUsage = {
   costUsd?: number;
 };
 
+export type RetryProgress = { type: "retry"; phase: "waiting" | "requesting"; retry: number; maxRetries: number; delayMs: number; status?: number; reason: "rate-limit" | "server" | "connection" | "transient" };
+
 export type ModelEvent =
+  | RetryProgress
   | { type: "text"; index: number; text: string }
   | { type: "thinking"; index: number; thinking: string }
   | { type: "thinking-signature"; index: number; signature: string }

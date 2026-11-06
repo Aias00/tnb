@@ -1,3 +1,4 @@
+import { withoutFileChangeEvidence } from "../../core/message";
 import type { ConversationMessage } from "../../core/message";
 import type { ModelTransport } from "../../providers/types";
 import { assertBalancedToolHistory, findSafeHistoryBoundary } from "../../core/history";
@@ -25,7 +26,7 @@ export type CompactConversationResult = {
 };
 
 export function estimateConversationTokens(messages: ConversationMessage[]): number {
-  return Math.ceil(JSON.stringify(messages).length / 4);
+  return Math.ceil(JSON.stringify(withoutFileChangeEvidence(messages)).length / 4);
 }
 
 export function createTransportSummarizer(options: {
@@ -51,7 +52,7 @@ export function createTransportSummarizer(options: {
     for await (const event of options.transport.stream(
       {
         model: options.model,
-        messages: [...structuredClone(messages), summaryRequest],
+        messages: [...structuredClone(withoutFileChangeEvidence(messages)), summaryRequest],
         tools: [],
       },
       signal,

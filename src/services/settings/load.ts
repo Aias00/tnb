@@ -26,7 +26,7 @@ export type TnbSettings = {
   pluginToolEnvironment?: PluginToolEnvironmentGrant[];
   blockedPluginFingerprints?: string[];
   general?: { vimMode?: boolean; editor?: string };
-  ui?: { theme?: "magenta" | "cyan" | "blue" | "green" };
+  ui?: { theme?: "magenta" | "cyan" | "blue" | "green"; notifications?: boolean };
   permissions?: PermissionRules & {
     defaultMode?: PermissionMode;
     disableBypassPermissionsMode?: "disable";
@@ -188,6 +188,10 @@ function validateSettings(value: unknown, path: string): TnbSettings {
   if (root.ui !== undefined) {
     const ui = requireObject(root.ui, `ui must be an object: ${path}`);
     const parsed: NonNullable<TnbSettings["ui"]> = {};
+    if (ui.notifications !== undefined) {
+      if (typeof ui.notifications !== "boolean") throw new Error(`ui.notifications must be boolean: ${path}`);
+      parsed.notifications = ui.notifications;
+    }
     if (ui.theme !== undefined) {
       if (ui.theme !== "magenta" && ui.theme !== "cyan" && ui.theme !== "blue" && ui.theme !== "green") {
         throw new Error(`ui.theme must be magenta, cyan, blue, or green: ${path}`);

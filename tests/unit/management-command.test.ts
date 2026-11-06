@@ -280,7 +280,7 @@ describe("plugin management command", () => {
 
     stdout = "";
     expect(await runResourceListCommand({ ...common, argv: ["plugins", "list", "--json"] })).toBe(0);
-    expect(JSON.parse(stdout)).toEqual([
+    expect(JSON.parse(stdout).filter((row: { source: string }) => row.source !== "builtin")).toEqual([
       expect.objectContaining({
         name: "review-pack",
         scope: "user",
@@ -376,4 +376,41 @@ test("builtin Coding enablement explains its durable-only scope and requires glo
   expect(JSON.parse(stdout)).toMatchObject({ source: "builtin", enabled: false, runtimeStatus: "not-queried" });
   expect(await runResourceListCommand({ ...common, argv: ["plugins", "enable", "TNB-CODING"] })).toBe(0);
   expect(JSON.parse(await readFile(join(configDir, "settings.json"), "utf8")).enabledPlugins["tnb-coding"]).toBe(true);
+});
+
+test("plugin list includes builtin configuration and never silently prints an empty list", async () => {
+  const configDir = await temporaryDirectory(), cwd = await temporaryDirectory();
+  await writeFile(join(configDir, "settings.json"), JSON.stringify({ enabledPlugins: { "tnb-coding": false } }));
+  let output = "";
+  const options = { configDir, cwd, env: {}, stdout: { write: (text: string) => { output += text; } }, stderr: { write() {} } };
+  expect(await runResourceListCommand({ ...options, argv: ["plugins", "list"] })).toBe(0);
+  expect(output).toContain("tnb-coding"); expect(output).toContain("0.1.0 · disabled");
+  expect(output).not.toContain("\t");
+  expect(output).not.toContain("host-provided");
+  expect(output).toContain("Built-in plugins (4)");
+  expect(output).toContain("No additional plugins installed"); expect(output).toContain("tnb runtime plugins");
+  output = "";
+  expect(await runResourceListCommand({ ...options, argv: ["plugins", "list", "--json"] })).toBe(0);
+  const rows = JSON.parse(output);
+  expect(rows).toHaveLength(4);
+  expect(rows.find((row: { name: string }) => row.name === "tnb-coding")).toMatchObject({ source: "builtin", enabled: false, runtimeStatus: "not-queried" });
+});
+
+test("resource lists print explicit empty state in text mode and retain JSON arrays", async () => {
+  const configDir = await temporaryDirectory(), cwd = await temporaryDirectory();
+  for (const command of ["agents", "hooks", "sessions"]) {
+    let output = "";
+    const common = { configDir, cwd, env: {}, stdout: { columns: 36, write: (text: string) => { output += text; } }, stderr: { write() {} } };
+    expect(await runResourceListCommand({ ...common, argv: [command] })).toBe(0);
+    expect(output).toContain("(0)"); expect(output).toMatch(/No (items|sessions)/); expect(output).not.toContain("\t");
+    output = "";
+    expect(await runResourceListCommand({ ...common, argv: [command, "--json"] })).toBe(0);
+    expect(JSON.parse(output)).toEqual([]);
+  }
+});
+
+test("provider summary uses labelled details and terminal width instead of tab columns", async () => {
+  const configDir = await temporaryDirectory(); let output = "";
+  expect(await runProviderCommand({ argv: ["provider", "list"], configDir, cwd: configDir, env: {}, stdout: { write: text => { output += text; } }, stderr: { write() {} } })).toBe(0);
+  expect(output).toContain("Providers ("); expect(output).toContain("API:"); expect(output).toContain("Endpoint:"); expect(output).not.toContain("\t");
 });

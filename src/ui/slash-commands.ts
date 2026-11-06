@@ -1,6 +1,11 @@
 import type { TranscriptEntry } from "./transcript/model";
 
 export const SLASH_COMMANDS = [
+  { name: "changes", aliases: [] as const, usage: "/changes [turn]", description: "Review recorded per-turn tool changes, separate from the working-tree diff." },
+  { name: "history", aliases: [] as const, usage: "/history [query]", description: "Find inputs across workspace sessions; reuse into an empty draft." },
+  { name: "session-preview", aliases: [] as const, usage: "/session-preview <id>", description: "Load a full session preview on demand." },
+  { name: "compactions", aliases: [] as const, usage: "/compactions", description: "Inspect recorded context compaction boundaries and summaries." },
+  { name: "search", aliases: [] as const, usage: "/search <text>", description: "Search workspace contents; select a match to add its reference to the draft." },
   {
     name: "longtask",
     aliases: ["task", "long", "长任务"] as const,
@@ -172,7 +177,7 @@ export const SLASH_COMMANDS = [
   {
     name: "mcp",
     aliases: [] as const,
-    usage: "/mcp [show|enable|disable|remove|reload] [server]",
+    usage: "/mcp [show|enable|disable|remove|reconnect|reload] [server]",
     description: "Inspect or manage configured MCP servers.",
   },
   {
@@ -304,7 +309,7 @@ export const SLASH_COMMANDS = [
   {
     name: "ide",
     aliases: [] as const,
-    usage: "/ide",
+    usage: "/ide [attach [descriptor-path]]",
     description: "Inspect local IDE bridge discovery endpoints.",
   },
   {
@@ -412,6 +417,7 @@ export type SlashCommandRequest = ParsedSlashCommand & {
 };
 
 export type SlashCommandResult = {
+  inputReference?: { label: string; text: string };
   message?: string;
   model?: string;
   contextWindowTokens?: number;
@@ -433,7 +439,7 @@ export type SlashCommandResult = {
 };
 
 export type ManagementView = {
-  kind: "diff" | "sessions" | "models" | "permissions" | "mcp" | "checkpoints" | "tasks" | "crontab" | "workflows" | "skills" | "plugins" | "marketplace" | "security" | "doctor" | "ide" | "hooks" | "agents" | "team";
+  kind: "compactions" | "search" | "diff" | "sessions" | "models" | "permissions" | "mcp" | "checkpoints" | "tasks" | "crontab" | "workflows" | "skills" | "plugins" | "marketplace" | "security" | "doctor" | "ide" | "hooks" | "agents" | "team";
   title: string;
   description?: string;
   refreshCommand?: string;
@@ -441,6 +447,8 @@ export type ManagementView = {
 };
 
 export type ManagementItem = {
+  draftReference?: string;
+  draftText?: string;
   sessionMetadata?: { messageCount: number; lastModified: number };
   id: string;
   label: string;

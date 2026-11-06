@@ -128,3 +128,11 @@ describe("settings loading", () => {
     expect(trusted.warnings).toBeUndefined();
   });
 });
+
+test("terminal notifications can be disabled without dropping the selected theme", async () => {
+  const configDir = await temporaryDirectory(), cwd = await temporaryDirectory();
+  await writeFile(join(configDir, "settings.json"), JSON.stringify({ ui: { theme: "cyan", notifications: false } }));
+  expect((await loadSettings({ configDir, cwd })).ui).toEqual({ theme: "cyan", notifications: false });
+  await writeFile(join(configDir, "settings.json"), JSON.stringify({ ui: { notifications: "false" } }));
+  await expect(loadSettings({ configDir, cwd })).rejects.toThrow("ui.notifications must be boolean");
+});

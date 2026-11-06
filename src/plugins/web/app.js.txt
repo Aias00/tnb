@@ -10,8 +10,8 @@ const statusText = { active: '进行中', paused: '已暂停', pausing: '暂停�
 function error(message) { $('error').textContent = message; $('error').classList.toggle('hidden', !message); document.querySelectorAll('dialog[open] .dialog-error').forEach(element => { element.textContent = message; element.classList.toggle('hidden', !message); }); }
 function toast(message) { $('toast').textContent = message.length > 240 ? message.slice(0, 240) + '…' : message; $('toast').classList.remove('hidden'); clearTimeout(toast.timer); toast.timer = setTimeout(() => $('toast').classList.add('hidden'), 5000); }
 function connection(online, text) { $('connection').textContent = text; $('connection').classList.toggle('online', online); }
-async function api(path, input) {
-  const response = await fetch(path, { credentials: 'same-origin', ...(input === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }) });
+async function api(path, input, signal) {
+  const response = await fetch(path, { credentials: 'same-origin', signal, ...(input === undefined ? {} : { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }) });
   const value = await response.json();
   if (!response.ok) { if (response.status === 401) { state.stream?.close(); state.chatStream?.close(); connection(false, '授权已失效'); } throw new Error(value.error || '请求失败'); }
   return value;
@@ -167,6 +167,8 @@ function setView(view) { state.view = view; $('chat-view').classList.toggle('hid
 function updateChatControls() {
   const running = ['running', 'waiting-approval'].includes(state.chatSnapshot?.chat.status), pending = !!state.chatPending;
   $('new-chat').disabled = state.chatBusy || pending || !state.chatAvailable;
+  $('content-search-open').disabled = !state.chatAvailable;
+  for (const kind of ['history','changes','compactions','mcp']) $('inspect-' + kind).disabled = !state.chatAvailable || ['changes','compactions'].includes(kind) && !state.chatId;
   $('chat-input').disabled = !state.chatAvailable || pending;
   $('chat-send').disabled = !state.chatAvailable || state.chatBusy || running || pending || !$('chat-model').value;
   $('chat-stop').classList.toggle('hidden', !running); $('chat-stop').disabled = state.chatBusy || pending;
@@ -179,6 +181,7 @@ function renderChats() {
     item.append(node('strong', chat.title), node('span', ({ idle: '继续对话', running: '正在执行', 'waiting-approval': '等待你的批准', interrupted: '本轮已中断', failed: '执行失败' })[chat.status], 'muted')); item.dataset.chatId = chat.id; $('chats').append(item); }
 }
 function newChat() {
+  clearChatRecap();
   state.chatStream?.close(); state.chatStream = null; state.chatId = null; state.chatSnapshot = null; save('chat-selected', null); setView('chat');
   $('chat-title').textContent = '一起把想法变成代码'; $('chat-messages').replaceChildren();
   const welcome = node('div', undefined, 'chat-welcome'); welcome.append(node('h2', '从一句话开始'), node('p', '讨论方案、阅读代码、修改文件和运行检查。')); $('chat-messages').append(welcome);
@@ -191,6 +194,7 @@ async function refreshChats() {
 }
 async function openChat(id) {
   if (state.chatPending && state.chatPending.chatId && state.chatPending.chatId !== id) { toast('请先确认上一条对话请求的结果'); return; }
+  if (state.chatId !== id) clearChatRecap();
   state.chatStream?.close(); state.chatId = id; save('chat-selected', id); setView('chat');
   try { const snapshot = await api('api/chats/' + encodeURIComponent(id)); if (state.chatId !== id) return; renderChat(snapshot);
     const stream = new EventSource('api/chats/' + encodeURIComponent(id) + '/stream'); state.chatStream = stream;
@@ -202,15 +206,24 @@ function renderChat(snapshot) {
   state.chatSnapshot = snapshot; const chat = snapshot.chat; $('chat-title').textContent = chat.title; $('chat-model').value = JSON.stringify([chat.provider, chat.model]);
   const index = state.chats.findIndex(item => item.id === chat.id); if (index < 0) state.chats.unshift(chat); else state.chats[index] = chat; renderChats();
   const container = $('chat-messages'), nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 100;
-  const opened = new Set([...container.querySelectorAll('details[open]')].map(item => item.dataset.tool)); container.replaceChildren();
+  const opened = new Set([...container.querySelectorAll('details[open]')].map(item => item.dataset.tool));
+  const focused = container.contains(document.activeElement) ? document.activeElement.dataset.focusKey : undefined; container.replaceChildren();
   if (snapshot.earlierMessages) container.append(node('p', '显示最近 64 条消息，更早的对话上下文仍由执行器保留。', 'muted small'));
   for (const message of snapshot.messages) {
     const row = node('article', undefined, 'chat-message ' + message.role); row.dataset.messageId = message.id;
-    row.append(node('p', message.role === 'user' ? '你' : 'TNB', 'chat-author'), node('div', message.text || (message.status === 'running' ? '正在思考…' : '本轮没有文本输出'), 'chat-text'));
+    row.append(node('p', message.role === 'user' ? '你' : 'TNB', 'chat-author'), message.role === 'assistant' && message.text ? renderMarkdown(message.text) : node('div', message.text || (message.status === 'running' ? '正在思考…' : '本轮没有文本输出'), 'chat-text'));
+    const actions = node('div', undefined, 'message-actions');
+    const copy = button('复制显示内容', async () => { try { await navigator.clipboard.writeText(message.text); toast('已复制'); } catch { toast('复制失败，请选择消息文字手动复制'); } }, 'quiet'); copy.dataset.focusKey = message.id + ':copy'; actions.append(copy);
+    if (message.role === 'user') { const reuse = button('编辑复用', () => reuseMessage(message.text), 'quiet'); reuse.dataset.focusKey = message.id + ':reuse'; actions.append(reuse); }
+    row.append(actions);
     for (const tool of message.tools || []) { const details = node('details', undefined, 'chat-tool'); details.dataset.tool = tool.id; details.open = opened.has(tool.id);
-      details.append(node('summary', tool.name + ' · ' + ({ running: '执行中', complete: '已完成', failed: '失败', interrupted: '需核对结果' })[tool.status])); if (tool.output) details.append(node('pre', tool.output, 'preview')); row.append(details); }
+      const phase = ({ requesting: '请求模型', tool: '运行工具', responding: '生成回复' })[tool.phase];
+      const progress = tool.status === 'running' ? [phase, tool.latestTool, Number.isFinite(tool.elapsedSeconds) ? Math.round(tool.elapsedSeconds) + 's' : null].filter(Boolean).join(' · ') : '';
+      const processResult = tool.name === 'bash' && tool.status !== 'running' && (tool.status === 'complete' || Number.isSafeInteger(tool.exitCode)) ? (Number.isSafeInteger(tool.exitCode) ? '进程退出 ' + tool.exitCode + (tool.status === 'failed' ? ' · 失败' : '') : '工具返回') : null;
+      const summary = node('summary', tool.name + ' · ' + (processResult || ({ running: '执行中', complete: '已完成', failed: '失败', interrupted: '需核对结果' })[tool.status] || tool.status) + (progress ? ' · ' + progress : '')); summary.dataset.focusKey = message.id + ':' + tool.id; details.append(summary); if (tool.output) details.append(node('pre', tool.output, 'preview')); row.append(details); }
     container.append(row);
   }
+  if (focused) [...container.querySelectorAll('[data-focus-key]')].find(item => item.dataset.focusKey === focused)?.focus({ preventScroll: true });
   if (nearBottom) container.scrollTop = container.scrollHeight;
   $('chat-approvals').replaceChildren();
   for (const approval of snapshot.approvals) { alertNotice('chat-approval:' + chat.id + ':' + approval.turnId, 'TNB 需要你的批准', approval.tool); const card = node('section', undefined, 'question-card'); card.append(node('h3', '批准本次操作：' + approval.tool), node('p', approval.message), node('pre', approval.input, 'preview'));
@@ -237,6 +250,90 @@ async function sendChat() {
     await chatAction({ action: 'send', chatId: state.chatId, text });
   } catch (issue) { error(issue.message); }
 }
+function reuseMessage(text) {
+  if ($('chat-input').disabled) { toast('请先确认上一条请求的结果'); return; }
+  if ($('chat-input').value) { toast('草稿已有内容，请先保存或清空'); return; }
+  $('chat-input').value = text; save('chat-draft', text); $('chat-input').focus(); toast('已放回草稿，发送后作为新消息；原对话保留');
+}
+let searchController, searchSequence = 0;
+$('content-search-open').onclick = () => { $('content-search-dialog').showModal(); $('content-search-query').focus(); };
+$('content-search-dialog').addEventListener('keydown', event => { if (event.key === 'Escape') { event.preventDefault(); $('content-search-dialog').close(); } });
+$('content-search-dialog').addEventListener('close', () => { searchController?.abort(); searchSequence++; if ($('content-search-results').getAttribute('aria-busy') === 'true') $('content-search-status').textContent = '搜索已取消，可重新检索。'; $('content-search-results').setAttribute('aria-busy', 'false'); });
+$('content-search-form').onsubmit = async event => {
+  event.preventDefault(); searchController?.abort(); const controller = searchController = new AbortController(), sequence = ++searchSequence;
+  $('content-search-results').replaceChildren(); $('content-search-results').setAttribute('aria-busy', 'true'); $('content-search-status').textContent = '正在搜索…';
+  try {
+    const result = await api('api/search', { query: $('content-search-query').value }, controller.signal);
+    if (sequence !== searchSequence || controller.signal.aborted) return;
+    $('content-search-status').textContent = result.matches.length + ' 条匹配' + (result.truncated ? ' · 结果已截断，请缩小检索范围' : '') + ' · 选择后加入草稿';
+    for (const match of result.matches) {
+      const card = node('section', undefined, 'content-search-result');
+      card.append(button(match.file + ':' + match.line, () => {
+        if ($('chat-input').disabled) { toast('请先确认上一条对话请求的结果'); return; }
+        const value = [$('chat-input').value, '@' + JSON.stringify(match.file) + ':' + match.line].filter(Boolean).join(' ');
+        if (value.length > $('chat-input').maxLength) { toast('草稿太长，请先整理后再添加引用'); return; }
+        $('chat-input').value = value; save('chat-draft', value); $('content-search-dialog').close(); setView('chat'); $('chat-input').focus(); toast('引用已加入草稿，尚未发送');
+      }, 'quiet'), node('pre', match.preview.join('\n'), 'preview'));
+      $('content-search-results').append(card);
+    }
+  } catch (issue) { if (sequence === searchSequence && !controller.signal.aborted) $('content-search-status').textContent = issue.message; }
+  finally { if (sequence === searchSequence) $('content-search-results').setAttribute('aria-busy', 'false'); }
+};
+let awayBaseline, recapSequence = 0;
+function recapBaseline(snapshot) {
+  return snapshot ? { id: snapshot.chat.id, messages: new Map(snapshot.messages.map(message => [message.id, message.status])), tools: new Map(snapshot.messages.flatMap(message => (message.tools || []).map(tool => [message.id + ':' + tool.id, tool.status]))) } : null;
+}
+function clearChatRecap() { recapSequence++; awayBaseline = null; $('chat-recap').replaceChildren(); $('chat-recap').classList.add('hidden'); }
+document.addEventListener('visibilitychange', async () => {
+  const sequence = ++recapSequence;
+  if (document.hidden) { awayBaseline = recapBaseline(state.chatSnapshot); return; }
+  const baseline = awayBaseline; awayBaseline = null;
+  if (!baseline || baseline.id !== state.chatId) return;
+  try {
+    const snapshot = await api('api/chats/' + encodeURIComponent(baseline.id));
+    if (document.hidden || baseline.id !== state.chatId || sequence !== recapSequence) return;
+    renderChat(snapshot);
+    const tools = snapshot.messages.flatMap(message => (message.tools || []).map(tool => ({ ...tool, recapId: message.id + ':' + tool.id })));
+    const completed = tools.filter(tool => tool.status === 'complete' && baseline.tools.get(tool.recapId) !== 'complete').length;
+    const failed = tools.filter(tool => tool.status === 'failed' && baseline.tools.get(tool.recapId) !== 'failed').length;
+    const replies = snapshot.messages.filter(message => message.role === 'assistant' && message.status === 'complete' && baseline.messages.get(message.id) !== 'complete').length;
+    if (!completed && !failed && !replies && !snapshot.approvals.length) return;
+    const recap = $('chat-recap'); recap.replaceChildren(node('span', `离开期间：${replies} 条回复完成，${completed} 次工具完成，${failed} 次失败；当前 ${snapshot.approvals.length} 项待批准。`), button('知道了', () => recap.classList.add('hidden'), 'quiet')); recap.classList.remove('hidden');
+  } catch (issue) { if (baseline.id === state.chatId) error(issue.message); }
+});
+
+let inspectionController, inspectionSequence = 0, inspectionKind = 'history';
+function cancelInspection() { inspectionController?.abort(); inspectionSequence++; $('inspection-items').setAttribute('aria-busy', 'false'); }
+$('inspection-dialog').addEventListener('close', cancelInspection);
+$('inspection-dialog').addEventListener('keydown', event => { if (event.key === 'Escape') { event.preventDefault(); $('inspection-dialog').close(); } });
+async function inspectWorkspace(kind, server) {
+  if (['changes', 'compactions'].includes(kind) && !state.chatId) { toast('请先选择会话'); return; }
+  cancelInspection(); const controller = inspectionController = new AbortController(), sequence = ++inspectionSequence;
+  const chatId = state.chatId; inspectionKind = kind === 'mcp-reconnect' ? 'mcp' : kind;
+  if (!$('inspection-dialog').open) $('inspection-dialog').showModal();
+  $('inspection-title').textContent = ({ history:'会话历史全文检索', changes:'分轮改动审阅', compactions:'上下文整理记录', mcp:'MCP 连接管理' })[inspectionKind];
+  $('inspection-form').classList.toggle('hidden', inspectionKind !== 'history'); $('inspection-status').textContent = '正在读取…'; $('inspection-items').replaceChildren(); $('inspection-items').setAttribute('aria-busy','true');
+  try {
+    const view = await api('api/inspect', { kind, ...(['changes','compactions'].includes(kind) ? { chatId } : {}), ...(kind === 'history' ? { query: $('inspection-query').value } : {}), ...(server ? { server } : {}) }, controller.signal);
+    if (controller.signal.aborted || sequence !== inspectionSequence || ['changes','compactions'].includes(kind) && chatId !== state.chatId) return;
+    $('inspection-title').textContent = view.title; $('inspection-status').textContent = view.description + (view.items.length ? '' : ' · 暂无记录');
+    for (const item of view.items) {
+      const card = node('section',undefined,'inspection-item'); card.append(node('h3',item.title),node('p',item.subtitle || '', 'muted small'),node('pre',item.body,'preview'));
+      if (item.draftText !== undefined || item.referenceText !== undefined) card.append(button(item.draftText !== undefined ? '复用输入' : '引用到草稿', () => {
+        if ($('chat-input').disabled) { toast('请先确认上一条对话请求的结果'); return; }
+        if (item.draftText !== undefined && $('chat-input').value) { toast('草稿已有内容，请先保存或清空'); return; }
+        const value = item.draftText !== undefined ? item.draftText : [$('chat-input').value, item.referenceText].filter(Boolean).join('\n');
+        if (value.length > $('chat-input').maxLength) { toast('内容超过草稿上限，请先缩小引用范围'); return; }
+        $('chat-input').value = value; save('chat-draft',value); $('inspection-dialog').close(); setView('chat'); $('chat-input').focus(); toast('已加入草稿，尚未发送；不包含媒体附件');
+      },'quiet'));
+      if (item.reconnectServer) card.append(button('检查 / 重建诊断连接', () => { if (confirm('检查此 MCP 服务连接？这不会重连正在运行的对话，也不会授予工具权限。')) inspectWorkspace('mcp-reconnect', item.reconnectServer); },'quiet'));
+      $('inspection-items').append(card);
+    }
+  } catch (issue) { if (sequence === inspectionSequence && !controller.signal.aborted) $('inspection-status').textContent = issue.message; }
+  finally { if (sequence === inspectionSequence) $('inspection-items').setAttribute('aria-busy','false'); }
+}
+for (const kind of ['history','changes','compactions','mcp']) $('inspect-' + kind).onclick = () => inspectWorkspace(kind);
+$('inspection-form').onsubmit = event => { event.preventDefault(); inspectWorkspace('history'); };
 $('new-chat').onclick = newChat;
 $('chat-input').oninput = () => save('chat-draft', $('chat-input').value);
 $('chat-input').onkeydown = event => { if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); if (!$('chat-send').disabled) sendChat(); } };
@@ -272,8 +369,8 @@ $('question-form').onsubmit = event => { event.preventDefault(); const question 
 $('reconcile-form').onsubmit = event => { event.preventDefault(); if (state.operation) action({ action: 'reconcile', runId: state.selected, taskId: state.operation.taskId, operationId: state.operation.id, result: $('confirmed-result').value }); };
 document.querySelectorAll('[data-tab]').forEach(element => element.onclick = () => { state.tab = element.dataset.tab; document.querySelectorAll('[data-tab]').forEach(item => item.classList.toggle('active', item === element)); for (const tab of ['report', 'changes', 'events']) $(tab + '-panel').classList.toggle('hidden', tab !== state.tab); if (state.tab === 'events') loadEvents(true); });
 $('retry').onclick = () => perform(null, true).catch(() => {}); $('discard').onclick = () => { if (confirm('请求可能已经执行。先检查任务状态，再决定是否放弃原请求重试。')) { state.pending = null; save('pending', null); showPending(); } };
-$('logout').onclick = async () => { try { await api('auth/logout', {}); state.stream?.close(); state.chatStream?.close(); clearInterval(state.chatPoll); state.chatAvailable = false; $('chat-messages').replaceChildren(); $('chat-approvals').replaceChildren(); updateChatControls(); connection(false, '已退出'); $('detail').classList.add('hidden'); $('runs').replaceChildren(); $('questions').replaceChildren(); $('notices').replaceChildren(); error('已退出。重新运行 tnb web 获取新入口。'); } catch (issue) { error(issue.message); } };
+$('logout').onclick = async () => { cancelInspection(); $('inspection-dialog').close(); $('inspection-items').replaceChildren(); searchController?.abort(); searchSequence++; $('content-search-dialog').close(); $('content-search-results').replaceChildren(); clearChatRecap(); try { await api('auth/logout', {}); state.stream?.close(); state.chatStream?.close(); clearInterval(state.chatPoll); state.chatAvailable = false; $('chat-messages').replaceChildren(); $('chat-approvals').replaceChildren(); updateChatControls(); connection(false, '已退出'); $('detail').classList.add('hidden'); $('runs').replaceChildren(); $('questions').replaceChildren(); $('notices').replaceChildren(); error('已退出。重新运行 tnb web 获取新入口。'); } catch (issue) { error(issue.message); } };
 $('notify').onclick = async () => { if (!('Notification' in window)) { toast('此浏览器不支持桌面提醒'); return; } const permission = await Notification.requestPermission(); save('notifications', permission === 'granted'); toast(permission === 'granted' ? '已开启。页面在后台时会提醒新问题和结果。' : '未开启桌面提醒，网页内提醒仍然有效。'); };
-window.addEventListener('pagehide', () => { state.stream?.close(); state.chatStream?.close(); clearInterval(state.chatPoll); });
+window.addEventListener('pagehide', () => { cancelInspection(); searchController?.abort(); state.stream?.close(); state.chatStream?.close(); clearInterval(state.chatPoll); });
 window.addEventListener('pageshow', event => { if (event.persisted) location.reload(); });
 boot().catch(issue => { connection(false, '无法连接'); error(issue.message); });

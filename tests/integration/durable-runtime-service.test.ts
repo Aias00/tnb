@@ -45,6 +45,7 @@ async function terminal(configDir: string, runId: string) {
 test("authenticated Unix service executes a loopback model and survives owner restart with receipt replay", async () => {
   const f = await fixture(); const first = await service(f.configDir); const paths = await runtimePaths(f.configDir);
   const unauthorized = await fetch("http://localhost/health", { unix: paths.socket }); expect(unauthorized.status).toBe(403);
+  expect(await runtimeRequest(f.configDir, "/health")).toMatchObject({ build: { mode: "source", version: "0.1.0", bun: Bun.version } });
   const body = { action: "submit", commandId: "service-submit", objective: "inspect", configuration: f.config };
   const submitted = await runtimeRequest(f.configDir, "/command", body) as { run: { runId: string } };
   expect((await terminal(f.configDir, submitted.run.runId)).run.status).toBe("succeeded"); expect(f.requests()).toBe(1);

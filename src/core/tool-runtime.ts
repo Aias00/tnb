@@ -13,6 +13,9 @@ export async function executeTool(
     ? options.toolCatalog.getTool(use.name)
     : options.tools.find((candidate) => candidate.name === use.name);
   if (!tool) return { result: toolError(use.id, `Unknown tool: ${use.name}`), attachments: [] };
+  const fileChanges: import("./tool").FileChangeEvidence[] = [];
+  const workspaceObservations: import("./tool").WorkspaceObservation[] = [];
+  const observationMetadata = () => workspaceObservations.length ? { workspaceObservations } : {};
   let started = false;
   let startedAt = 0;
   let invocationId: string | undefined;
@@ -60,6 +63,8 @@ export async function executeTool(
     assertAuthority();
     signal.throwIfAborted();
     const output = await tool.execute(input, signal, (data) => {
+      if (data.workspaceObservation && workspaceObservations.length < 8 && Buffer.byteLength(JSON.stringify(data.workspaceObservation)) <= 64 * 1024) workspaceObservations.push(structuredClone(data.workspaceObservation));
+      if (data.fileChange && fileChanges.length < 8 && Buffer.byteLength(JSON.stringify(data.fileChange)) <= 64 * 1024) fileChanges.push(structuredClone(data.fileChange));
       emit(options, {
         type: "tool-execution-progress",
         id: use.id,
@@ -72,7 +77,7 @@ export async function executeTool(
     if (invocationId && options.callJournal) {
       journalBarrier = true;
       await options.callJournal.settle(invocationId, {
-        result: { type: "tool-result", toolUseId: use.id, content, isError: false }, attachments,
+        result: { type: "tool-result", toolUseId: use.id, content, isError: false, ...(fileChanges.length ? { fileChanges } : {}), ...observationMetadata() }, attachments,
       });
       journalBarrier = false;
     }
@@ -85,7 +90,7 @@ export async function executeTool(
     });
     const resultContent = appendTextContext(content, [...(pre?.context ?? []), ...(post?.context ?? [])]);
     const outcome = {
-      result: { type: "tool-result" as const, toolUseId: use.id, content: resultContent, isError: false },
+      result: { type: "tool-result" as const, toolUseId: use.id, content: resultContent, isError: false, ...(fileChanges.length ? { fileChanges } : {}), ...observationMetadata() },
       attachments,
     };
     if (invocationId && options.callJournal) {
@@ -113,7 +118,7 @@ export async function executeTool(
       isError: true,
     }).catch(() => undefined);
     const resultContent = appendTextContext(message, post?.context);
-    const outcome = { result: toolError(use.id, resultContent), attachments: [] };
+    const outcome = { result: { ...toolError(use.id, resultContent), ...observationMetadata() }, attachments: [] };
     if (invocationId && options.callJournal) await options.callJournal.settle(invocationId, outcome);
     if (started) {
       emit(options, {

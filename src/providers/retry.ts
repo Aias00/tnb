@@ -1,3 +1,4 @@
+import type { RetryProgress } from "./types";
 export const DEFAULT_MAX_RETRIES = 10;
 export const BASE_RETRY_DELAY_MS = 500;
 export const MAX_RETRY_DELAY_MS = 32_000;
@@ -23,16 +24,18 @@ export class ProviderStreamError extends Error {
   }
 }
 
-export type RetryOptions = {
+export type RetryOptions<T = unknown> = {
   maxRetries?: number;
   signal?: AbortSignal;
   sleep?: (delayMs: number, signal?: AbortSignal) => Promise<void>;
   random?: () => number;
+  /** Observational metadata; never treated as response output. */
+  progress?: (event: RetryProgress) => T;
 };
 
 export async function* streamWithRetry<T>(
   operation: (attempt: number) => AsyncGenerator<T>,
-  options: RetryOptions = {},
+  options: RetryOptions<T> = {},
 ): AsyncGenerator<T> {
   const maxRetries = options.maxRetries ?? DEFAULT_MAX_RETRIES;
   const sleep = options.sleep ?? abortableSleep;
@@ -51,7 +54,14 @@ export async function* streamWithRetry<T>(
       if (emitted || attempt > maxRetries || !isRetryableProviderError(error)) throw error;
       const retryAfter =
         error instanceof ProviderHttpError ? error.headers.get("retry-after") : undefined;
-      await sleep(getRetryDelay(attempt, retryAfter, random), options.signal);
+      const delayMs = Math.max(0, getRetryDelay(attempt, retryAfter, random));
+      const progress: Omit<RetryProgress, "phase"> = { type: "retry", retry: attempt, maxRetries, delayMs,
+        ...(error instanceof ProviderHttpError ? { status: error.status } : {}),
+        reason: error instanceof ProviderHttpError ? error.status === 429 ? "rate-limit" : error.status >= 500 ? "server" : "transient" : "connection" };
+      if (options.progress) yield options.progress({ ...progress, phase: "waiting" });
+      await sleep(delayMs, options.signal);
+      options.signal?.throwIfAborted();
+      if (options.progress) yield options.progress({ ...progress, phase: "requesting" });
     }
   }
 }
@@ -90,15 +100,11 @@ export function isRetryableProviderError(error: unknown): boolean {
 
 async function abortableSleep(delayMs: number, signal?: AbortSignal): Promise<void> {
   if (delayMs <= 0) return;
+  signal?.throwIfAborted();
   await new Promise<void>((resolve, reject) => {
-    const timeout = setTimeout(resolve, delayMs);
-    signal?.addEventListener(
-      "abort",
-      () => {
-        clearTimeout(timeout);
-        reject(signal.reason);
-      },
-      { once: true },
-    );
+    const stop = () => { clearTimeout(timeout); signal?.removeEventListener("abort", stop); reject(signal?.reason); };
+    const timeout = setTimeout(() => { signal?.removeEventListener("abort", stop); resolve(); }, delayMs);
+    signal?.addEventListener("abort", stop, { once: true });
+    if (signal?.aborted) stop();
   });
 }

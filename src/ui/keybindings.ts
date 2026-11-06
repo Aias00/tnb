@@ -10,6 +10,10 @@ export const KEYBINDING_ACTIONS = [
   "pasteImage",
   "promptQueue",
   "redraw",
+  "previousMessage",
+  "nextMessage",
+  "editMessage",
+  "copyToolInput",
   "previousTool",
   "nextTool",
   "toggleTool",
@@ -27,6 +31,10 @@ export const DEFAULT_KEYBINDINGS: KeybindingMap = {
   pasteImage: "ctrl+v",
   promptQueue: "ctrl+q",
   redraw: "ctrl+l",
+  previousMessage: "ctrl+shift+up",
+  nextMessage: "ctrl+shift+down",
+  editMessage: "meta+e",
+  copyToolInput: "meta+p",
   previousTool: "meta+up",
   nextTool: "meta+down",
   toggleTool: "meta+enter",
@@ -81,6 +89,8 @@ export function matchesKeybinding(
   input: string,
   key: KeyLike,
 ): boolean {
+  // Cancellation/exit remain reachable even if a custom map assigns these keys.
+  if (key.escape || key.ctrl && input.toLowerCase() === "c") return false;
   const binding = bindings[action];
   if (!binding) return false;
   const parts = binding.trim().toLocaleLowerCase().split("+");
@@ -99,7 +109,7 @@ export function matchesKeybinding(
   if (name === "end") return key.end === true;
   if (name === "enter") return key.return === true;
   if (name === "tab") return key.tab === true;
-  if (name === "escape") return key.escape === true;
+  if (name === "escape") return false;
   return input.toLocaleLowerCase() === name;
 }
 
@@ -116,4 +126,23 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function isMissingFile(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT";
+}
+
+
+export function diagnoseKeybindings(bindings: KeybindingMap): string[] {
+  const groups = new Map<string, string[]>();
+  const warnings: string[] = [];
+  for (const action of KEYBINDING_ACTIONS) {
+    const binding = bindings[action]; if (!binding) continue;
+    const parts = binding.toLowerCase().replace(/cmd/g, "meta").split("+");
+    const key = parts.pop()!;
+    const modifiers = [...new Set(parts)].sort();
+    const canonical = [...modifiers, key].join("+");
+    const actions = groups.get(canonical) ?? []; actions.push(action); groups.set(canonical, actions);
+    if (canonical === "ctrl+c" || canonical === "escape") warnings.push(`${action}: ${binding} conflicts with fixed cancel/exit controls.`);
+    if (["ctrl+s", "ctrl+_", "ctrl+shift+-"].includes(canonical)) warnings.push(`${action}: ${binding} overlaps prompt stash/undo controls.`);
+    if (modifiers.length !== parts.length) warnings.push(`${action}: repeated modifiers in ${binding}.`);
+  }
+  for (const [binding, actions] of groups) if (actions.length > 1) warnings.push(`${binding} is assigned to ${actions.join(", ")}; only the first matching action can run in the active view.`);
+  return warnings;
 }

@@ -1,3 +1,4 @@
+import type { PromptInputSubmit } from "../prompt-input/types";
 export type TranscriptBase = {
   id: string;
   sequence: number;
@@ -7,6 +8,7 @@ export type TranscriptBase = {
 export type TranscriptToolProgress = {
   output?: string;
   fullOutput?: string;
+  exitCode?: number;
   elapsedTimeSeconds?: number;
   totalLines?: number;
   totalBytes?: number;
@@ -14,11 +16,13 @@ export type TranscriptToolProgress = {
   taskId?: string;
   progress?: number;
   progressTotal?: number;
+  agentPhase?: "requesting" | "tool" | "responding";
+  latestTool?: string;
   message?: string;
 };
 
 export type TranscriptEntry =
-  | (TranscriptBase & { kind: "user"; text: string })
+  | (TranscriptBase & { kind: "user"; text: string; input?: PromptInputSubmit })
   | (TranscriptBase & { kind: "assistant"; text: string; streaming: boolean })
   | (TranscriptBase & { kind: "system"; text: string; tone: "info" | "error" })
   | (TranscriptBase & {
@@ -34,7 +38,7 @@ export type TranscriptEntry =
     });
 
 export type TranscriptEntryInput =
-  | { kind: "user"; text: string }
+  | { kind: "user"; text: string; input?: PromptInputSubmit }
   | { kind: "assistant"; text: string; streaming?: boolean }
   | { kind: "system"; text: string; tone: "info" | "error" }
   | {

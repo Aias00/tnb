@@ -1,6 +1,6 @@
 import type { ProviderSelection } from "../../providers/config";
 import { createConfiguredTransportWithFallback, resolveBillingRoute, type ReasoningEffort } from "../../providers/factory";
-import type { ModelTransport } from "../../providers/types";
+import type { ModelRequest, ModelTransport } from "../../providers/types";
 import type { UsageBudget } from "../usage/budget";
 
 export type ModelExecutionOptions = {
@@ -13,6 +13,7 @@ export type ModelExecutionOptions = {
   /** Borrowed invocation ledger; its caller owns cancellation and disposal. */
   budget?: UsageBudget;
   workspace?: string;
+  onRequest?(request: ModelRequest): void;
 };
 
 /** Shared host assembly. The kernel receives only the resulting model transport. */
@@ -21,6 +22,8 @@ export function createModelExecution(options: ModelExecutionOptions) {
   let configured = options.transport;
   const raw: ModelTransport = {
     stream(request, signal) {
+      // Reporting is observational and must not change model execution.
+      try { options.onRequest?.(request); } catch { /* Host observer only. */ }
       configured ??= createConfiguredTransportWithFallback(selection, options.fallbackSelection,
         options.reasoningEffort, undefined, options.fastMode, { maxRetries: options.maxRetries });
       return configured.stream(request, signal);

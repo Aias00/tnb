@@ -1,3 +1,4 @@
+import { withoutFileChangeEvidence } from "../../core/message";
 import type { ConversationMessage } from "../../core/message";
 import { isContextOverflowError } from "../../core/agent-loop";
 import type { ModelRequest, ModelTransport } from "../../providers/types";
@@ -11,7 +12,7 @@ export function createBoundedSummarizer(options: {
   const inputLimit = requestInputLimit(options.contextWindow, outputLimit);
   return async (messages: ConversationMessage[], signal?: AbortSignal): Promise<string> => {
     // Serialize as evidence, never replay historical tool calls as live calls.
-    let remaining = JSON.stringify(messages.map(({ role, content }) => ({ role, content })));
+    let remaining = JSON.stringify(withoutFileChangeEvidence(messages).map(({ role, content }) => ({ role, content })));
     let summary = ""; let requests = 0; let scale = 1;
     while (remaining.length) {
       signal?.throwIfAborted();
