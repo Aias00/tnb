@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { loadHostPlugins, type BuiltinHostPlugin } from "../../src/agent/plugins";
@@ -54,6 +54,44 @@ async function fixture(app = true, dependent = false) {
   return { root, source, installed: installed.root, store, options, authority, code, load, events, manifest };
 }
 const reference = { id: "fixture-channel", version: "1" };
+
+test("reference diagnostics distinguish absent history from a failed startup collector", async () => {
+  const f = await fixture(false), options = { roots: [], trustStorePath: f.options.trustStorePath, generationReferences: [], channelReferences: [] };
+  let host = await loadHostPlugins(options); cleanup.push(() => host.close());
+  expect(host.references(options).collection).toEqual({ phase: "startup", status: "disabled", reason: "no-history-root" });
+  await host.close();
+  const state = join(f.root, "broken-history"); await mkdir(state); await writeFile(join(state, "plugin-generations"), "invalid history root");
+  host = await loadHostPlugins(options, [], join(state, "plugin-snapshots")); cleanup.push(() => host.close());
+  expect(host.references(options).collection).toMatchObject({ phase: "startup", status: "failed", error: "Error: Plugin history must be a real directory" });
+  expect(host.list()[0]?.error).toContain("Historical collection failed");
+  expect(await readFile(join(state, "plugin-generations"), "utf8")).toBe("invalid history root");
+});
+
+test("an omitted inventory disables collection, while inactive channel bindings still retain old bytes", async () => {
+  const f = await fixture(false); await trustPlugin(f.options.trustStorePath, f.installed);
+  let host = await f.load();
+  const old = resolveChannelBinding(f.store, "application", "source", "transport", reference, host.extensions.channels);
+  await host.close();
+  await f.code(f.installed, "new"); await trustPlugin(f.options.trustStorePath, f.installed);
+  const history = join(f.root, "state", "plugin-generations"), oldKey = pluginGenerationKey(old.plugin!);
+  await mkdir(join(history, ".stage-abandoned"));
+  for (const missing of [{ channelReferences: undefined }, { generationReferences: undefined }, { generationReferences: undefined, channelReferences: undefined }]) {
+    host = await f.load(missing);
+    expect(await readdir(history)).toContain(oldKey);
+    expect(await readdir(history)).toContain(".stage-abandoned");
+    expect(host.references(missing).collection).toEqual({ phase: "startup", status: "disabled", reason: "incomplete-inventory" });
+    await host.close();
+  }
+  const inactive = channelGenerationReferences(f.store, () => false);
+  host = await f.load({ channelReferences: inactive });
+  const report = host.references({ generationReferences: [], channelReferences: inactive });
+  expect(report.collection).toEqual({ phase: "startup", status: "completed" });
+  expect(report.generations[0]).toMatchObject({ key: oldKey, retain: true, load: false, references: [{ kind: "channel", key: "source", load: false }] });
+  expect(host.list().find(item => item.generation === "retained")?.status).toBe("inactive");
+  expect(await readdir(history)).toContain(oldKey);
+  expect(await readdir(history)).not.toContain(".stage-abandoned");
+  expect((await f.events()).filter(item => item === "old:import")).toHaveLength(2); // Original + the known channel inventory; reporting imports nothing.
+});
 
 test("installed old channels preserve their state while new sources use current code and independent state", async () => {
   const f = await fixture(); await trustPlugin(f.options.trustStorePath, f.installed); let host = await f.load();

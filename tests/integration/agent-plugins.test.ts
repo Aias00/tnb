@@ -34,7 +34,7 @@ async function fixture(settings: Record<string, unknown> = {}) {
   await writeFile(join(source, "settings.json"), JSON.stringify({ trace, ...settings }));
   const installed = await installLocalPlugin({ source, targetRoot: plugins, sourceType: "user" });
   const installedRoot = installed.root;
-  const options = { roots: [{ directory: plugins, source: "user" as const }], trustStorePath: trust };
+  const options = { roots: [{ directory: plugins, source: "user" as const }], trustStorePath: trust, channelReferences: [] };
   const events = async () => (await readFile(trace, "utf8").catch(() => "")).trim().split("\n").filter(Boolean);
   async function open() { const host = await openAgentRuntime({ directory: join(root, "runtime"), plugins: options }); cleanup.push(() => host.close()); return host; }
   return { root, plugins, source, installedRoot, trace, trust, options, events, open, manifest };
@@ -220,6 +220,7 @@ ownerTest("history collection retains terminal Run references and task overrides
   const entry = join(f.installedRoot, "index.mjs"); await writeFile(entry, await readFile(entry, "utf8") + "\n// upgrade\n"); await trustPlugin(f.trust, f.installedRoot);
   host = await f.open(); expect(await readdir(history)).toContain(oldKey);
   expect(host.plugins.list().find(item => item.generation === "retained")).toMatchObject({ status: "inactive", references: 1 }); // Terminal code is retained, not executed.
+  expect(host.plugins.references().generations.find(item => item.key === oldKey)).toMatchObject({ retain: true, load: false, references: [{ kind: "run", runId: first.run.runId, load: false }] });
   expect((await f.events()).filter(item => item === "import")).toHaveLength(2);
   expect((await host.submit({ commandId: "terminal", objective: "Finish", namespace: "fixture", adapter: descriptor() })).run.runId).toBe(first.run.runId);
   const current = await host.submit({ commandId: "hold-reference", objective: "Wait", namespace: "fixture", adapter: descriptor({ wait: true }) });
@@ -227,12 +228,18 @@ ownerTest("history collection retains terminal Run references and task overrides
   host.store.command("override", {}, Date.now(), tx => tx.saveRecord({ kind: "task-configuration", id: current.tasks[0]!.taskId, runId: current.run.runId, taskId: current.tasks[0]!.taskId,
     value: { domain: { ...descriptor(), plugin: old } } }, 0));
   expect(pluginGenerationReferences(host.store).some(ref => ref.taskId === current.tasks[0]!.taskId && ref.plugin.fingerprint === old.fingerprint)).toBe(true);
-  host.store.deleteTerminalRun(first.run.runId); await host.close();
+  expect(host.plugins.references().generations.find(item => item.key === oldKey)).toMatchObject({ load: true, references: [{ kind: "run" }, { kind: "task", taskId: current.tasks[0]!.taskId }] });
+  host.store.deleteTerminalRun(first.run.runId);
+  expect(host.plugins.references().generations.find(item => item.key === oldKey)?.references).toHaveLength(1);
+  await host.close();
   host = await f.open(); expect(host.plugins.list().find(item => item.generation === "retained")).toMatchObject({ status: "active", references: 1 });
   expect(await readdir(history)).toContain(oldKey);
   host.runtime.commands.cancelRun({ commandId: "cancel-current", runId: current.run.runId, expectedRevision: host.store.getRun(current.run.runId)!.revision });
   await until(host, () => host.store.getRun(current.run.runId)?.status === "cancelled");
-  host.store.deleteTerminalRun(current.run.runId); await host.close();
+  host.store.deleteTerminalRun(current.run.runId);
+  expect(host.plugins.references().generations.find(item => item.key === oldKey)).toBeUndefined();
+  expect(await readdir(history)).toContain(oldKey); // A report never collects live code.
+  await host.close();
   host = await f.open(); expect(await readdir(history)).not.toContain(oldKey);
 });
 

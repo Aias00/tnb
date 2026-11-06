@@ -83,6 +83,8 @@ Coding 持久 Worker 记录选中 Skill/MCP 的包来源，在授权以及 Skill
 
 领域包和渠道支持历史可执行代际留存，inventory 显示 current/retained 和引用数。安装包受安装、启用、信任和兼容性约束；默认 Coding/channels 使用嵌入包和宿主私有批准。任务和来源保留原指纹，不把历史实现作为默认回退。详见 [领域安装包](plugin-generations.md)、[默认 Coding](builtin-generations.md) 和 [渠道来源恢复](channel-generations.md)；自定义 inline factory 和历史应用/界面不在此恢复范围。
 
+`tnb runtime plugins --references` 提供实时引用理由；SDK 使用 `host.plugins.references()`。直接 `loadHostPlugins` 时，启动回收必须明确提供领域和渠道两类完整清单，省略表示未知，见[引用与回收指南](plugin-references.md)。
+
 ## 服务、状态和依赖
 
 应用/交互的 `start(context)` 返回可选 `handle(Request)`、`status()`。context 提供：

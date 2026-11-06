@@ -80,6 +80,7 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
             return await (request.method === "GET" ? plugins.extensions.handle(ref, request) : serialCommand(() => plugins.extensions.handle(ref, request)));
           }
           if (url.pathname === "/plugins") return Response.json(plugins?.list() ?? []);
+          if (request.method === "GET" && url.pathname === "/plugins/references") return Response.json(profile.references(store));
           if (request.method === "GET") {
             if (url.pathname === "/presentation") {
               const workspace = await realpath(url.searchParams.get("workspace") ?? ""); const runId = url.searchParams.get("runId");

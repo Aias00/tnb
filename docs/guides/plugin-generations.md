@@ -28,7 +28,7 @@ tnb runtime plugins
 
 本版本新创建的任务会在同一事务内保存原提交摘要和规范化命令。精确重复提交可以验证并返回原回执，不需要重新加载终态任务的旧代码；更改 objective/configuration 等输入不能复用原命令身份。历史任务仍沿原规范化命令校验，不放宽旧回执摘要。
 
-仍被任何 Run 引用的包不会自动删除，包括 paused、failed、cancelled 和 succeeded 的记录。明确 prune 终态 Run 后，无引用且非当前的历史包会在下一次启动时回收；中途崩溃遗留的暂存目录也会清理。SDK `openAgentRuntime` 自动收集引用；直接使用 `loadHostPlugins` 时，没有完整的宿主引用清单就不自动回收。
+仍被任何 Run 或渠道绑定引用的包不会自动删除，包括 paused、failed、cancelled 和 succeeded 的记录以及停用 Source。明确 prune 终态 Run 后，无引用且非当前的历史包会在下一次启动时回收；完整清单启动也清理中途崩溃遗留的暂存目录。SDK `openAgentRuntime` 自动收集两类引用；直接使用 `loadHostPlugins` 时，必须同时提供 `generationReferences` 和 `channelReferences` 才回收，没有该类引用须明确传 `[]`。省略任一清单表示未知，禁用回收。使用 `tnb runtime plugins --references` 查看当前引用理由和启动回收结果，见[引用诊断](plugin-references.md)。
 
 历史目录与任务数据库是不同的数据。runtime backup v2 已保存历史包及插件私有文件，并校验持久引用；v1 仍明确缺少该覆盖。使用 `tnb runtime backup-check <directory>` 核对材料，详见[备份指南](plugin-backup.md)。原安装包、信任文件、配置和外部环境仍需另行准备，恢复到不同路径需要重新审核来源。
 

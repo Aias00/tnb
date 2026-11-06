@@ -16,6 +16,7 @@ import { digestJson } from "../services/runtime/json";
 import { isPluginFingerprintBlocked } from "../services/plugins/policy";
 import { bindPluginMigrations } from "./plugin-state";
 import { parsePluginDataDeclaration } from "./plugin-data";
+import { pluginReferenceReport, type PluginCollectionState, type PluginReferenceInventory } from "./plugin-references";
 
 /** Trusted in-process code. This API does not confer sandbox isolation. */
 export type AdapterPluginAPI = {
@@ -42,11 +43,12 @@ export type AgentPluginOptions = {
   trustStorePath: string;
   builtins?: readonly (BuiltinAdapterPlugin | BuiltinHostPlugin)[];
   configuration?: Record<string, unknown>;
-  /** Complete host-owned inventory; omitted means historical collection is disabled. */
+  /** Complete host-owned domain inventory; both inventories are required for historical collection. */
   generationReferences?: readonly PluginGenerationReference[];
   /** Owner-held host approval table. Never exposed through the plugin API. */
   builtinAuthority?: BuiltinGenerationAuthority;
   builtinChannelAuthority?: BuiltinGenerationAuthority;
+  /** Complete host-owned channel inventory; use [] when none exist. Omission disables collection. */
   channelReferences?: readonly ChannelGenerationReference[];
   blockedFingerprints?: readonly string[];
   /** Current host policy, applied outside the loaded implementation, including historical packages. */
@@ -236,15 +238,21 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
     }
   }
   states.push(...retainedStates);
-  if (historyRoot && options.generationReferences) {
+  let collection: PluginCollectionState = { phase: "startup", status: "disabled", reason: historyRoot ? "incomplete-inventory" : "no-history-root" };
+  if (historyRoot && options.generationReferences !== undefined && options.channelReferences !== undefined) {
     const keep = new Set(references.map(ref => pluginGenerationKey(ref.plugin)));
     for (const state of states) if (state.generation === "current" && state.version && state.fingerprint) keep.add(pluginGenerationKey({ name: state.name, version: state.version, fingerprint: state.fingerprint }));
-    try { await collectPluginGenerations(historyRoot, keep); }
-    catch (error) { states.push({ name: "plugin-generations", root: historyRoot, enabled: false, trust: "untrusted", status: "failed", error: `Historical collection failed: ${String(error)}` }); }
+    try { await collectPluginGenerations(historyRoot, keep); collection = { phase: "startup", status: "completed" }; }
+    catch (error) {
+      collection = { phase: "startup", status: "failed", error: String(error) };
+      states.push({ name: "plugin-generations", root: historyRoot, enabled: false, trust: "untrusted", status: "failed", error: `Historical collection failed: ${String(error)}` });
+    }
   }
   const extensions = new ExtensionHost(extensionRegistrations, [...registrations.filter(row => !row.recoveryOnly), ...inline.map(adapter => ({ adapter }))], stateDirectory, options.channelReferences);
   let closing: Promise<void> | undefined;
   return { registrations, extensions,
+    /** Caller supplies current owner facts. Reporting never performs collection. */
+    references: (inventory: PluginReferenceInventory) => pluginReferenceReport(inventory, states, collection),
     list: () => structuredClone(states.map(state => {
       const contributions = extensions.list().filter(contribution => contribution.plugin.name === state.name && contribution.plugin.fingerprint === state.fingerprint);
       return contributions.length ? { ...state, contributions } : state;
@@ -266,6 +274,7 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
 
 export type HostPluginOptions = AgentPluginOptions;
 export type HostPluginState = AdapterPluginState;
+export type { PluginReferenceInventory, PluginReferenceReport, PluginRetentionReason, PluginCollectionState } from "./plugin-references";
 export const loadAdapterPlugins = loadHostPlugins;
 function guardAdapter(adapter: AgentDomainAdapter, plugin: AdapterPluginIdentity, recoveryOnly: boolean, guard: AgentPluginOptions["workerGuard"]): AgentDomainAdapter {
   if (!guard) return adapter;

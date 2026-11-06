@@ -640,6 +640,8 @@ self-update manifest alongside the binary and `SHA256SUMS`.
 
 外部工具子进程默认使用最小环境和私有 HOME/TMP，凭据需在用户 `settings.json` 中按包指纹和工具显式引用。撤权会排空旧调用，旧句柄不能自动取得新凭据，见[环境与凭据合同](docs/guides/plugin-tool-environment.md)。
 
+`tnb runtime plugins --references` 或对话中的 `/runtime plugins --references` 可查看历史代际被哪些任务、子任务和 Source 保留，以及启动回收结果。停用 Source 仍保护历史字节，自定义宿主缺少任一类完整引用清单就禁止回收，见[引用诊断](docs/guides/plugin-references.md)。
+
 持久任务可通过 `--skill NAME`、`--mcp-tool NAME` 显式选择额外能力，详见 [长任务 skills 与 MCP](docs/guides/durable-capabilities.md)。
 
 网页工作台：`tnb web` 默认进入 Coding 对话，支持连续提问、流式回复、工具执行和逐次审批，也可切换历史对话或转为后台任务。原有实时问题提醒、任务控制和结果查看仍保留，见 [使用说明](docs/guides/web-workbench.md)。

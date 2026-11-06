@@ -31,6 +31,7 @@ backup <directory> / restore <directory> / prune <run-id>  Offline maintenance; 
 backup-check <directory>  Read-only verification of saved evidence and plugin assets; never starts the owner.
 storage  Show state size and free disk space.
 plugins  Show the running host's built-in and installed domain plugin generations.
+plugins --references  Explain current Run/task/Source retention and startup collection status.
 
 All actions accept --config-dir PATH. Submitting starts a persistent local service;
 closing the client does not cancel accepted work. Checks are explicitly authorized
@@ -82,7 +83,7 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
     if (action === "submit" && !args.includes("--no-start")) await ensureRuntime(configDir, options.env);
     let result: unknown;
     if (action === "list") result = await runtimeRequest(configDir, "/runs");
-    else if (action === "plugins") result = await runtimeRequest(configDir, "/plugins");
+    else if (action === "plugins") result = await runtimeRequest(configDir, args.includes("--references") ? "/plugins/references" : "/plugins");
     else if (action === "routing") {
       const query = new URLSearchParams({ workspace: await realpath(resolve(value("--cwd") ?? options.cwd)), pending: String(args.includes("--pending")) });
       if (value("--before-input")) query.set("beforeInput", value("--before-input")!);
@@ -153,7 +154,7 @@ export async function runRuntimeChatCommand(options: RuntimeChatOptions): Promis
   const args = options.args.length ? [...options.args] : ["list"]; const action = args[0]!;
   if (!["followup", "routing", "submit", "list", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel", "storage", "start", "restart", "stop", "plugins", "backup-check"].includes(action)) throw new Error("/runtime supports submit, list, status, result, events, questions, answer, limits, pause, resume, cancel, storage, start, restart, stop, plugins and backup-check.");
   const valueFlags = new Set(["--before-input", "--text", "--input-id", "--resolve-input", "--successor", "--cwd", "--mode", "--check", "--skill", "--mcp-tool", "--allow-workspace", "--provider", "--model", "--max-budget-usd", "--max-turns", "--command-id", "--config-dir", "--after", "--task", "--question", "--answer", "--version", "--deadline", "--extend-hours", "--revision"]);
-  const flags = new Set(["--pending", "--allow-write", "--allow-shell", "--no-start", "--help", "-h"]);
+  const flags = new Set(["--references", "--pending", "--allow-write", "--allow-shell", "--no-start", "--help", "-h"]);
   if (action === "followup" && (!args[1] || args[1].startsWith("--"))) args.splice(1, 0, "");
   const hasTarget = ["followup", "submit", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel", "backup-check"].includes(action);
   for (let index = hasTarget ? 2 : 1; index < args.length; index++) {

@@ -43,7 +43,9 @@ export async function loadDefaultProfile(options: { configDir: string; root: str
         ? capabilities.guardLegacy(context.configuration, context.signal) : async () => {},
     }, [], join(root, "plugin-snapshots"));
   } finally { if (!options.runtime) referenceStore.close(); }
-  return { plugins, async start(runtime: DurableRuntime, signal?: AbortSignal) {
+  return { plugins,
+    references: (store: RuntimeStore) => plugins.references({ generationReferences: pluginGenerationReferences(store), channelReferences: collaborationChannelReferences(store, config) }),
+    async start(runtime: DurableRuntime, signal?: AbortSignal) {
     await plugins.extensions.start({ store: runtime.store, signal, configuration: settings.pluginConfiguration, serviceProviders: [
       provideService(CHAT_SERVICE_REF, scope => {
         const chats = createChatService({ store: runtime.store, configDir, env, signal: scope.signal, track: scope.track });

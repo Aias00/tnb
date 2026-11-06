@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RuntimeStore } from "../../src/services/runtime/store";
@@ -8,6 +8,12 @@ import { serveDurableRuntime, runtimeRequest } from "../../src/services/runtime/
 import { DurableQuestionInbox } from "../../src/services/runtime/attention";
 import { acquireWorkspace } from "../../src/services/runtime/workspace";
 import { presentRun, presentRunDetail } from "../../src/services/runtime/presentation";
+import { saveChannelBinding } from "../../src/agent/channel-bindings";
+import { COLLABORATION_CHANNEL_OWNER } from "../../src/services/collaboration/channels";
+import { sourceIdentity } from "../../src/services/collaboration/config";
+import { runRuntimeCommand, runRuntimeChatCommand } from "../../src/entrypoints/runtime";
+import type { PluginReferenceReport } from "../../src/agent/plugin-references";
+import type { Source } from "../../src/services/collaboration/types";
 const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
 async function until(test: () => boolean) { const end = Date.now() + 8000; while (!test()) { if (Date.now() > end) throw new Error("Presentation timeout"); await Bun.sleep(10); } }
@@ -23,6 +29,29 @@ async function fixture(check?: (command: string) => Promise<string>) {
   const configuration: RuntimeConfiguration = { workspace, allowedWorkspaces: [workspace], allowWrite: false, allowShell: false, checks: [], maxTurns: 8, maxRetries: 0, compactThreshold: 10000 };
   return { root, workspace, other, configDir, runtime, store, configuration };
 }
+
+test("plugin reference API, CLI and slash command use live bindings and the owner's effective configuration", async () => {
+  const f = await fixture();
+  const before = await runtimeRequest(f.configDir, "/plugins/references") as PluginReferenceReport;
+  expect(before.generations).toEqual([]);
+  expect(before.collection.status).toBe("completed");
+  const descriptor = { id: "retired-channel", version: "1", plugin: { name: "retained-channel", version: "1.0.0", fingerprint: "a".repeat(64) } };
+  const source: Source = { id: "archived", type: "plugin", channel: descriptor, options: {}, actors: ["alice"], controllers: ["alice"], mode: "single", pollIntervalMs: 1000, configuration: f.configuration };
+  saveChannelBinding(f.store, { owner: COLLABORATION_CHANNEL_OWNER, key: source.id, transport: sourceIdentity(source), descriptor });
+  // This change is not effective until restart. A report must not re-read disk intent as owner policy.
+  await writeFile(join(f.configDir, "collaboration.json"), JSON.stringify({ enabled: true, sources: [source] }));
+  let output = "", error = "";
+  expect(await runRuntimeCommand({ argv: ["runtime", "plugins", "--references", "--config-dir", f.configDir], cwd: f.workspace, env: {},
+    stdout: { write(value) { output += value; } }, stderr: { write(value) { error += value; } } })).toBe(0);
+  expect(error).toBe("");
+  const report: PluginReferenceReport = JSON.parse(output);
+  expect(report.inventory).toEqual({ domains: "complete", channels: "complete" });
+  expect(report.generations[0]).toMatchObject({ retain: true, load: false, implementations: [], references: [{ kind: "channel", owner: COLLABORATION_CHANNEL_OWNER, key: "archived", load: false }] });
+  const slash = await runRuntimeChatCommand({ args: ["plugins", "--references"], configDir: f.configDir, cwd: f.workspace, workspace: f.workspace, env: {}, provider: "fixture", model: "fixture", sessionId: "session" });
+  expect(JSON.parse(slash)).toEqual(report);
+  expect(await runtimeRequest(f.configDir, "/plugins/references")).toEqual(report);
+  expect(Array.isArray(await runtimeRequest(f.configDir, "/plugins"))).toBe(true); // Existing inventory API stays compatible.
+});
 test("live presentation and controls remain workspace scoped; saved followups are distinct from delivery and completion", async () => {
   const f = await fixture(), release = await acquireWorkspace(f.workspace); let released = false; cleanup.push(async () => { if (!released) await release(); });
   const { run } = await f.runtime.submit({ commandId: "create", objective: "Inspect", configuration: f.configuration, mode: "single" });

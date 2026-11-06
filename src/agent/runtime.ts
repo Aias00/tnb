@@ -9,6 +9,7 @@ import { loadAdapterPlugins, type AgentPluginOptions } from "./plugins";
 import { pluginGenerationReferences } from "./plugin-generations";
 import { builtinGenerationAuthority, builtinChannelGenerationAuthority } from "./builtin-generations";
 import { channelGenerationReferences } from "./channel-bindings";
+import { pluginReferenceReport } from "./plugin-references";
 
 /** Local Bun host. Acquire the owner lock before opening SQLite, including on recovery. */
 export async function openAgentRuntime(options: { directory: string; adapters?: readonly AgentDomainAdapter[]; plugins?: AgentPluginOptions; legacyAdapterId?: string; signal?: AbortSignal; services?: ExtensionHostOptions["services"]; serviceProviders?: ExtensionHostOptions["serviceProviders"]; serviceGrants?: ExtensionHostOptions["grants"]; pluginConfiguration?: ExtensionHostOptions["configuration"] }) {
@@ -22,8 +23,8 @@ export async function openAgentRuntime(options: { directory: string; adapters?: 
   let plugins: Awaited<ReturnType<typeof loadAdapterPlugins>> | undefined;
   try {
     store = new RuntimeStore(join(options.directory, "state.sqlite"));
-    plugins = options.plugins ? await loadAdapterPlugins({ ...options.plugins, generationReferences: pluginGenerationReferences(store),
-      channelReferences: [...channelGenerationReferences(store), ...(options.plugins.channelReferences ?? [])], builtinAuthority: builtinGenerationAuthority(store), builtinChannelAuthority: builtinChannelGenerationAuthority(store) }, options.adapters, join(options.directory, "plugin-snapshots")) : undefined;
+    const references = () => ({ generationReferences: pluginGenerationReferences(store!), channelReferences: [...channelGenerationReferences(store!), ...(options.plugins?.channelReferences ?? [])] });
+    plugins = options.plugins ? await loadAdapterPlugins({ ...options.plugins, ...references(), builtinAuthority: builtinGenerationAuthority(store), builtinChannelAuthority: builtinChannelGenerationAuthority(store) }, options.adapters, join(options.directory, "plugin-snapshots")) : undefined;
     const domains = new DomainRegistry(options.adapters, plugins?.registrations, options.legacyAdapterId);
     const runtime = running = new DurableRuntime(store, options.directory, domains);
     // The host retains ownership through plugin disposal and database close.
@@ -42,6 +43,7 @@ export async function openAgentRuntime(options: { directory: string; adapters?: 
     options.signal?.addEventListener("abort", abort, { once: true });
     if (options.signal?.aborted) { await close(); options.signal.throwIfAborted(); }
     return { runtime, store, submit: runtime.submitDomain.bind(runtime), plugins: { list: () => plugins?.list() ?? [], extensions: () => plugins?.extensions.list() ?? [],
+        references: () => plugins ? plugins.references(references()) : pluginReferenceReport(references(), [], { phase: "startup", status: "disabled", reason: "no-history-root" }),
         request: (ref: ContributionReference, request: Request) => { if (!plugins) throw new Error("No host plugins are loaded"); return plugins.extensions.handle(ref, request); }, channels: plugins?.extensions.channels }, close };
 
   } catch (error) {
@@ -65,6 +67,8 @@ export { CHAT_SERVICE, CHAT_SERVICE_REF } from "./chat-service";
 export type { ChatService, WorkspaceChatService, ChatSummary, ChatMessage, ChatApproval, ChatSnapshot } from "./chat-service";
 export type { HostPluginAPI, HostPluginFactory, BuiltinHostPlugin, HostPluginOptions, HostPluginState } from "./plugins";
 export type { PluginGenerationReference } from "./plugin-generations";
+export { pluginGenerationReferences } from "./plugin-generations";
+export type { PluginReferenceInventory, PluginReferenceReport, PluginRetentionReason, PluginCollectionState } from "./plugin-references";
 export { builtinGenerationAuthority, builtinChannelGenerationAuthority } from "./builtin-generations";
 export { channelGenerationReferences, resolveChannelBinding } from "./channel-bindings";
 export type { ChannelBinding, ChannelGenerationReference } from "./channel-bindings";

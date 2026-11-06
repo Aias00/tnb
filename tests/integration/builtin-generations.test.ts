@@ -31,7 +31,7 @@ async function fixture() {
     return { identity: { name: manifest.name, version: manifest.version, fingerprint: packed.fingerprint }, package: packed,
       adapters: [{ id: "fixture", version: "1" }], setup() { throw new Error("Inline factory must never run for a packaged builtin"); } };
   }
-  const options = { roots: [{ directory: plugins, source: "user" as const }], trustStorePath: join(root, "trust.json") };
+  const options = { roots: [{ directory: plugins, source: "user" as const }], trustStorePath: join(root, "trust.json"), channelReferences: [] };
   async function open(value: BuiltinAdapterPlugin, extra = {}) {
     const host = await openAgentRuntime({ directory: join(root, "control/runtime"), plugins: { ...options, builtins: [value], ...extra } }); cleanup.push(() => host.close()); return host;
   }
