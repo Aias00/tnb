@@ -41,6 +41,10 @@ test("large foreground output stays bounded, logs its full output and preserves 
   expect(output).toContain("Complete output saved.");
   const path = /Log: (.+?)\. Complete/.exec(output)![1]!;
   expect((await stat(path)).size).toBe(300007);
+});
+
+test("large failed foreground output retains its error tail and nonzero exit", async () => {
+  const { manager } = await fixture();
   await expect(manager.runForeground(command('process.stderr.write("x".repeat(300000)+"FAILED_END");process.exitCode=7'),
     5000, new AbortController().signal)).rejects.toThrow("FAILED_END");
 });
