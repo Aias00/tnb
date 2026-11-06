@@ -88,6 +88,8 @@ export interface Query extends AsyncGenerator<SDKMessage, void, void> {
   updateTask(taskId: string, update: TaskUpdate): Promise<TaskRecord | null>;
   stopTask(taskId: string): Promise<TaskRecord | null>;
   close(): void;
+  /** Await actual child exit after close/abort; close itself remains synchronous. */
+  waitForExit(): Promise<void>;
 }
 
 export type SDKContextUsage = {
@@ -120,6 +122,8 @@ class SubprocessQuery implements Query {
   #inputComplete = false;
   #pendingUserTurns = 0;
   #stderr = "";
+  readonly #exited = Promise.withResolvers<void>();
+  #killTimer?: ReturnType<typeof setTimeout>;
 
   constructor(input: QueryInput) {
     const options = input.options ?? {};
@@ -174,7 +178,9 @@ class SubprocessQuery implements Query {
     this.#child.stderr.setEncoding("utf8");
     this.#child.stderr.on("data", (chunk: string) => { this.#stderr += chunk; });
     this.#child.once("error", (error) => this.#fail(error));
+    this.#child.once("close", () => { clearTimeout(this.#killTimer); this.#exited.resolve(); });
     this.#child.once("exit", (code, signal) => {
+      clearTimeout(this.#killTimer); this.#exited.resolve();
       if (!this.#closed && code !== 0 && !this.#receivedResult) {
         const detail = this.#stderr.trim() || `tnb exited with ${signal ? `signal ${signal}` : `code ${code}`}`;
         this.#fail(new Error(detail));
@@ -306,9 +312,15 @@ class SubprocessQuery implements Query {
     if (this.#closed) return;
     this.#closed = true;
     this.#child.stdin.end();
-    if (this.#child.exitCode === null) this.#child.kill("SIGTERM");
+    if (this.#child.exitCode === null) {
+      this.#child.kill("SIGTERM");
+      this.#killTimer = setTimeout(() => { if (this.#child.exitCode === null) this.#child.kill("SIGKILL"); }, 1000);
+      this.#killTimer.unref();
+    }
     this.#finish();
   }
+
+  waitForExit(): Promise<void> { return this.#exited.promise; }
 
   async #pumpInput(input: AsyncIterable<SDKUserMessage>): Promise<void> {
     try {

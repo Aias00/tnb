@@ -1,6 +1,7 @@
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { digestJson } from "../../services/runtime/json";
 import type { TaskService, WorkspaceTaskService } from "../../agent/task-service";
+import type { ChatService, WorkspaceChatService } from "../../agent/chat-service";
 import { page, script, style } from "./assets";
 
 type Session = { scope: string; expires: number; controller: AbortController; expiry: AbortSignal; streams: Set<AbortController> };
@@ -10,10 +11,11 @@ const headers = { "cache-control": "no-store", "x-content-type-options": "nosnif
   "content-security-policy": "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'" };
 
 /** Browser-facing listener owned by an interface plugin, never the private runtime RPC. */
-export function createWebWorkbench(options: { tasks: TaskService; signal?: AbortSignal; now?: () => number; sessionTtlMs?: number }) {
+export function createWebWorkbench(options: { tasks: TaskService; chats?: ChatService; signal?: AbortSignal; now?: () => number; sessionTtlMs?: number }) {
   const now = options.now ?? Date.now;
   const lifetime = new AbortController(), signal = options.signal ? AbortSignal.any([options.signal, lifetime.signal]) : lifetime.signal;
   const scopes = new Map<string, WorkspaceTaskService>(), tickets = new Map<string, { scope: string; expires: number }>(), sessions = new Map<string, Session>();
+  const conversations = new Map<string, WorkspaceChatService>();
   const pending = new Set<Promise<Response>>();
   let server: ReturnType<typeof Bun.serve> | undefined, origin = "", closing = false;
   let closingPromise: Promise<void> | undefined;
@@ -21,7 +23,7 @@ export function createWebWorkbench(options: { tasks: TaskService; signal?: Abort
   const prune = () => {
     for (const [token, session] of sessions) if (session.expires <= now()) removeSession(token);
     for (const [token, ticket] of tickets) if (ticket.expires <= now()) tickets.delete(token);
-    for (const scope of scopes.keys()) if (![...tickets.values(), ...sessions.values()].some(item => item.scope === scope)) scopes.delete(scope);
+    for (const scope of scopes.keys()) if (![...tickets.values(), ...sessions.values()].some(item => item.scope === scope)) { scopes.delete(scope); conversations.delete(scope); }
   };
   const json = (value: unknown, status = 200, extra: Record<string, string> = {}) => Response.json(value, { status, headers: { ...headers, ...extra } });
   async function handle(request: Request): Promise<Response> {
@@ -56,7 +58,19 @@ export function createWebWorkbench(options: { tasks: TaskService; signal?: Abort
       removeSession(token); return json({ signedOut: true }, 200, { "set-cookie": `tnb_web=; HttpOnly; SameSite=Strict; Path=/w/${scope}/; Max-Age=0` });
     }
     if (request.method === "GET") {
-      if (resource === "api/info") return json(await tasks.info());
+      if (resource === "api/info") return json({ ...await tasks.info(), chat: conversations.has(scope) });
+      const chats = conversations.get(scope);
+      if (resource === "api/chats") return chats ? json(chats.list()) : json({ error: "会话服务不可用" }, 503);
+      const conversation = /^api\/chats\/([^/]+)(\/stream)?$/.exec(resource);
+      if (conversation && chats) {
+        const id = decodeURIComponent(conversation[1]!);
+        if (!conversation[2]) return json(chats.detail(id));
+        if (session.streams.size >= 4) return json({ error: "此会话的实时连接已达上限" }, 429);
+        const controller = new AbortController(), linked = AbortSignal.any([requestSignal, controller.signal]); session.streams.add(controller);
+        const cleanup = () => { session.streams.delete(controller); controller.abort(); };
+        try { const response = chats.watch(id, linked, cleanup); return new Response(response.body, { headers: { ...headers, "content-type": "text/event-stream" } }); }
+        catch (error) { cleanup(); throw error; }
+      }
       if (resource === "api/runs") return json(tasks.list());
       if (resource === "api/attention") {
         if (session.streams.size >= 4) return json({ error: "此会话的实时连接已达上限" }, 429);
@@ -73,12 +87,16 @@ export function createWebWorkbench(options: { tasks: TaskService; signal?: Abort
       if (detail) return json(detail[2] ? tasks.events(decodeURIComponent(detail[1]!), Number(url.searchParams.get("after") ?? 0)) : await tasks.detail(decodeURIComponent(detail[1]!)));
     }
     if (request.method === "POST" && resource === "api/command") return json(await tasks.command(await request.json(), requestSignal));
+    if (request.method === "POST" && resource === "api/chat/command") {
+      const chats = conversations.get(scope); if (!chats) return json({ error: "会话服务不可用" }, 503);
+      return json(await chats.command(await request.json()));
+    }
     return json({ error: "未知工作台接口" }, 404);
   }
   const close = () => closingPromise ??= (async () => {
     closing = true; lifetime.abort();
     for (const token of sessions.keys()) removeSession(token);
-    tickets.clear(); scopes.clear();
+    tickets.clear(); scopes.clear(); conversations.clear();
     // Let abort-driven stream closures reach Bun's HTTP transport before joining stop.
     await new Promise<void>(resolve => setImmediate(resolve));
     await server?.stop(true); await Promise.allSettled([...pending]); server = undefined;
@@ -88,6 +106,7 @@ export function createWebWorkbench(options: { tasks: TaskService; signal?: Abort
       signal.throwIfAborted();
       if (port !== undefined && (!Number.isSafeInteger(port) || port < 0 || port > 65535)) throw new Error("Invalid local HTTP port");
       const tasks = await options.tasks.open(workspace); signal.throwIfAborted(); prune();
+      const chats = options.chats ? await options.chats.open(tasks.workspace) : undefined; signal.throwIfAborted();
       const scope = digestJson(tasks.workspace).slice(0, 32);
       if (!scopes.has(scope) && scopes.size >= 32 || tickets.size >= 64) throw new Error("工作台入口数量已达上限");
       if (server && port && server.port !== port) throw new Error(`工作台已监听 ${server.port}，请使用现有端口`);
@@ -100,7 +119,7 @@ export function createWebWorkbench(options: { tasks: TaskService; signal?: Abort
         });
         origin = `http://127.0.0.1:${server.port}`;
       }
-      scopes.set(scope, tasks); const code = key(); tickets.set(code, { scope, expires: now() + 60_000 });
+      scopes.set(scope, tasks); if (chats) conversations.set(scope, chats); const code = key(); tickets.set(code, { scope, expires: now() + 60_000 });
       return { url: `${origin}/w/${scope}/#code=${code}`, workspace: tasks.workspace, origin };
     },
     close,

@@ -7,6 +7,8 @@ import { runtimeRequest } from "../services/runtime/server";
 const HELP = `Usage: tnb web [--cwd PATH] [--port N] [--config-dir PATH] [--json] [--no-start]
 
 Launch the local web interface plugin for this workspace. The default port is random.
+The home view supports continuous Coding conversations, streamed replies and tool approvals.
+Background tasks remain available alongside conversations.
 Prints a one-use browser link (valid for 60 seconds); the runtime key stays on the host.
 The same durable owner keeps tasks running after the terminal or browser closes.
 Run this command again to open another workspace or reconnect after owner restart.

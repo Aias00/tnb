@@ -8,6 +8,15 @@ import { SessionStore } from "../../src/services/session/storage";
 const roots: string[] = [];
 afterEach(async () => { await Promise.all(roots.splice(0).map(path => rm(path, { recursive: true, force: true }))); });
 
+test("SDK close waits for actual child exit and escalates an ignored termination request", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tnb-sdk-owned-exit-")); roots.push(root);
+  const fixture = join(root, "child.ts");
+  await writeFile(fixture, 'process.on("SIGTERM",()=>{});console.log(JSON.stringify({type:"system",pid:process.pid}));setInterval(()=>{},1000);');
+  const q = query({ prompt: "wait", options: { pathToTnbExecutable: process.execPath, executableArgs: [fixture] } });
+  const first = await q.next(); const pid = Number(first.value?.pid); q.close();
+  await q.waitForExit(); expect(() => process.kill(pid, 0)).toThrow();
+});
+
 test("SDK abort terminates a single-turn child without requiring bidirectional control", async () => {
   const root = await mkdtemp(join(tmpdir(), "tnb-sdk-abort-")); roots.push(root);
   const fixture = join(root, "child.ts"), pidFile = join(root, "pid");

@@ -61,6 +61,8 @@ export type { AgentPluginOptions, AdapterPluginAPI, AdapterPluginFactory, Adapte
 export { loadHostPlugins } from "./plugins";
 export type { TaskService, WorkspaceTaskService } from "./task-service";
 export { TASK_SERVICE, TASK_SERVICE_REF } from "./task-service";
+export { CHAT_SERVICE, CHAT_SERVICE_REF } from "./chat-service";
+export type { ChatService, WorkspaceChatService, ChatSummary, ChatMessage, ChatApproval, ChatSnapshot } from "./chat-service";
 export type { HostPluginAPI, HostPluginFactory, BuiltinHostPlugin, HostPluginOptions, HostPluginState } from "./plugins";
 export type { PluginGenerationReference } from "./plugin-generations";
 export { builtinGenerationAuthority, builtinChannelGenerationAuthority } from "./builtin-generations";

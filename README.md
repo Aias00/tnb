@@ -640,4 +640,4 @@ self-update manifest alongside the binary and `SHA256SUMS`.
 
 持久任务可通过 `--skill NAME`、`--mcp-tool NAME` 显式选择额外能力，详见 [长任务 skills 与 MCP](docs/guides/durable-capabilities.md)。
 
-网页工作台：`tnb web` 在当前目录打开同一持久任务的网页入口，支持实时问题提醒、任务控制和结果查看，见 [使用说明](docs/guides/web-workbench.md)。
+网页工作台：`tnb web` 默认进入 Coding 对话，支持连续提问、流式回复、工具执行和逐次审批，也可切换历史对话或转为后台任务。原有实时问题提醒、任务控制和结果查看仍保留，见 [使用说明](docs/guides/web-workbench.md)。

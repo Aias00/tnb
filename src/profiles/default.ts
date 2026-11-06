@@ -20,6 +20,8 @@ import { RuntimeStore } from "../services/runtime/store";
 import { builtinGenerationAuthority, builtinChannelGenerationAuthority } from "../agent/builtin-generations";
 import { migrateCollaborationChannels, collaborationChannelReferences } from "../services/collaboration/channels";
 import { createDurableCapabilityHost } from "../adapters/coding/capabilities";
+import { CHAT_SERVICE, CHAT_SERVICE_REF } from "../agent/chat-service";
+import { createChatService } from "../services/workbench/chat";
 
 /** Product composition only; the generic plugin host knows neither Coding nor collaboration. */
 export async function loadDefaultProfile(options: { configDir: string; root: string; env: Record<string, string | undefined>; coding: boolean; runtime?: DurableRuntime }) {
@@ -43,6 +45,10 @@ export async function loadDefaultProfile(options: { configDir: string; root: str
   } finally { if (!options.runtime) referenceStore.close(); }
   return { plugins, async start(runtime: DurableRuntime, signal?: AbortSignal) {
     await plugins.extensions.start({ store: runtime.store, signal, configuration: settings.pluginConfiguration, serviceProviders: [
+      provideService(CHAT_SERVICE_REF, scope => {
+        const chats = createChatService({ store: runtime.store, configDir, env, signal: scope.signal, track: scope.track });
+        scope.onDispose(chats.close); return chats.service;
+      }),
       provideService(COLLABORATION_SERVICE_REF, scope => {
         const factory = createCollaborationService(runtime, config, plugins.extensions.channels, scope.signal, scope.track);
         return { open(signal) { const service = factory.open(AbortSignal.any([signal, scope.signal])); scope.onDispose(service.close); return service; } };
@@ -54,7 +60,7 @@ export async function loadDefaultProfile(options: { configDir: string; root: str
       } })),
       provideService(TASK_SERVICE_REF, scope => createTaskService({ runtime, configDir, env, coding: runtime.domains.has("coding", "1"), signal: scope.signal, track: scope.track })),
       provideService(RUNTIME_READ_SERVICE_REF, () => ({ runs: () => runtime.store.runs(), status: (runId: string) => ({ run: runtime.store.getRun(runId), tasks: runtime.store.tasks(runId) }), configuration: (runId: string) => runtime.configuration(runId) })),
-    ], grants: { "tnb-collaboration": [COLLABORATION_SERVICE, CHANNEL_SERVICE], "tnb-web": [TASK_SERVICE], ...settings.pluginServices } });
+    ], grants: { "tnb-collaboration": [COLLABORATION_SERVICE, CHANNEL_SERVICE], "tnb-web": [TASK_SERVICE, CHAT_SERVICE], ...settings.pluginServices } });
     if (config.enabled && settings.enabledPlugins?.["tnb-collaboration"] !== false) {
       const state = plugins.extensions.list().find(item => item.kind === "application" && item.id === "collaboration" && item.version === "1");
       if (state?.status !== "active") throw new Error(`Collaboration application unavailable: ${state?.error ?? "disabled, untrusted or failed to register"}`);

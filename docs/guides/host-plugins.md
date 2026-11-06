@@ -79,7 +79,7 @@ Coding 持久 Worker 记录选中 Skill/MCP 的包来源，在授权以及 Skill
 
 这些机制不提供任意进程内代码的强制热撤销。已加载的交互 Hook、Skill 和 MCP 仍需资源刷新或重启；后台可执行包选择也在重启时更新。已发出的网络请求或子进程效果不能通过撤权回滚。外部插件工具现有 HTTP 目标约束、调用取消/排空和读取限额见[运行合同](plugin-tool-runtime.md)；其保证不自动延伸到任意进程内代码或其他 MCP/Channel 传输。
 
-默认产品 profile 在一个宿主内组合 `tnb-coding`、`tnb-channels`、`tnb-collaboration`、`tnb-web`。这些包也在构建产物的 dist/plugins 下提供可安装包，运行中的内置版本和安装版本走相同注册与生命周期。停用协作插件不会删除工单、通知或原 Run。
+默认产品 profile 在一个宿主内组合 `tnb-coding`、`tnb-channels`、`tnb-collaboration`、`tnb-web`。这些包也在构建产物的 dist/plugins 下提供可安装包，运行中的内置版本和安装版本走相同注册与生命周期。停用协作插件不会删除工单、通知或原 Run。Web 默认进入普通 Coding 对话，通过类型化 `tnb.chat/v1` 接入终端执行器，并保留 `tnb.tasks/v1` 后台任务入口，见[网页指南](web-workbench.md)。
 
 领域包和渠道支持历史可执行代际留存，inventory 显示 current/retained 和引用数。安装包受安装、启用、信任和兼容性约束；默认 Coding/channels 使用嵌入包和宿主私有批准。任务和来源保留原指纹，不把历史实现作为默认回退。详见 [领域安装包](plugin-generations.md)、[默认 Coding](builtin-generations.md) 和 [渠道来源恢复](channel-generations.md)；自定义 inline factory 和历史应用/界面不在此恢复范围。
 

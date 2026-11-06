@@ -1,12 +1,13 @@
 import packageJson from "../../../package.json";
 import type { BuiltinHostPlugin, HostPluginFactory } from "../../agent/plugins";
 import { TASK_SERVICE, TASK_SERVICE_REF } from "../../agent/task-service";
+import { CHAT_SERVICE, CHAT_SERVICE_REF } from "../../agent/chat-service";
 import { hostCodeFingerprint } from "../../agent/plugin-fingerprint";
 import { createWebWorkbench } from "./server";
 
 export const WEB_EXTENSION = { kind: "interface" as const, id: "web", version: "1" };
 export const webSetup: HostPluginFactory = api => api.registerInterface({ id: "web", version: "1", start(context) {
-  const workbench = createWebWorkbench({ tasks: context.service(TASK_SERVICE_REF), signal: context.signal });
+  const workbench = createWebWorkbench({ tasks: context.service(TASK_SERVICE_REF), chats: context.service(CHAT_SERVICE_REF), signal: context.signal });
   context.onDispose(workbench.close);
   return { status: workbench.status, async handle(request) {
     if (request.method === "GET") return Response.json(workbench.status());
@@ -18,6 +19,6 @@ export const webSetup: HostPluginFactory = api => api.registerInterface({ id: "w
 } });
 export async function createWebPlugin(): Promise<BuiltinHostPlugin> {
   return { identity: { name: "tnb-web", version: packageJson.version, fingerprint: await hostCodeFingerprint() },
-    extensions: [{ ...WEB_EXTENSION, entry: "index.mjs", services: [TASK_SERVICE], requires: [] }], setup: webSetup };
+    extensions: [{ ...WEB_EXTENSION, entry: "index.mjs", services: [TASK_SERVICE, CHAT_SERVICE], requires: [] }], setup: webSetup };
 }
 export default webSetup;

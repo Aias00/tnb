@@ -40,7 +40,9 @@ export function createTaskService(options: { runtime: DurableRuntime; configDir:
         const catalog = await loadProviderCatalog(options);
         assertLive();
         const models = Object.values(catalog.providers).flatMap(provider => provider.models.map(model => ({ provider: provider.id, providerName: provider.name, id: model.id, name: model.name })));
-        const first = models.find(model => model.provider === options.env.TNB_PROVIDER && (!options.env.TNB_MODEL || model.id === options.env.TNB_MODEL)) ?? models[0];
+        const ready = Object.values(catalog.providers).find(provider => provider.apiKey || !["anthropic", "openai"].includes(provider.id));
+        const first = models.find(model => model.provider === options.env.TNB_PROVIDER && (!options.env.TNB_MODEL || model.id === options.env.TNB_MODEL))
+          ?? models.find(model => model.provider === ready?.id) ?? models[0];
         return { workspace, coding: options.coding, models, defaults: { provider: first?.provider ?? "", model: first?.id ?? "" } };
       }),
       list: () => { assertLive(); return presentRuns(runtime, workspace); },
