@@ -317,10 +317,12 @@ test("small terminal keeps selected completions, prompt and footer visible throu
     await ui.send("read @file");
     await until(() => ui.screen().includes("@file-0.ts"));
     await ui.send("\u001b[B".repeat(15));
+    await until(() => ui.screen().includes("@file-15.ts"));
     expect(ui.screen()).toContain("@file-15.ts");
     expect(ui.screen()).toContain("read @file");
     expect(ui.screen().split("\n").at(-1)).toContain("test");
     await ui.resize(90, 24);
+    await until(() => ui.screen().includes("@file-15.ts"));
     expect(ui.screen()).toContain("@file-15.ts");
     await ui.send("\u001b");
     expect(ui.screen()).toContain("read @file");
