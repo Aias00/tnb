@@ -6,6 +6,7 @@ import { digestJson } from "../services/runtime/json";
 import { computePluginTreeSha256 } from "../services/plugins/trust";
 import { loadPlugins, type LoadedPlugin } from "../services/plugins/loader";
 import { validateDomainDescriptor, type AdapterPluginIdentity, type DomainDescriptor } from "./domain";
+import { PluginRecoveryError } from "./plugin-recovery-error";
 
 export type PluginGenerationReference = { plugin: AdapterPluginIdentity; adapter: { id: string; version: string }; runId: string; taskId?: string; load: boolean };
 type GenerationMetadata = { version: 1; identity: AdapterPluginIdentity; origin: string; origins?: string[] };
@@ -76,6 +77,14 @@ async function syncTree(directory: string): Promise<void> {
 
 /** Revalidate both package bytes and current host compatibility before any import. */
 export async function readRetainedPlugin(root: string, identity: AdapterPluginIdentity): Promise<{ plugin: LoadedPlugin; origin: string; origins: string[] }> {
+  try { return await readRetainedPluginEvidence(root, identity); }
+  catch (error) {
+    if (error instanceof PluginRecoveryError) throw error;
+    if (missing(error)) throw new PluginRecoveryError("PLUGIN_ARCHIVE_MISSING", "archive", "Retained plugin generation is missing");
+    throw new PluginRecoveryError("PLUGIN_ARCHIVE_DAMAGED", "archive", error instanceof SyntaxError ? "Invalid retained plugin metadata JSON" : error instanceof Error ? error.message : "Invalid retained plugin evidence");
+  }
+}
+async function readRetainedPluginEvidence(root: string, identity: AdapterPluginIdentity): Promise<{ plugin: LoadedPlugin; origin: string; origins: string[] }> {
   await assertHistoryRoot(root);
   const directory = join(root, pluginGenerationKey(identity));
   if ((await lstat(directory)).isSymbolicLink()) throw new Error("Retained plugin directory cannot be a symbolic link");
@@ -89,7 +98,7 @@ export async function readRetainedPlugin(root: string, identity: AdapterPluginId
   const loaded = await loadPlugins([{ directory, source: "user" }]);
   const canonicalRoot = await realpath(packageRoot);
   const plugin = loaded.plugins.find(item => item.root === canonicalRoot);
-  if (!plugin || plugin.name !== identity.name || plugin.version !== identity.version) throw new Error(loaded.errors[0]?.error ?? "Retained plugin manifest does not match pinned identity");
+  if (!plugin || plugin.name !== identity.name || plugin.version !== identity.version) throw new PluginRecoveryError("PLUGIN_HOST_INCOMPATIBLE", "archive", loaded.errors[0]?.error ?? "Retained plugin manifest does not match pinned identity");
   return { plugin: { ...plugin, fingerprint: identity.fingerprint }, origin: metadata.origin, origins: metadata.origins ?? [metadata.origin] };
 }
 
@@ -107,4 +116,4 @@ async function assertHistoryRoot(root: string): Promise<void> {
   const info = await lstat(root);
   if (!info.isDirectory() || info.isSymbolicLink()) throw new Error("Plugin history must be a real directory");
 }
-function missing(error: unknown): boolean { return !!error && typeof error === "object" && "code" in error && error.code === "ENOENT"; }
+function missing(error: unknown): boolean { return !!error && typeof error === "object" && "code" in error && (error.code === "ENOENT" || error.code === "PLUGIN_ARCHIVE_MISSING"); }

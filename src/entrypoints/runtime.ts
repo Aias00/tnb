@@ -32,6 +32,7 @@ backup-check <directory>  Read-only verification of saved evidence and plugin as
 storage  Show state size and free disk space.
 plugins  Show the running host's built-in and installed domain plugin generations.
 plugins --references  Explain current Run/task/Source retention and startup collection status.
+plugins --check  Inspect local recovery bytes, trust, approval/ABI and pinned declarations; never runs plugin code.
 
 All actions accept --config-dir PATH. Submitting starts a persistent local service;
 closing the client does not cancel accepted work. Checks are explicitly authorized
@@ -83,7 +84,10 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
     if (action === "submit" && !args.includes("--no-start")) await ensureRuntime(configDir, options.env);
     let result: unknown;
     if (action === "list") result = await runtimeRequest(configDir, "/runs");
-    else if (action === "plugins") result = await runtimeRequest(configDir, args.includes("--references") ? "/plugins/references" : "/plugins");
+    else if (action === "plugins") {
+      if (args.includes("--check") && args.includes("--references")) throw new Error("Choose --check or --references");
+      result = await runtimeRequest(configDir, args.includes("--check") ? "/plugins/recovery" : args.includes("--references") ? "/plugins/references" : "/plugins");
+    }
     else if (action === "routing") {
       const query = new URLSearchParams({ workspace: await realpath(resolve(value("--cwd") ?? options.cwd)), pending: String(args.includes("--pending")) });
       if (value("--before-input")) query.set("beforeInput", value("--before-input")!);
@@ -159,6 +163,7 @@ export async function runRuntimeChatCommand(options: RuntimeChatOptions): Promis
   const hasTarget = ["followup", "submit", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel", "backup-check"].includes(action);
   for (let index = hasTarget ? 2 : 1; index < args.length; index++) {
     const flag = args[index]!;
+    if (action === "plugins" && flag === "--check") continue;
     if (valueFlags.has(flag)) { if (!args[index + 1] || args[index + 1]!.startsWith("--")) throw new Error(`${flag} requires a value`); index++; }
     else if (!flags.has(flag)) throw new Error(`Unexpected argument ${flag}; quote the objective and use supported runtime options`);
   }

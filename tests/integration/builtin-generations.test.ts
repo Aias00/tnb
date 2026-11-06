@@ -46,12 +46,14 @@ async function until(host: AgentRuntimeHost, predicate: () => boolean) {
 test("packaged builtins execute their archived bytes, require independent host approval, and honor exact fingerprint blocks", async () => {
   const f = await fixture(), first = await f.builtin(), store = new RuntimeStore(":memory:"); cleanup.push(async () => store.close());
   const snapshot = join(f.root, "state", "plugin-snapshots"), authority = builtinGenerationAuthority(store);
+  expect(authority.inspect?.(first.identity)).toBe("missing");
   async function load(value: BuiltinAdapterPlugin, extra = {}) {
     const host = await loadHostPlugins({ ...f.options, builtins: [value], builtinAuthority: authority, generationReferences: pluginGenerationReferences(store), ...extra }, [], snapshot);
     cleanup.push(() => host.close()); return host;
   }
   let host = await load(first); expect(host.list()[0], JSON.stringify(host.list())).toMatchObject({ status: "active", root: "builtin:builtin-fixture" });
   expect(authority.approved(first.identity)).toBe(true);
+  expect(authority.inspect?.(first.identity)).toBe("approved");
   const pinned = new DomainRegistry([], host.registrations).prepare(descriptor()), commands = new RuntimeCommands(store);
   commands.createRun({ commandId: "keep", objective: "Keep old code", configuration: { domain: pinned } }); await host.close();
   const second = await f.builtin(f.original.replaceAll("actual plugin fact", "updated plugin fact"));
@@ -60,9 +62,19 @@ test("packaged builtins execute their archived bytes, require independent host a
   host = await load(second, { blockedFingerprints: [first.identity.fingerprint] }); expect(host.list().find(item => item.generation === "retained")?.error).toContain("blocked by host policy"); await host.close();
   host = await load(second, { enabled: { "builtin-fixture": false } }); expect(host.list().find(item => item.generation === "retained")?.status).toBe("blocked"); await host.close();
   host = await load(second, { builtinAuthority: { approved: () => false, approve() {} } }); expect(host.list().find(item => item.generation === "retained")?.error).toContain("approval or recovery ABI"); await host.close();
+  const emptyApprovals = new RuntimeStore(":memory:"); cleanup.push(async () => emptyApprovals.close());
+  host = await load(second, { builtinAuthority: builtinGenerationAuthority(emptyApprovals) });
+  const evidence = emptyApprovals.snapshot();
+  expect((await host.checkRecovery({ generationReferences: pluginGenerationReferences(store), channelReferences: [] })).generations[0]?.diagnostics[0]?.code).toBe("PLUGIN_BUILTIN_APPROVAL_MISSING");
+  expect(emptyApprovals.snapshot()).toEqual(evidence); expect(emptyApprovals.applicationRecord("host.builtin-generations", pluginGenerationKey(first.identity))).toBeUndefined();
+  await host.close();
   const approval = store.applicationRecord<{ identity: unknown; abi: { bun: string } }>("host.builtin-generations", pluginGenerationKey(first.identity))!;
   store.command("abi-change", {}, Date.now(), tx => tx.saveApplicationRecord({ ...approval, value: { ...approval.value, abi: { ...approval.value.abi, bun: "incompatible" } } }, approval.revision));
-  host = await load(second); expect(host.list().find(item => item.generation === "retained")?.error).toContain("approval or recovery ABI"); await host.close();
+  host = await load(second); expect(host.list().find(item => item.generation === "retained")?.error).toContain("approval or recovery ABI");
+  expect(authority.inspect?.(first.identity)).toBe("abi-incompatible");
+  expect((await host.checkRecovery({ generationReferences: pluginGenerationReferences(store), channelReferences: [] })).generations[0]?.diagnostics[0]?.code).toBe("PLUGIN_BUILTIN_ABI_INCOMPATIBLE");
+  expect(host.list().find(item => item.generation === "retained")?.recoveryDiagnostic?.code).toBe("PLUGIN_BUILTIN_ABI_INCOMPATIBLE");
+  await host.close();
   const archive = join(f.root, "state", "plugin-generations", pluginGenerationKey(first.identity), "package", "index.mjs");
   await writeFile(archive, "throw new Error('tampered old builtin must not execute');");
   host = await load(second); expect(host.list().find(item => item.generation === "retained")?.error).toContain("fingerprint mismatch"); await host.close();

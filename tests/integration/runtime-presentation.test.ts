@@ -13,6 +13,7 @@ import { COLLABORATION_CHANNEL_OWNER } from "../../src/services/collaboration/ch
 import { sourceIdentity } from "../../src/services/collaboration/config";
 import { runRuntimeCommand, runRuntimeChatCommand } from "../../src/entrypoints/runtime";
 import type { PluginReferenceReport } from "../../src/agent/plugin-references";
+import type { PluginRecoveryReport } from "../../src/agent/plugin-recovery";
 import type { Source } from "../../src/services/collaboration/types";
 const cleanup: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const close of cleanup.splice(0).reverse()) await close(); });
@@ -51,6 +52,16 @@ test("plugin reference API, CLI and slash command use live bindings and the owne
   expect(JSON.parse(slash)).toEqual(report);
   expect(await runtimeRequest(f.configDir, "/plugins/references")).toEqual(report);
   expect(Array.isArray(await runtimeRequest(f.configDir, "/plugins"))).toBe(true); // Existing inventory API stays compatible.
+  output = "";
+  expect(await runRuntimeCommand({ argv: ["runtime", "plugins", "--check", "--config-dir", f.configDir], cwd: f.workspace, env: {},
+    stdout: { write(value) { output += value; } }, stderr: { write(value) { error += value; } } })).toBe(0);
+  const recovery: PluginRecoveryReport = JSON.parse(output);
+  expect(recovery.status).toBe("issues-found");
+  expect(recovery.references).toEqual(report);
+  expect(recovery.generations[0]?.diagnostics[0]?.code).toBe("PLUGIN_ARCHIVE_MISSING");
+  expect(await runtimeRequest(f.configDir, "/plugins/recovery")).toEqual(recovery);
+  expect(JSON.parse(await runRuntimeChatCommand({ args: ["plugins", "--check"], configDir: f.configDir, cwd: f.workspace, workspace: f.workspace, env: {}, provider: "fixture", model: "fixture", sessionId: "session" }))).toEqual(recovery);
+  await expect(runRuntimeChatCommand({ args: ["plugins", "--check", "--references"], configDir: f.configDir, cwd: f.workspace, workspace: f.workspace, env: {}, provider: "fixture", model: "fixture", sessionId: "session" })).rejects.toThrow("Choose --check or --references");
 });
 test("live presentation and controls remain workspace scoped; saved followups are distinct from delivery and completion", async () => {
   const f = await fixture(), release = await acquireWorkspace(f.workspace); let released = false; cleanup.push(async () => { if (!released) await release(); });

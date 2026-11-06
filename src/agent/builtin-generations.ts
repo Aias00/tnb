@@ -6,7 +6,8 @@ import { pluginGenerationKey } from "./plugin-generations";
 const namespace = "host.builtin-generations";
 export const builtinRecoveryABI = () => ({ protocol: "tnb.domain/v1", bun: Bun.version, platform: process.platform, arch: process.arch });
 export const channelRecoveryABI = () => ({ protocol: "tnb.channel/v1", bun: Bun.version, platform: process.platform, arch: process.arch });
-export type BuiltinGenerationAuthority = { approved(identity: AdapterPluginIdentity): boolean; approve(identity: AdapterPluginIdentity): void };
+export type BuiltinApprovalStatus = "approved" | "missing" | "abi-incompatible" | "identity-mismatch";
+export type BuiltinGenerationAuthority = { approved(identity: AdapterPluginIdentity): boolean; approve(identity: AdapterPluginIdentity): void; inspect?(identity: AdapterPluginIdentity): BuiltinApprovalStatus };
 
 /** Separate host fact; archive metadata alone cannot grant a package builtin privileges. */
 export function builtinGenerationAuthority(store: RuntimeStore): BuiltinGenerationAuthority {
@@ -16,11 +17,16 @@ export function builtinChannelGenerationAuthority(store: RuntimeStore): BuiltinG
   return generationAuthority(store, "host.builtin-channels", channelRecoveryABI());
 }
 function generationAuthority(store: RuntimeStore, namespace: string, abi: ReturnType<typeof builtinRecoveryABI>): BuiltinGenerationAuthority {
+  const inspect = (identity: AdapterPluginIdentity): BuiltinApprovalStatus => {
+    const value = store.applicationRecord<{ identity?: AdapterPluginIdentity; abi?: unknown }>(namespace, pluginGenerationKey(identity))?.value;
+    if (!value) return "missing";
+    if (digestJson(value.identity ?? null) !== digestJson(identity)) return "identity-mismatch";
+    if (digestJson(value) !== digestJson({ identity, abi })) return "abi-incompatible";
+    return "approved";
+  };
   return Object.freeze({
-    approved(identity: AdapterPluginIdentity) {
-      const value = store.applicationRecord(namespace, pluginGenerationKey(identity))?.value;
-      return !!value && digestJson(value) === digestJson({ identity, abi });
-    },
+    inspect,
+    approved: (identity: AdapterPluginIdentity) => inspect(identity) === "approved",
     approve(identity: AdapterPluginIdentity) {
       const id = pluginGenerationKey(identity), value = { identity, abi };
       const existing = store.applicationRecord(namespace, id);

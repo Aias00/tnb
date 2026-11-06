@@ -28,7 +28,7 @@ export const RUNTIME_CAPABILITIES = Object.freeze({ protocol: 2, defaultMode: "a
   durableWaits: true, durableDelegation: true, deadlineScheduling: true, questionNotifications: true, lifecycleNotifications: true, adjustableLimits: true,
   taskRouting: true, safeFollowups: true, delegationStrategyVersion: 2, defaultDelegationDepth: 1, autoParallelBranches: 2,
   structuredChildReports: true, machineModelCoordination: true, overlappingWorkspaceLocks: true,
-  domainAdapters: true, codingPlugin: true, pluginInventory: true, collaborationProfile: true, hostPluginExtensions: true, webWorkbench: true, workspaceTaskApi: true });
+  domainAdapters: true, codingPlugin: true, pluginInventory: true, pluginRecoveryCheck: true, collaborationProfile: true, hostPluginExtensions: true, webWorkbench: true, workspaceTaskApi: true });
 export async function serveDurableRuntime(options: ServerOptions): Promise<void> {
   const paths = await runtimePaths(options.configDir);
   const release = await lock(paths.root, { realpath: true, stale: 5000, update: 1000, retries: 0 });
@@ -81,6 +81,7 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
           }
           if (url.pathname === "/plugins") return Response.json(plugins?.list() ?? []);
           if (request.method === "GET" && url.pathname === "/plugins/references") return Response.json(profile.references(store));
+          if (request.method === "GET" && url.pathname === "/plugins/recovery") return Response.json(await profile.checkRecovery(store));
           if (request.method === "GET") {
             if (url.pathname === "/presentation") {
               const workspace = await realpath(url.searchParams.get("workspace") ?? ""); const runId = url.searchParams.get("runId");

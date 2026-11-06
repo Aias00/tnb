@@ -85,6 +85,8 @@ Coding 持久 Worker 记录选中 Skill/MCP 的包来源，在授权以及 Skill
 
 `tnb runtime plugins --references` 提供实时引用理由；SDK 使用 `host.plugins.references()`。直接 `loadHostPlugins` 时，启动回收必须明确提供领域和渠道两类完整清单，省略表示未知，见[引用与回收指南](plugin-references.md)。
 
+`tnb runtime plugins --check` 和 SDK `host.plugins.checkRecovery()` 检查本地归档、来源、信任、内置批准/ABI 及原贡献声明，复用实际历史加载规则；不执行 factory 或状态迁移，见[本地恢复预检](plugin-recovery-check.md)。
+
 ## 服务、状态和依赖
 
 应用/交互的 `start(context)` 返回可选 `handle(Request)`、`status()`。context 提供：

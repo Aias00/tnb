@@ -44,6 +44,7 @@ export async function openAgentRuntime(options: { directory: string; adapters?: 
     if (options.signal?.aborted) { await close(); options.signal.throwIfAborted(); }
     return { runtime, store, submit: runtime.submitDomain.bind(runtime), plugins: { list: () => plugins?.list() ?? [], extensions: () => plugins?.extensions.list() ?? [],
         references: () => plugins ? plugins.references(references()) : pluginReferenceReport(references(), [], { phase: "startup", status: "disabled", reason: "no-history-root" }),
+        checkRecovery: async () => { if (!plugins) throw new Error("No host plugins are loaded"); return plugins.checkRecovery(references()); },
         request: (ref: ContributionReference, request: Request) => { if (!plugins) throw new Error("No host plugins are loaded"); return plugins.extensions.handle(ref, request); }, channels: plugins?.extensions.channels }, close };
 
   } catch (error) {
@@ -69,10 +70,12 @@ export type { HostPluginAPI, HostPluginFactory, BuiltinHostPlugin, HostPluginOpt
 export type { PluginGenerationReference } from "./plugin-generations";
 export { pluginGenerationReferences } from "./plugin-generations";
 export type { PluginReferenceInventory, PluginReferenceReport, PluginRetentionReason, PluginCollectionState } from "./plugin-references";
+export type { PluginRecoveryReport, PluginRecoveryDiagnostic } from "./plugin-recovery";
+export type { PluginRecoveryCode, PluginRecoveryPhase } from "./plugin-recovery-error";
 export { builtinGenerationAuthority, builtinChannelGenerationAuthority } from "./builtin-generations";
 export { channelGenerationReferences, resolveChannelBinding } from "./channel-bindings";
 export type { ChannelBinding, ChannelGenerationReference } from "./channel-bindings";
-export type { BuiltinGenerationAuthority } from "./builtin-generations";
+export type { BuiltinGenerationAuthority, BuiltinApprovalStatus } from "./builtin-generations";
 export type { PackedPlugin } from "./packed-plugin";
 export type { PluginApplication, PluginInterface, PluginChannel, ExtensionContext, ActiveExtension, ChannelPort, ChannelDescriptor, ChannelRegistry, PluginStateStore, ContributionReference, ExtensionState } from "./extensions";
 

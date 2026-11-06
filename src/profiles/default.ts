@@ -45,6 +45,7 @@ export async function loadDefaultProfile(options: { configDir: string; root: str
   } finally { if (!options.runtime) referenceStore.close(); }
   return { plugins,
     references: (store: RuntimeStore) => plugins.references({ generationReferences: pluginGenerationReferences(store), channelReferences: collaborationChannelReferences(store, config) }),
+    checkRecovery: (store: RuntimeStore) => plugins.checkRecovery({ generationReferences: pluginGenerationReferences(store), channelReferences: collaborationChannelReferences(store, config) }),
     async start(runtime: DurableRuntime, signal?: AbortSignal) {
     await plugins.extensions.start({ store: runtime.store, signal, configuration: settings.pluginConfiguration, serviceProviders: [
       provideService(CHAT_SERVICE_REF, scope => {

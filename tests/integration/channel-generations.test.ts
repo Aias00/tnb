@@ -10,7 +10,7 @@ import { channelGenerationReferences, resolveChannelBinding } from "../../src/ag
 import { builtinChannelGenerationAuthority } from "../../src/agent/builtin-generations";
 import { packPlugin } from "../../src/agent/packed-plugin";
 import type { ChannelDescriptor } from "../../src/agent/extensions";
-import { pluginGenerationKey } from "../../src/agent/plugin-generations";
+import { pluginGenerationKey, retainPluginGeneration } from "../../src/agent/plugin-generations";
 import { createCollaborationPlugin, COLLABORATION_EXTENSION, CHANNEL_SERVICE } from "../../src/plugins/collaboration/plugin";
 import { COLLABORATION_SERVICE, COLLABORATION_SERVICE_REF } from "../../src/agent/collaboration-service";
 import { CHANNEL_SERVICE_REF } from "../../src/agent/channel-service";
@@ -54,6 +54,86 @@ async function fixture(app = true, dependent = false) {
   return { root, source, installed: installed.root, store, options, authority, code, load, events, manifest };
 }
 const reference = { id: "fixture-channel", version: "1" };
+
+test("recovery inspection uses current files without importing plugins, writing state or activating a changed package", async () => {
+  const f = await fixture(false); await trustPlugin(f.options.trustStorePath, f.installed); const host = await f.load();
+  resolveChannelBinding(f.store, "application", "source", "transport", reference, host.extensions.channels);
+  const inventory = { generationReferences: [], channelReferences: channelGenerationReferences(f.store) };
+  const evidence = f.store.snapshot(), events = await f.events();
+  const first = host.checkRecovery(inventory), joined = host.checkRecovery(inventory);
+  await expect(host.checkRecovery({})).rejects.toThrow("PLUGIN_CHECK_BUSY");
+  let [report, copy] = await Promise.all([first, joined]);
+  expect(copy).toEqual(report); copy.generations[0]!.plugin.name = "mutated"; expect(report.generations[0]!.plugin.name).toBe(f.manifest.name);
+  expect(report.status).toBe("local-checks-passed"); expect(report.generations[0]?.status).toBe("local-checks-passed");
+  expect(report.unchecked).toContain("configuration-and-state-migrations");
+  expect(report.unchecked).toContain("credentials-and-remote-services");
+  expect(f.store.snapshot()).toEqual(evidence); expect(await f.events()).toEqual(events);
+  await f.code(f.installed, "new");
+  report = await host.checkRecovery(inventory);
+  expect(report.generations[0]?.diagnostics[0]?.code).toBe("PLUGIN_INSTALLATION_UNAVAILABLE");
+  expect(host.list()[0]?.status).toBe("active"); // The running immutable snapshot has not been replaced.
+  await trustPlugin(f.options.trustStorePath, f.installed);
+  expect((await host.checkRecovery(inventory)).status).toBe("local-checks-passed");
+  expect(await f.events()).toEqual(events); expect(f.store.snapshot()).toEqual(evidence);
+  expect((await host.checkRecovery({})).diagnostics[0]?.code).toBe("PLUGIN_INVENTORY_INCOMPLETE");
+  const checking = host.checkRecovery(inventory), closing = host.close();
+  await expect(checking).rejects.toThrow(); await closing;
+  await expect(host.checkRecovery(inventory)).rejects.toThrow("closing");
+});
+
+for (const mode of ["missing", "damaged", "revoked", "disabled", "blocked", "origin"] as const) {
+  test(`preflight and actual retained loading agree on ${mode} evidence`, async () => {
+    const f = await fixture(false); await trustPlugin(f.options.trustStorePath, f.installed); let host = await f.load();
+    const old = resolveChannelBinding(f.store, "application", "source", "transport", reference, host.extensions.channels); await host.close();
+    await f.code(f.installed, "new"); await trustPlugin(f.options.trustStorePath, f.installed);
+    const archive = join(f.root, "state", "plugin-generations", pluginGenerationKey(old.plugin!));
+    if (mode === "missing") await rm(archive, { recursive: true });
+    if (mode === "damaged") await writeFile(join(archive, "package", "index.mjs"), "throw new Error('secret must not be echoed');");
+    if (mode === "revoked") { await revokePluginTrust(f.options.trustStorePath, f.installed); await trustPlugin(f.options.trustStorePath, f.installed); }
+    if (mode === "origin") await writeFile(join(archive, "generation.json"), JSON.stringify({ version: 1, identity: old.plugin, origin: "changed-origin" }));
+    host = await f.load({ ...(mode === "disabled" ? { enabled: { "fixture-channel": false } } : {}), ...(mode === "blocked" ? { blockedFingerprints: [old.plugin!.fingerprint] } : {}) });
+    const before = await f.events();
+    const report = await host.checkRecovery({ generationReferences: [], channelReferences: channelGenerationReferences(f.store) });
+    const expected = ({ missing: "PLUGIN_ARCHIVE_MISSING", damaged: "PLUGIN_ARCHIVE_DAMAGED", revoked: "PLUGIN_GENERATION_UNTRUSTED", disabled: "PLUGIN_INSTALLATION_UNAVAILABLE", blocked: "PLUGIN_FINGERPRINT_BLOCKED", origin: "PLUGIN_INSTALLATION_ORIGIN_CHANGED" } as const)[mode];
+    expect(report.status).toBe("issues-found");
+    expect(report.generations[0]?.diagnostics[0]).toMatchObject({ code: expected, retryable: false, plugin: old.plugin });
+    expect(host.list().find(row => row.generation === "retained")?.recoveryDiagnostic?.code).toBe(expected);
+    expect(await f.events()).toEqual(before);
+    expect(JSON.stringify(report)).not.toContain("secret must not be echoed");
+  });
+}
+
+test("valid archived bytes with incompatible host requirements are diagnosed without importing their entry", async () => {
+  const f = await fixture(false); await trustPlugin(f.options.trustStorePath, f.installed); const host = await f.load();
+  await writeFile(join(f.source, "plugin.json"), JSON.stringify({ ...f.manifest, compatibility: { minTnbVersion: "999.0.0" } }));
+  const plugin = { name: f.manifest.name, version: f.manifest.version, fingerprint: await computePluginTreeSha256(f.source) };
+  await retainPluginGeneration(join(f.root, "state", "plugin-generations"), plugin, f.installed, f.source);
+  const before = await f.events();
+  const report = await host.checkRecovery({ generationReferences: [], channelReferences: [{ plugin, channel: reference, owner: "application", key: "unsupported", load: true }] });
+  expect(report.generations[0]?.diagnostics[0]).toMatchObject({ code: "PLUGIN_HOST_INCOMPATIBLE", phase: "archive" });
+  expect(await f.events()).toEqual(before);
+});
+
+test("static recovery checks reject absent pinned declarations and missing entry files without executing them", async () => {
+  const f = await fixture(false); await trustPlugin(f.options.trustStorePath, f.installed); const host = await f.load();
+  const old = resolveChannelBinding(f.store, "application", "source", "transport", reference, host.extensions.channels);
+  const before = await f.events();
+  let report = await host.checkRecovery({ generationReferences: [], channelReferences: [{ plugin: old.plugin!, channel: { ...reference, id: "absent" }, owner: "application", key: "missing", load: true }] });
+  expect(report.generations[0]?.diagnostics[0]?.code).toBe("PLUGIN_CONTRIBUTION_MISSING");
+  await writeFile(join(f.installed, "plugin.json"), JSON.stringify({ ...f.manifest, contributes: { channels: [{ id: reference.id, version: reference.version, entry: "missing.mjs" }] } }));
+  await trustPlugin(f.options.trustStorePath, f.installed);
+  const plugin = { ...old.plugin!, fingerprint: await computePluginTreeSha256(f.installed) };
+  await retainPluginGeneration(join(f.root, "state", "plugin-generations"), plugin, f.installed, f.installed);
+  report = await host.checkRecovery({ generationReferences: [], channelReferences: [{ plugin, channel: reference, owner: "application", key: "missing-entry", load: true }] });
+  expect(report.generations[0]?.diagnostics[0]?.code).toBe("PLUGIN_ENTRY_INVALID");
+  await mkdir(join(f.installed, "missing.mjs"));
+  const directoryPlugin = { ...plugin, fingerprint: await computePluginTreeSha256(f.installed) };
+  await trustPlugin(f.options.trustStorePath, f.installed);
+  await retainPluginGeneration(join(f.root, "state", "plugin-generations"), directoryPlugin, f.installed, f.installed);
+  report = await host.checkRecovery({ generationReferences: [], channelReferences: [{ plugin: directoryPlugin, channel: reference, owner: "application", key: "directory-entry", load: true }] });
+  expect(report.generations[0]?.diagnostics[0]?.code).toBe("PLUGIN_ENTRY_INVALID");
+  expect(await f.events()).toEqual(before);
+});
 
 test("reference diagnostics distinguish absent history from a failed startup collector", async () => {
   const f = await fixture(false), options = { roots: [], trustStorePath: f.options.trustStorePath, generationReferences: [], channelReferences: [] };
@@ -123,6 +203,8 @@ test("retained channels with dependencies are rejected without importing their o
   const old = resolveChannelBinding(f.store, "application", "source", "transport", reference, host.extensions.channels); await host.close();
   await f.code(f.installed, "new"); await trustPlugin(f.options.trustStorePath, f.installed); host = await f.load();
   expect(host.list().find(item => item.generation === "retained")?.error).toContain("self-contained");
+  const report = await host.checkRecovery({ generationReferences: [], channelReferences: channelGenerationReferences(f.store) });
+  expect(report.generations[0]?.diagnostics[0]?.code).toBe("PLUGIN_CHANNEL_DEPENDENCY_UNSUPPORTED");
   expect(() => host.extensions.channels.descriptor(old)).toThrow("unavailable");
   expect((await f.events()).filter(item => item === "old:import")).toHaveLength(1);
 });

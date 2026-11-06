@@ -26,6 +26,8 @@ tnb runtime plugins --references
 
 查询不校验归档字节、重新授信、连接渠道或验证远端服务。包实现显示 active 也不能代表每个渠道连接都健康。检查保存的备份材料使用 [backup-check](plugin-backup.md)；该命令同样不代表完整恢复预检。
 
+要进一步检查本地归档、来源、信任、内置批准/ABI 和贡献声明，使用 `tnb runtime plugins --check`，见[本地恢复预检](plugin-recovery-check.md)。
+
 ## 自定义宿主
 
 `openAgentRuntime(...).plugins.references()` 自动读取当前 Run 和渠道绑定，附加宿主提供的渠道引用。直接使用 `loadHostPlugins` 时：
