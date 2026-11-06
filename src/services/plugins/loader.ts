@@ -360,6 +360,7 @@ function optionalAdapterContributions(value: unknown, path: string, root: string
   const seen = new Set<string>();
   return value.map((item, index) => {
     if (!isRecord(item)) throw new Error(`Invalid adapter contribution: ${path}`);
+    if (item.execution !== undefined) throw new Error("Process execution is not supported for Adapter contributions; use host-managed workers");
     const id = requiredIdentifier(item.id, `adapters[${index}].id`, path);
     const version = requiredString(item.version, `adapters[${index}].version`, path);
     if (version.length > 128 || seen.has(`${id}@${version}`)) throw new Error(`Duplicate adapter contribution: ${path}`);
@@ -376,7 +377,7 @@ function optionalExtensionContributions(value: unknown, kind: ExtensionKind, pat
   if (!Array.isArray(value) || !value.length || value.length > 32) throw new Error(`Plugin contributes.${kind}s must contain 1..32 entries: ${path}`);
   const seen = new Set<string>();
   return value.map(item => {
-    if (!isRecord(item) || Object.keys(item).some(key => !["id", "version", "entry", "services", "requires", "configuration", "state"].includes(key))) throw new Error(`Invalid ${kind} contribution: ${path}`);
+    if (!isRecord(item) || Object.keys(item).some(key => !["id", "version", "entry", "services", "requires", "configuration", "state", "execution"].includes(key))) throw new Error(`Invalid ${kind} contribution: ${path}`);
     const id = requiredIdentifier(item.id, `${kind}.id`, path), version = requiredString(item.version, `${kind}.version`, path);
     if (version.length > 128 || seen.has(`${id}@${version}`)) throw new Error(`Duplicate ${kind} contribution: ${path}`);
     seen.add(`${id}@${version}`);
@@ -390,7 +391,16 @@ function optionalExtensionContributions(value: unknown, kind: ExtensionKind, pat
       return { kind: raw.kind as ContributionReference["kind"], id: requiredIdentifier(raw.id, "dependency.id", path), version: requiredString(raw.version, "dependency.version", path) };
     });
     if (new Set(requires.map(ref => JSON.stringify(ref))).size !== requires.length) throw new Error("Duplicate plugin dependency");
-    return { kind, id, version, entry, services, requires, ...parsePluginDataDeclaration(item, kind) };
+    const data = parsePluginDataDeclaration(item, kind);
+    let execution: ExtensionDeclaration["execution"];
+    if (item.execution !== undefined) {
+      const value = item.execution;
+      if (!isRecord(value) || Object.keys(value).some(key => !["mode", "protocol", "timeoutMs"].includes(key)) || value.mode !== "process" || value.protocol !== "tnb.process-plugin/v1"
+        || value.timeoutMs !== undefined && (!Number.isSafeInteger(value.timeoutMs) || Number(value.timeoutMs) < 100 || Number(value.timeoutMs) > 300000)) throw new Error("Invalid process execution contract");
+      if (data.state?.migrations?.length) throw new Error("Process state migrations require an explicit host migration; synchronous callbacks cannot cross the process boundary");
+      execution = { mode: "process", protocol: "tnb.process-plugin/v1", ...(value.timeoutMs !== undefined ? { timeoutMs: Number(value.timeoutMs) } : {}) };
+    }
+    return { kind, id, version, entry, services, requires, ...data, ...(execution ? { execution } : {}) };
   });
 }
 

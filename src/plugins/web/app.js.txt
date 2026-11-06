@@ -237,7 +237,7 @@ function renderChatStatus() {
   const status = ({ idle:'本轮已完成，可以继续对话。', running:'正在执行', 'waiting-approval':'等待工具授权', interrupted:'本轮已中断，请核对工具结果后继续。', failed:'本轮执行失败，可核对后继续。' })[chat.status];
   let label = status;
   if (activity && ['running','waiting-approval'].includes(chat.status)) {
-    label = ({ requesting:'正在请求模型', thinking:'正在思考', responding:'正在生成回复', 'preparing-tool':'正在准备工具', tool:'正在运行工具', retrying:'等待模型重试', 'waiting-approval':'等待工具授权', cancelling:'正在停止本轮' })[activity.phase] || status;
+    label = ({ requesting:'正在请求模型', thinking:'正在思考', responding:'正在生成回复', finishing:'正在完成回复', 'preparing-tool':'正在准备工具', tool:'正在运行工具', retrying:'等待模型重试', 'waiting-approval':'等待工具授权', cancelling:'正在停止本轮' })[activity.phase] || status;
     if (activity.tool) label += ' · ' + activity.tool;
     if (activity.phase === 'retrying') label += (activity.retry ? ' · 第 ' + activity.retry + ' 次' : '') + (activity.retryAt ? ' · ' + Math.max(0,Math.ceil((activity.retryAt-Date.now())/1000)) + 's 后重试' : '');
     if (Number.isFinite(activity.startedAt)) label += ' · 本轮 ' + Math.max(0,Math.floor((Date.now()-activity.startedAt)/1000)) + 's';

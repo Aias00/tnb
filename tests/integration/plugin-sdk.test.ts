@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { cp, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { delimiter, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { initializePlugin, validatePluginPackage, testPluginPackage } from "../../src/services/plugins/development";
@@ -27,10 +27,10 @@ test("one SDK entry exposes typed author helpers without starting a host", async
   expect(createServiceRef<{ read(): string }>({ id: "fixture", version: 1, scope: "contribution", methods: { read: true } }).name).toBe("fixture/v1");
 });
 
-for (const template of ["agent", "application", "channel"] as const) test(`packed SDK and ${template} TypeScript template work in an independent project`, async () => {
+for (const [template, execution] of [["agent", "in-process"], ["application", "in-process"], ["channel", "in-process"], ["application", "process"], ["channel", "process"]] as const) test(`packed SDK and ${execution} ${template} TypeScript template work in an independent project`, async () => {
   const root = await mkdtemp(join(tmpdir(), "tnb-typed-author-")); roots.push(root);
   const project = join(root, "project");
-  await initializePlugin(project, template, "typed-plugin", { language: "typescript", sdkTarball });
+  await initializePlugin(project, template, "typed-plugin", { language: "typescript", sdkTarball, execution });
   const document = JSON.parse(await readFile(join(project, "package.json"), "utf8"));
   // Only the local tarball is installed by tests. The repository's existing compiler is a CLI on PATH,
   // not a type dependency. Normal generated projects install their own pinned compiler.
@@ -41,6 +41,18 @@ for (const template of ["agent", "application", "channel"] as const) test(`packe
   expect((await readdir(join(project, "node_modules"))).filter(name => !name.startsWith("."))).toEqual(["@tnb"]);
   const types = await readFile(join(project, "node_modules/@tnb/plugin-sdk/index.d.ts"), "utf8");
   expect(types).not.toMatch(/^import\s|\/\/\/\s*<reference|import\(["']|\b(?:Bun|RuntimeStore|DurableRuntime)\b/m);
+  if (execution === "process") {
+    const path = join(project, "src/process-contract.ts");
+    await writeFile(path, `import { createServiceRef, type ProcessContext } from "@tnb/plugin-sdk";
+      declare const context: ProcessContext;
+      const ref = createServiceRef<{ echo(text: string): Promise<string> }>({ id: "typed.echo", version: 1, scope: "contribution", methods: { echo: true } });
+      context.call(ref, "echo", ["ok"]);
+      // @ts-expect-error undeclared method
+      context.call(ref, "missing", []);
+      // @ts-expect-error argument type is enforced across the JSON boundary
+      context.call(ref, "echo", [42]);
+    `);
+  }
   const check = await command([process.execPath, "run", "typecheck"], project);
   expect(check.code, check.stdout + check.stderr).toBe(0);
   const entry = join(project, "src/index.ts"), original = await readFile(entry, "utf8");
@@ -67,3 +79,15 @@ test("TypeScript creation rejects absent SDK artifacts before creating a partial
   await expect(initializePlugin(join(root, "project"), "application", "fixture", { language: "typescript", sdkTarball: join(root, "absent.tgz") })).rejects.toThrow("Plugin SDK tarball not found");
   expect(await readdir(root)).toEqual([]);
 });
+
+
+test("independent ticket business integrates the public SDK, injected service, process state and domain task", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tnb-business-sdk-")); roots.push(root);
+  await cp(join(repo, "examples/plugins/ticket-intake"), root, { recursive: true, filter: path => !path.includes("node_modules") && !path.includes("/package/") });
+  const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
+  pkg.devDependencies = { "@tnb/plugin-sdk": `file:${sdkTarball}` }; await writeFile(join(root, "package.json"), JSON.stringify(pkg));
+  for (const args of [[process.execPath, "install", "--ignore-scripts", "--registry", "http://127.0.0.1:1"],
+    [process.execPath, "run", "typecheck"], [process.execPath, "run", "build"], [process.execPath, "test", "./test.ts"]]) {
+    const result = await command(args, root); expect(result.code, result.stdout + result.stderr).toBe(0);
+  }
+}, 30000);

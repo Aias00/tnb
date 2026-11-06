@@ -8,7 +8,21 @@
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": false,
     "noEmit": true,
-    "types": ["bun"]
+    "types": [
+      "bun"
+    ],
+    "paths": {
+      "@tnb/plugin-sdk": [
+        "./src/plugin-sdk/index.ts"
+      ],
+      "@tnb/plugin-sdk/testing": [
+        "./src/plugin-sdk/testing.ts"
+      ]
+    }
   },
-  "include": ["src", "tests", "examples"]
+  "include": [
+    "src",
+    "tests",
+    "examples"
+  ]
 }

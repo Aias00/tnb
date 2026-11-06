@@ -15,5 +15,14 @@ export type { PluginJsonSchema } from "../agent/plugin-schema";
 export type { AgentTool, ToolDefinition, ToolAccess, ToolOutput, ToolExecutionContext, ToolCapability, ToolEffects, ToolProgressReporter } from "../core/tool";
 export type { ModelTransport, ModelRequest, ModelEvent, TokenUsage, StopReason } from "../providers/types";
 export type { ConversationMessage, ToolUseBlock, ToolResultBlock, MediaBlock } from "../core/message";
-export type { WorkerResources, RuntimeConfiguration } from "../services/runtime/engine-core";
+export type { WorkerResources, ExecutionConfiguration, AgentTaskInput } from "../agent/execution";
+/** @deprecated Host compatibility shape; new authors use AgentContext.execution. */
+export type { RuntimeConfiguration } from "../services/runtime/engine-core";
+export { defineAgent } from "./agent";
+export type { AgentDefinition, AgentContext } from "./agent";
 export type { DurableRun, DurableTask } from "../services/runtime/types";
+
+export type { ExecutionActivity } from "../agent/activity";
+
+export { defineProcessPlugin, PROCESS_PLUGIN_PROTOCOL } from "./process";
+export type { ProcessPluginDefinition, ProcessContext, ProcessHandlers, ProcessRequest, ProcessResponse, ProcessStateWrite, ProcessStateRecord } from "./process";

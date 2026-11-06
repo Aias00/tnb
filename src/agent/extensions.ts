@@ -5,7 +5,7 @@ import type { PluginConfiguration, PluginDataDeclaration } from "./plugin-data";
 
 export type ExtensionKind = "application" | "interface" | "channel";
 export type ContributionReference = { kind: ExtensionKind | "adapter"; id: string; version: string };
-export type ExtensionDeclaration = ContributionReference & PluginDataDeclaration & { kind: ExtensionKind; entry: string; services: string[]; requires: ContributionReference[] };
+export type ExtensionDeclaration = ContributionReference & PluginDataDeclaration & { execution?: { mode: "process"; protocol: "tnb.process-plugin/v1"; timeoutMs?: number }; kind: ExtensionKind; entry: string; services: string[]; requires: ContributionReference[] };
 export type ExtensionState = ContributionReference & { plugin: AdapterPluginIdentity; status: "registered" | "starting" | "active" | "failed" | "draining" | "stopped"; error?: string;
   configuration?: { status: "ready" | "invalid"; version?: number; digest?: string };
   state?: { status: "legacy" | "ready" | "migrating" | "blocked"; version: number; target?: number } };

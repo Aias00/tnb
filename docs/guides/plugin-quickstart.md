@@ -45,6 +45,8 @@ tnb plugins test . --yes --json
 
 临时宿主不读取用户 settings 来提供模型配置、服务授权或伪造的服务对象。需要这些能力的插件，应使用 SDK 测试宿主显式提供服务、配置和 fixtures，参考[服务指南](plugin-services.md)和[宿主指南](host-plugins.md)。进程内插件仍可访问当前进程环境和用户文件，临时状态不等于沙箱；不合作的代码仍可能阻塞退出。模板本身不会调用外部业务服务。
 
+需要故障隔离的应用/渠道可在创建时加 `--execution process`，使用独立监督进程和业务进程、异步宿主调用与有界超时，见[进程插件](process-plugins.md)。需要自定义服务与配置的真实业务接入，可从[独立工单示例](../../examples/plugins/ticket-intake/README.md)开始，使用 `@tnb/plugin-sdk/testing`。
+
 两条验证命令均输出 JSON，`ok: false` 时退出码为 1，适合接入 CI。`test` 的 `checks` 按准备、激活、场景和关闭报告；输出不包含原始模型/工具响应。Windows 支持静态校验、应用和渠道试跑；Agent 任务试跑目前需要 macOS/Linux 的持久化屏障，不在 Windows 静默降级。
 
 ## 测试文件合同

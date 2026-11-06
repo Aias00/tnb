@@ -7,7 +7,7 @@ export const PLUGIN_DEVELOPMENT_HELP = `Usage: tnb plugins <action> [directory|n
 
 Plugin development:
   tnb plugins init <directory> [--template agent|application|channel] [--name NAME]
-    [--language javascript|typescript] [--sdk /path/to/sdk.tgz]
+    [--language javascript|typescript] [--sdk /path/to/sdk.tgz] [--execution in-process|process]
   tnb plugins validate <directory> [--json]
   tnb plugins test <directory> --yes [--json]
 
@@ -24,13 +24,14 @@ export async function runPluginDevelopmentCommand(options: ManagementCommandOpti
   if (args.includes("--help") || args.includes("-h")) { options.stdout.write(PLUGIN_DEVELOPMENT_HELP); return 0; }
   const target = args[0];
   if (!target || target.startsWith("--")) throw new Error(`plugins ${action} requires a directory`);
-  let template: PluginTemplate = "agent", name: string | undefined, language: "javascript" | "typescript" = "javascript", sdkTarball: string | undefined;
+  let template: PluginTemplate = "agent", name: string | undefined, language: "javascript" | "typescript" = "javascript", sdkTarball: string | undefined, execution: "in-process" | "process" = "in-process";
   for (let index = 1; index < args.length; index++) {
     const flag = args[index]!;
     if (flag === "--json" || action === "test" && flag === "--yes") continue;
-    if (action === "init" && ["--template", "--name", "--language", "--sdk"].includes(flag)) {
+    if (action === "init" && ["--template", "--name", "--language", "--sdk", "--execution"].includes(flag)) {
       const value = args[++index]; if (!value || value.startsWith("--")) throw new Error(`${flag} requires a value`);
-      if (flag === "--name") name = value;
+      if (flag === "--execution") { if (value !== "in-process" && value !== "process") throw new Error("--execution must be in-process or process"); execution = value; }
+      else if (flag === "--name") name = value;
       else if (flag === "--sdk") sdkTarball = resolve(options.cwd, value);
       else if (flag === "--language") { if (value !== "javascript" && value !== "typescript") throw new Error("--language must be javascript or typescript"); language = value; }
       else { if (!(PLUGIN_TEMPLATES as readonly string[]).includes(value)) throw new Error("--template must be agent, application or channel"); template = value as PluginTemplate; }
@@ -39,7 +40,7 @@ export async function runPluginDevelopmentCommand(options: ManagementCommandOpti
   const directory = resolve(options.cwd, target);
   if (action === "init") {
     if (sdkTarball && language !== "typescript") throw new Error("--sdk requires --language typescript");
-    const result = await initializePlugin(directory, template, name, { language, sdkTarball });
+    const result = await initializePlugin(directory, template, name, { language, sdkTarball, execution });
     if (args.includes("--json")) options.stdout.write(JSON.stringify(result, null, 2) + "\n");
     else options.stdout.write(`Created ${result.name} (${result.template}, ${result.language}) in ${result.directory}\n\nNext, from that directory:\n${language === "typescript" ? "  bun install --ignore-scripts\n  bun run check" : "  tnb plugins validate .\n  tnb plugins test . --yes"}\n\nSee README.md and edit ${language === "typescript" ? "src/index.ts" : "index.mjs"} plus plugin.test.json.\n`);
     return 0;

@@ -1,3 +1,5 @@
+import { ExecutionActivityTracker } from "../../agent/activity";
+import type { ModelEvent } from "../../providers/types";
 import { createWorkspaceInspection } from "./inspection";
 import { searchWorkspaceContent } from "../workspace/content-search";
 import { randomUUID } from "node:crypto";
@@ -74,6 +76,7 @@ export function createChatService(options: { store: RuntimeStore; configDir: str
   };
   async function run(chat: ChatSummary, prompt: string, resume: boolean, turn: LiveTurn) {
     let client: Query | undefined, completed = false;
+    const activity = new ExecutionActivityTracker(turn.activity.startedAt);
     let status: ChatSummary["status"] = "idle", failure: string | undefined;
     const timeout = setTimeout(() => turn.controller.abort(new Error("本轮达到 10 分钟上限，请核对执行结果后继续。")), 10 * 60 * 1000);
     const linked = AbortSignal.any([signal, turn.controller.signal]);
@@ -87,25 +90,24 @@ export function createChatService(options: { store: RuntimeStore; configDir: str
           linked.throwIfAborted(); if (turn.approvals.size >= 16) return { behavior: "deny", message: "Too many pending approvals" };
           const value: ChatApproval = { requestId: request.requestId, turnId: chat.turnId!, tool, input: clipped(encodeJson(input, 1024 * 1024), 16 * 1024), message: request.message };
           const decision = Promise.withResolvers<CanUseToolResult>(); turn.approvals.set(value.requestId, { value, resolve: decision.resolve });
-          turn.activity = { phase: "waiting-approval", startedAt: turn.activity.startedAt };
+          turn.activity = activity.set("waiting-approval");
           save({ ...read(chat.id).value, status: "waiting-approval" }); emit(chat.id);
-          return decision.promise;
+          try { return await decision.promise; } finally { if (turn.approvals.size === 0) turn.activity = activity.resume(); }
         },
       } });
       for await (const message of client) {
         linked.throwIfAborted();
+        if (turn.activity.phase === "cancelling") activity.set("cancelling");
         if (message.type === "model_event") {
-          const event = message.event as { type?: string; text?: string; name?: string; phase?: string; retry?: number; delayMs?: number };
-          if (event?.type === "text" || event?.type === "thinking") turn.activity = { phase: event.type === "text" ? "responding" : "thinking", startedAt: turn.activity.startedAt };
-          if (event?.type === "tool-start") turn.activity = { phase: "preparing-tool", tool: String(event.name ?? "tool").slice(0, 128), startedAt: turn.activity.startedAt };
-          if (event?.type === "retry") turn.activity = { phase: event.phase === "waiting" ? "retrying" : "requesting", startedAt: turn.activity.startedAt, ...(Number.isSafeInteger(event.retry) ? { retry: event.retry } : {}), ...(event.phase === "waiting" && typeof event.delayMs === "number" && Number.isFinite(event.delayMs) && event.delayMs >= 0 ? { retryAt: Date.now() + Math.min(event.delayMs, 3600000) } : {}) };
+          const event = message.event as ModelEvent;
+          turn.activity = activity.model(event);
           if (event?.type === "text" && typeof event.text === "string") turn.message.text = clipped(turn.message.text + event.text);
         }
         if (message.type === "tool_event") {
           const event = message.event as { type: string; id: string; name: string; output?: string; isError?: boolean; data?: { exitCode?: number; agentPhase?: string; latestTool?: string; elapsedTimeSeconds?: number } };
           if (event?.type === "tool-execution-start") {
             turn.activeTools.set(event.id, String(event.name).slice(0, 128));
-            turn.activity = { phase: "tool", tool: String(event.name).slice(0, 128), startedAt: turn.activity.startedAt };
+            turn.activity = activity.tool("start", event.id, event.name);
             turn.message.tools ??= []; if (turn.message.tools.length < 64) turn.message.tools.push({ id: String(event.id).slice(0, 128), name: String(event.name).slice(0, 128), status: "running" });
           }
           if (event?.type === "tool-execution-progress") {
@@ -120,8 +122,7 @@ export function createChatService(options: { store: RuntimeStore; configDir: str
           if (event?.type === "tool-execution-end") {
             const tool = turn.message.tools?.find(item => item.id === event.id); if (tool) { tool.status = event.isError ? "failed" : "complete"; tool.output = clipped(event.output ?? "", 4096); }
             turn.activeTools.delete(event.id);
-            const running = turn.activeTools.values().next().value;
-            turn.activity = { phase: running ? "tool" : "requesting", ...(running ? { tool: running } : {}), startedAt: turn.activity.startedAt };
+            turn.activity = activity.tool("end", event.id);
           }
         }
         if (message.type === "result") {

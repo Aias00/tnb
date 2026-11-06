@@ -1,0 +1,17 @@
+{
+  "name": "ticket-intake", "version": "0.1.0", "manifestVersion": 2,
+  "apiVersion": "tnb.host-plugin/v1",
+  "contributes": {
+    "adapters": [{ "id": "ticket-review", "version": "1", "entry": "agent.mjs" }],
+    "applications": [{
+      "id": "ticket-intake", "version": "1", "entry": "intake.mjs",
+      "execution": { "mode": "process", "protocol": "tnb.process-plugin/v1", "timeoutMs": 5000 },
+      "services": ["example.support/v1"],
+      "configuration": { "version": 1, "schema": {
+        "type": "object", "properties": { "queue": { "type": "string", "minLength": 1 } },
+        "required": ["queue"], "additionalProperties": false
+      } },
+      "state": { "version": 1 }
+    }]
+  }
+}

@@ -23,35 +23,25 @@ import { DurableCallJournal, type Operation } from "./journal";
 import { DurableTranscript } from "./transcript";
 import { digestJson, text } from "./json";
 import type { DurableRun, DurableTask, ExecutionPolicy, WorkerIdentity, RunLimits } from "./types";
-import type { BillingRoute } from "../usage/budget";
+import type { ExecutionConfiguration, AgentTaskInput, WorkerResources } from "../../agent/execution";
+export type { WorkerResources } from "../../agent/execution";
 import { runtimeStorageUsage } from "./maintenance";
 import { DurableWaits, refreshWaits, validateWaitProposal, type WaitProposal, type DurableWait } from "./waits";
 
 class DurableYield extends Error {}
 class DurableReport extends Error {}
 
-export type RuntimeConfiguration = {
+/** Host persistence compatibility shape; new domain authors use ExecutionConfiguration. */
+export type RuntimeConfiguration = ExecutionConfiguration & {
   workspace: string; allowedWorkspaces: string[]; allowWrite: boolean; allowShell: boolean;
-  checks: string[]; provider?: string; model?: string; maxCostUsd?: number;
-  maxTurns: number; maxRetries: number; compactThreshold: number;
+  checks: string[];
   originSessionId?: string; conversationContext?: string;
   strategyVersion?: 1 | 2;
-  maxModelRequests?: number;
   /** Coding adapter selections; executable capabilities and credentials stay on the host. */
   skills?: string[];
   mcpTools?: string[];
   capabilityPins?: Record<string, string>;
   domain?: DomainDescriptor;
-};
-export type WorkerResources = Pick<AgentLoopOptions, "transport" | "model" | "tools" | "authorize"> & {
-  route: BillingRoute; maxOutputTokens: number;
-  /** Custom factories predating context budgeting default conservatively to 32k. */
-  contextWindowTokens?: number;
-  projectInstructions?: string;
-  systemInstructions?: string;
-  binding?: unknown;
-  check?(command: string, signal: AbortSignal): Promise<string>;
-  close?(): Promise<void>;
 };
 export type RuntimeWorkerFactory = (context: { run: DurableRun; task: DurableTask; configuration: RuntimeConfiguration; signal: AbortSignal }) => Promise<WorkerResources>;
 
@@ -171,14 +161,13 @@ export class DurableRuntime {
     const original = originalLimits ? this.store.record<RunLimits>("binding-limits", runId) : undefined;
     return { ...config, ...(original ? { maxCostUsd: original.value.maxCostUsd } : {}), ...(override || {}), ...(limits || {}) };
   }
-  async submitDomain(input: { commandId: string; objective: string; namespace: string; adapter: DomainDescriptor; mode?: ExecutionPolicy["mode"];
-    maxTurns?: number; maxRetries?: number; maxModelRequests?: number; compactThreshold?: number; maxCostUsd?: number; deadline?: number }) {
+  async submitDomain(input: AgentTaskInput) {
     text(input.namespace, "task namespace", 256);
     const workspace = `agent:${input.namespace}`;
     return this.submit({ commandId: input.commandId, objective: input.objective, mode: input.mode, deadline: input.deadline,
       configuration: { domain: input.adapter, workspace, allowedWorkspaces: [workspace], allowWrite: false, allowShell: false, checks: [],
         maxTurns: input.maxTurns ?? 50, maxRetries: input.maxRetries ?? 1, maxModelRequests: input.maxModelRequests ?? 256,
-        compactThreshold: input.compactThreshold ?? 10000, maxCostUsd: input.maxCostUsd } });
+        compactThreshold: input.compactThreshold ?? 10000, maxCostUsd: input.maxCostUsd, provider: input.provider, model: input.model } });
   }
   #domainContext(task: DurableTask, signal: AbortSignal): DomainContext {
     const config = this.configuration(task.runId, task.taskId);

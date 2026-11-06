@@ -55,7 +55,8 @@
     "./agent/plugins": "./src/agent/plugins.ts",
     "./agent/extensions": "./src/agent/extensions.ts",
     "./agent/services": "./src/agent/services.ts",
-    "./plugin-sdk": "./src/plugin-sdk/index.ts"
+    "./plugin-sdk": "./src/plugin-sdk/index.ts",
+    "./plugin-sdk/testing": "./src/plugin-sdk/testing.ts"
   },
   "license": "Apache-2.0",
   "private": true,

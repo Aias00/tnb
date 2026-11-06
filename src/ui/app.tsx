@@ -1,3 +1,4 @@
+import { ExecutionActivityTracker, executionActivityLabel } from "../agent/activity";
 import type { ContextReport } from "../services/compact/context-report";
 import { CompactionNotices } from "../services/compact/notice";
 import { AwayRecap } from "../services/notifications/away-recap";
@@ -395,7 +396,6 @@ export function TuiApp(options: TuiAppOptions) {
     idleNotifications.sync(notices);
   }, [permission, question, durableQuestions, runNotifications, idleNotifications]);
   useEffect(() => { const timer = setInterval(() => idleNotifications.tick(focusRef.current), 500); return () => { clearInterval(timer); idleNotifications.close(); }; }, [idleNotifications]);
-  const preparingTool = useRef<string | undefined>(undefined);
   const invocationSequence = useRef(0);
   const usageSessionEpoch = useRef(0);
 
@@ -587,8 +587,8 @@ export function TuiApp(options: TuiAppOptions) {
     compactionNotices.reset();
     setCancelling(false);
     setTurnStartedAt(Date.now());
+    const executionActivity = new ExecutionActivityTracker();
     setPhase("Requesting model");
-    preparingTool.current = undefined;
     dispatch({ type: "submit", text: structured.display, input: structuredClone(structured) });
     const controller = new AbortController();
     abortController.current = controller;
@@ -626,19 +626,12 @@ export function TuiApp(options: TuiAppOptions) {
         if (sessionId.current === invocationSession && usageSessionEpoch.current === invocationEpoch && invocationSequence.current === invocation) dispatch({ type: "context-report", report });
       },
       onModelEvent(event) {
-        if (event.type === "retry") setPhase(event.phase === "waiting"
-          ? `${event.reason === "rate-limit" ? "Rate limited" : event.reason === "connection" ? "Connection failed" : "Provider unavailable"}${event.status ? ` (${event.status})` : ""} · retry ${event.retry}/${event.maxRetries} in ${Math.ceil(event.delayMs / 1000)}s`
-          : `Retrying model · ${event.retry}/${event.maxRetries}`);
-        if (event.type === "text") setPhase("Writing response");
-        if (event.type === "thinking") setPhase("Thinking");
-        if (event.type === "tool-start") { preparingTool.current = event.name; setPhase(`Preparing ${event.name}`); }
-        if (event.type === "tool-input") setPhase(preparingTool.current ? `Preparing ${preparingTool.current} arguments` : "Preparing tool arguments");
-        if (event.type === "response-end") setPhase(event.reason === "tool-use" ? "Preparing tools" : "Finishing response");
+        setPhase(executionActivityLabel(executionActivity.model(event)));
         dispatch({ type: "model-event", event });
       },
       onToolEvent(event) {
         if (event.type === "tool-execution-start") {
-          setPhase(`Running ${event.name}`);
+          setPhase(executionActivityLabel(executionActivity.tool("start", event.id, event.name)));
           if (event.name === "image_generate") {
             const input = typeof event.input === "object" && event.input !== null ? event.input as Record<string, unknown> : {};
             const path = typeof input.outputPath === "string"
@@ -656,6 +649,7 @@ export function TuiApp(options: TuiAppOptions) {
         } else if (event.type === "tool-execution-progress") {
           dispatch({ type: "tool-progress", id: event.id, data: event.data });
         } else {
+          setPhase(executionActivityLabel(executionActivity.tool("end", event.id)));
           awayRecap.toolFinished(event.isError);
           dispatch({
             type: "tool-finish",

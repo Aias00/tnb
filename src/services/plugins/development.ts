@@ -1,3 +1,4 @@
+import { processPluginTemplate } from "./process-template";
 import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -56,9 +57,10 @@ export async function readPluginTests(directory: string): Promise<PluginTestSpec
   return value as PluginTestSpecification;
 }
 
-export async function initializePlugin(directory: string, template: PluginTemplate, name = basename(resolve(directory)), options: { language?: "javascript" | "typescript"; sdkTarball?: string } = {}) {
+export async function initializePlugin(directory: string, template: PluginTemplate, name = basename(resolve(directory)), options: { language?: "javascript" | "typescript"; sdkTarball?: string; execution?: "in-process" | "process" } = {}) {
   if (!PLUGIN_TEMPLATES.includes(template)) throw new Error("--template must be agent, application or channel");
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/.test(name)) throw new Error("Use --name with a valid plugin name (letters, numbers, _ or -; at most 64 characters)");
+  if (options.execution === "process" && template === "agent") throw new Error("Process execution currently supports application and channel templates");
   const target = resolve(directory);
   let sdkTarball: string | undefined;
   if (options.language === "typescript") {
@@ -70,7 +72,7 @@ export async function initializePlugin(directory: string, template: PluginTempla
   await mkdir(dirname(target), { recursive: true });
   await mkdir(target, { mode: 0o700 }); // Deliberately refuses existing paths, including empty directories and symlinks.
   try {
-    const files = sdkTarball ? typescriptPluginTemplate(name, template, sdkTarball) : pluginTemplate(name, template);
+    const files = sdkTarball ? typescriptPluginTemplate(name, template, sdkTarball, options.execution) : options.execution === "process" ? processPluginTemplate(name, template) : pluginTemplate(name, template);
     for (const [path, content] of Object.entries(files)) { await mkdir(dirname(join(target, path)), { recursive: true }); await writeFile(join(target, path), content, { flag: "wx" }); }
     return { directory: target, name, template, language: options.language ?? "javascript", files: Object.keys(files), ...(sdkTarball ? { sdkTarball } : {}) };
   } catch (error) { await rm(target, { recursive: true, force: true }); throw error; }

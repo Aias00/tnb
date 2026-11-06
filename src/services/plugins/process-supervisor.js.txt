@@ -1,0 +1,26 @@
+// Trusted supervisor: plugin code runs in a different event loop. Owner EOF must
+// still be observed when the plugin itself is blocked in synchronous code.
+const workerSource = __TNB_WORKER_SOURCE__;
+const { spawn } = await import("node:child_process");
+const { join } = await import("node:path");
+const entry = process.argv.at(-1);
+const args = __TNB_COMPILED__ ? ["--internal-plugin-worker", entry] : ["-e", workerSource, entry];
+const child = spawn(process.execPath, args, { stdio: "pipe", env: process.env, windowsHide: true });
+let stopping = false;
+const stop = () => {
+  if (stopping) return; stopping = true;
+  if (process.platform !== "win32") {
+    // The owner created this supervisor as group leader; the plugin inherits it.
+    try { process.kill(-process.pid, "SIGKILL"); } catch { child.kill("SIGKILL"); process.exit(1); }
+  } else {
+    const killer = spawn(join(process.env.SystemRoot || "C:\\Windows", "System32", "taskkill.exe"), ["/pid", String(process.pid), "/T", "/F"], { stdio: "ignore", windowsHide: true });
+    killer.on("error", () => { child.kill("SIGKILL"); process.exit(1); });
+  }
+};
+process.stdin.pipe(child.stdin);
+child.stdout.pipe(process.stdout);
+child.stderr.pipe(process.stderr);
+process.stdin.on("end", stop); process.stdin.on("error", stop);
+process.stdout.on("error", stop); process.stderr.on("error", stop);
+child.stdin.on("error", stop); child.on("error", stop); child.on("exit", stop);
+process.on("SIGTERM", stop); process.on("SIGINT", stop);

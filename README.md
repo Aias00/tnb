@@ -635,6 +635,8 @@ self-update manifest alongside the binary and `SHA256SUMS`.
 
 TypeScript 作者可用 `--language typescript` 创建项目，通过 `bun run check` 完成类型检查、构建、校验和真实试跑。独立 `@tnb/plugin-sdk` 以本地 `.tgz` 随构建产物交付，尚未发布到注册表，见[SDK 使用和分发](docs/guides/plugin-sdk.md)。
 
+通用 Agent 使用 `defineAgent` 声明业务 Schema 和验收；应用/渠道可加 `--execution process` 选择[进程隔离](docs/guides/process-plugins.md)。[工单插件](examples/plugins/ticket-intake/README.md)展示公开 SDK、显式服务授权、临时测试宿主和重启后幂等验证。
+
 宿主服务支持类型化引用、工厂依赖和按贡献管理的生命周期，默认 Web/协作/渠道已使用同一协议，见[服务接入指南](docs/guides/plugin-services.md)。运行 `bun examples/typed-plugin-service.ts` 可验证一个无需模型的完整服务样例。
 
 贡献可声明版本化配置和私有记录迁移，宿主在启动前校验，失败不会自动读取不兼容状态。见[数据合同](docs/guides/plugin-data-contracts.md)，本地示例：`bun examples/plugin-data-contract.ts`。

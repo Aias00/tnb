@@ -1,3 +1,4 @@
+import { processRegistration } from "../services/plugins/process-host";
 import { cp, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join, resolve } from "node:path";
@@ -204,6 +205,11 @@ export async function loadHostPlugins(options: AgentPluginOptions, inline: reado
             || item.kind === "channel" && "channel" in ref && ref.channel.id === item.id && ref.channel.version === item.version));
         if (recoveryOnly && !expected.some(requested)) continue;
         const path = await assertPluginContributionPath({ ...plugin, root: target }, entry);
+        if (expected.some(row => row.kind !== "adapter" && row.execution?.mode === "process")) {
+          if (expected.length !== 1 || expected[0]!.kind === "adapter") throw new Error("A process entry must declare exactly one non-adapter contribution");
+          stagedExtensions.push(processRegistration(path, expected[0] as ExtensionDeclaration, identity));
+          continue;
+        }
         const loaded: { default?: unknown } = await import(pathToFileURL(path).href);
         if (typeof loaded.default !== "function") throw new Error("Adapter module must export a default factory");
         const entryResult = await initializeEntry(loaded.default as HostPluginFactory, expected, identity, callbacks, stateDirectory, options.configuration?.[plugin.name] ?? configuration);
@@ -307,6 +313,7 @@ function guardAdapter(adapter: AgentDomainAdapter, plugin: AdapterPluginIdentity
 type EntryDeclaration = { kind: "adapter"; id: string; version: string } | ExtensionDeclaration;
 async function initializeEntry(factory: HostPluginFactory, expected: EntryDeclaration[], identity: Readonly<AdapterPluginIdentity>,
   callbacks: Array<() => void | Promise<void>>, stateDirectory?: string, configuration?: unknown): Promise<{ adapters: PluginAdapterRegistration[]; extensions: ExtensionRegistration[] }> {
+  if (expected.some(row => row.kind !== "adapter" && row.execution)) throw new Error("Process declarations require a packaged entry, not an in-process registration factory");
   for (const declaration of expected) if (declaration.kind !== "adapter") parsePluginDataDeclaration(declaration, declaration.kind);
   const pending: AgentDomainAdapter[] = [], extensions: ExtensionRegistration[] = [];
   const registered = new Set<string>();

@@ -1,0 +1,81 @@
+// Self-contained child bootstrap, embedded in both the CLI and SDK test host.
+const protocol = "tnb.process-plugin/v1", maxBytes = 256 * 1024;
+const entry = process.argv.at(-1);
+const controller = new AbortController(), pending = new Map();
+let sequence = 0, handlers, initialized = false, inputBytes = 0, active = 0;
+let inputWindow = performance.now();
+const write = value => {
+  let nodes = 0;
+  const check = (item, depth = 0) => {
+    if (++nodes > 20000 || depth > 32) throw new Error("Process JSON complexity limit exceeded");
+    if (item === null || typeof item === "string" || typeof item === "boolean" || typeof item === "number" && Number.isFinite(item)) return;
+    if (Array.isArray(item)) { for (const child of item) check(child, depth + 1); return; }
+    if (item && typeof item === "object" && [Object.prototype, null].includes(Object.getPrototypeOf(item))) { for (const child of Object.values(item)) check(child, depth + 1); return; }
+    throw new Error("Process boundary requires JSON data");
+  };
+  check(value);
+  const line = JSON.stringify({ jsonrpc: "2.0", ...value }, (_key, item) => {
+    if (item === undefined || typeof item === "function" || typeof item === "symbol" || typeof item === "bigint" || typeof item === "number" && !Number.isFinite(item)) throw new Error("Process boundary requires JSON data");
+    return item;
+  }) + "\n";
+  if (Buffer.byteLength(line) > maxBytes) throw new Error("Process frame exceeds limit");
+  process.stdout.write(line);
+};
+const call = (method, params) => {
+  if (controller.signal.aborted || pending.size >= 32) return Promise.reject(new Error("Host callback scope ended or capacity exceeded"));
+  const id = "worker:" + (++sequence);
+  return new Promise((resolve, reject) => { pending.set(id, { resolve, reject }); try { write({ id, method, params }); } catch (error) { pending.delete(id); reject(error); } });
+};
+// Plugin logs use stderr; stdout belongs exclusively to framed RPC.
+console.log = console.info = console.debug = (...args) => console.error(...args);
+async function dispatch(message) {
+  if (message.jsonrpc !== "2.0" || typeof message.id !== "string") throw new Error("Invalid process message");
+  if (!message.method) {
+    const job = pending.get(message.id); if (!job) throw new Error("Unknown host callback response"); pending.delete(message.id);
+    if (message.error) job.reject(new Error(message.error.message)); else job.resolve(message.result);
+    return;
+  }
+  if (++active > 32) throw new Error("Process request capacity exceeded");
+  try {
+    let result;
+    if (message.method === "initialize") {
+      if (initialized || message.params.protocol !== protocol) throw new Error("Process protocol initialization rejected");
+      initialized = true;
+      const mod = await import(entry);
+      if (mod.default?.protocol !== protocol || typeof mod.default.start !== "function") throw new Error("Expected process plugin definition");
+      const context = { ...message.params.context, signal: controller.signal,
+        state: { get: id => call("state.get", { id }), list: (afterId, limit) => call("state.list", { ...(afterId !== undefined ? { afterId } : {}), ...(limit !== undefined ? { limit } : {}) }),
+          command: (id, input, writes) => call("state.command", { id, input, writes }) },
+        call: (ref, method, args) => call("service.call", { ref, method, args }),
+        request: (ref, request) => call("contribution.request", { ref, request }),
+      };
+      handlers = await mod.default.start(context);
+      if (!handlers || typeof handlers !== "object" || Object.keys(handlers).some(key => !["handle", "poll", "send", "find", "receive", "observe", "close"].includes(key) || typeof handlers[key] !== "function")) throw new Error("Invalid process handlers");
+      result = { protocol, methods: Object.keys(handlers) };
+    } else {
+      if (!handlers || typeof handlers[message.method] !== "function") throw new Error("Unsupported process operation");
+      const params = message.params;
+      if (message.method === "poll" && params[0] === null) params[0] = undefined;
+      result = await handlers[message.method](...params);
+    }
+    write({ id: message.id, result: result ?? null });
+  } catch (error) { write({ id: message.id, error: { code: -32000, message: String(error?.message ?? "Plugin operation failed").slice(0, 2048) } }); }
+  finally { active--; }
+}
+let buffered = Buffer.alloc(0);
+for await (const chunk of process.stdin) {
+  if (performance.now() - inputWindow >= 60000) { inputWindow = performance.now(); inputBytes = 0; }
+  inputBytes += chunk.length;
+  if (inputBytes > 64 * 1024 * 1024) throw new Error("Process session input limit reached");
+  buffered = Buffer.concat([buffered, chunk]);
+  for (;;) {
+    const end = buffered.indexOf(10); if (end < 0) break;
+    if (end > maxBytes) throw new Error("Process frame exceeds limit");
+    const line = buffered.subarray(0, end); buffered = buffered.subarray(end + 1);
+    void dispatch(JSON.parse(line.toString("utf8"))).catch(() => process.exit(1));
+  }
+  if (buffered.length > maxBytes) throw new Error("Process frame exceeds limit");
+}
+controller.abort();
+for (const job of pending.values()) job.reject(new Error("Host disconnected"));
+process.exit(0);

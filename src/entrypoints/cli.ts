@@ -6043,7 +6043,11 @@ function writeHookExecutionEvent(
   ) })}\n`);
 }
 
-if (import.meta.main) {
+if (import.meta.main && process.argv[2] === "--internal-plugin-process") {
+  await (await import("../services/plugins/process-host")).runPluginProcessWorker();
+} else if (import.meta.main && process.argv[2] === "--internal-plugin-worker") {
+  await (await import("../services/plugins/process-host")).runPluginProcessEntry();
+} else if (import.meta.main) {
   setupGracefulShutdown();
   const suppliedArgv = normalizeCliArguments(Bun.argv.slice(2));
   const remoteControlSocket = suppliedArgv[0] === "remote-control"

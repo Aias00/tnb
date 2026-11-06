@@ -1,15 +1,19 @@
+import { processPluginTemplate } from "./process-template";
 import { pluginTemplate, type PluginTemplate } from "./templates";
 
 /** The distributable runtime is built from src/index.ts into package/index.mjs. */
-export function typescriptPluginTemplate(name: string, template: PluginTemplate, sdkTarball: string): Record<string, string> {
-  const files = pluginTemplate(name, template), manifest = JSON.parse(files["plugin.json"]!);
+export function typescriptPluginTemplate(name: string, template: PluginTemplate, sdkTarball: string, execution: "in-process" | "process" = "in-process"): Record<string, string> {
+  const files = execution === "process" ? processPluginTemplate(name, template) : pluginTemplate(name, template), manifest = JSON.parse(files["plugin.json"]!);
   for (const declarations of Object.values(manifest.contributes) as Array<Array<{ entry: string }>>) for (const row of declarations) row.entry = "index.mjs";
   let source = files["index.mjs"]!.replace("export default api =>", "const setup: HostPluginFactory = api =>");
-  const imports = `import { definePlugin, type HostPluginFactory${template === "agent" ? ", type JsonValue, type WorkerResources" : template === "channel" ? ", type JsonValue" : ""} } from "@tnb/plugin-sdk";\n\n`;
+  const imports = `import { definePlugin, type HostPluginFactory${template === "agent" ? ", defineAgent, type JsonValue, type WorkerResources" : template === "channel" ? ", type JsonValue" : ""} } from "@tnb/plugin-sdk";\n\n`;
   if (template === "agent") {
     source = source.replace('    if (!config || typeof config.message !== "string" || !config.message.trim()) throw new Error("config.message is required");', '    readText(config, "message");')
       .replaceAll("context.descriptor.config.message", 'readText(context.descriptor.config, "message")')
-      .replace("async createWorker(context) {", "async createWorker(context): Promise<WorkerResources> {");
+      .replace("async createWorker(context) {", "async createWorker(context): Promise<WorkerResources> {")
+      .replace("api.registerAdapter({", "api.registerAdapter(defineAgent({")
+      .replace('version: "1",\n  validate', 'version: "1",\n  configuration: { type: "object", properties: { message: { type: "string", minLength: 1 } }, required: ["message"], additionalProperties: false },\n  validate')
+      .replace(/\}\);\s*$/, "}));\n");
   } else if (template === "application") {
     source = source.replace('tx.get("visits")', 'tx.get<number>("visits")!').replaceAll('context.state.get("visits")', 'context.state.get<number>("visits")!');
   } else {
@@ -23,9 +27,12 @@ export function typescriptPluginTemplate(name: string, template: PluginTemplate,
   if (typeof text !== "string" || !text.trim()) throw new Error(key + " is required");
   return text;
 }\n\n`;
+  const processSource = execution === "process" ? `import { defineProcessPlugin, type ProcessPluginDefinition, type JsonValue } from "@tnb/plugin-sdk";\n${helper}\n` + files["index.mjs"]!.replace("export default {", "const definition: ProcessPluginDefinition = {")
+    .replace('  const configuration = context.configuration;', '  const configuration = { text: readText(context.configuration, "text") };')
+    .replace('context.state.get(message.id)', 'context.state.get<{ receipt: string }>(message.id)') + "\nexport default defineProcessPlugin(definition);\n" : undefined;
   const test = files["plugin.test.json"]!;
   return {
-    "src/index.ts": imports + helper + source + "\nexport default definePlugin(setup);\n",
+    "src/index.ts": processSource ?? imports + helper + source + "\nexport default definePlugin(setup);\n",
     "plugin.json": JSON.stringify(manifest, null, 2) + "\n",
     "plugin.test.json": test,
     "package.json": JSON.stringify({ name: `${name}-development`, private: true, type: "module", scripts: {
