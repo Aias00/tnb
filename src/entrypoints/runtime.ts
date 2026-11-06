@@ -7,9 +7,9 @@ import { ensureRuntime, assertConversationOwner, restartRuntime } from "../servi
 import { parseDeadline, extensionMilliseconds } from "../services/runtime/limits";
 import type { DurableRun } from "../services/runtime/types";
 import { registerCleanup } from "../utils/cleanup-registry";
-import { withOfflineRuntime, backupRuntime, restoreRuntime, pruneRuntime, runtimeStorageUsage } from "../services/runtime/maintenance";
+import { withOfflineRuntime, backupRuntime, checkRuntimeBackup, restoreRuntime, pruneRuntime, runtimeStorageUsage } from "../services/runtime/maintenance";
 
-const HELP = `Usage: tnb runtime <submit|status|result|list|events|questions|answer|limits|pause|resume|cancel|reconcile|start|restart|serve|stop|backup|restore|prune|storage|plugins> [options]
+const HELP = `Usage: tnb runtime <submit|status|result|list|events|questions|answer|limits|pause|resume|cancel|reconcile|start|restart|serve|stop|backup|backup-check|restore|prune|storage|plugins> [options]
 
 followup [run-id] --text "requirements" [--task ID] [--input-id ID]
   Select an unresolved input with --resolve-input ID --revision N and a run-id.
@@ -28,6 +28,7 @@ serve  Run the local owner in the foreground (normally started on demand).
 start / restart  Start or explicitly drain/restart the persistent service.
 stop   Drain and stop the service; accepted tasks remain recoverable.
 backup <directory> / restore <directory> / prune <run-id>  Offline maintenance; stop the service first.
+backup-check <directory>  Read-only verification of saved evidence and plugin assets; never starts the owner.
 storage  Show state size and free disk space.
 plugins  Show the running host's built-in and installed domain plugin generations.
 
@@ -47,6 +48,10 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
   const configDir = resolve(value("--config-dir") ?? options.env.TNB_HOME ?? join(homedir(), ".tnb"));
   try {
     if (!action || args.includes("--help") || args.includes("-h")) { options.stdout.write(HELP); return 0; }
+    if (action === "backup-check") {
+      if (!args[1] || args[1].startsWith("--")) throw new Error("A backup directory is required");
+      options.stdout.write(`${JSON.stringify(await checkRuntimeBackup(resolve(options.cwd, args[1])), null, 2)}\n`); return 0;
+    }
     if (action === "start" || action === "restart") {
       if (action === "restart") await restartRuntime(configDir, options.env); else await ensureRuntime(configDir, options.env);
       options.stdout.write(`${JSON.stringify(await runtimeRequest(configDir, "/health"), null, 2)}\n`); return 0;
@@ -146,11 +151,11 @@ export type RuntimeChatOptions = { args: string[]; cwd: string; workspace: strin
   env: Record<string, string | undefined>; provider: string; model: string; sessionId: string; sourceText?: string };
 export async function runRuntimeChatCommand(options: RuntimeChatOptions): Promise<string> {
   const args = options.args.length ? [...options.args] : ["list"]; const action = args[0]!;
-  if (!["followup", "routing", "submit", "list", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel", "storage", "start", "restart", "stop", "plugins"].includes(action)) throw new Error("/runtime supports submit, list, status, result, events, questions, answer, limits, pause, resume, cancel, storage, start, restart, stop and plugins.");
+  if (!["followup", "routing", "submit", "list", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel", "storage", "start", "restart", "stop", "plugins", "backup-check"].includes(action)) throw new Error("/runtime supports submit, list, status, result, events, questions, answer, limits, pause, resume, cancel, storage, start, restart, stop, plugins and backup-check.");
   const valueFlags = new Set(["--before-input", "--text", "--input-id", "--resolve-input", "--successor", "--cwd", "--mode", "--check", "--skill", "--mcp-tool", "--allow-workspace", "--provider", "--model", "--max-budget-usd", "--max-turns", "--command-id", "--config-dir", "--after", "--task", "--question", "--answer", "--version", "--deadline", "--extend-hours", "--revision"]);
   const flags = new Set(["--pending", "--allow-write", "--allow-shell", "--no-start", "--help", "-h"]);
   if (action === "followup" && (!args[1] || args[1].startsWith("--"))) args.splice(1, 0, "");
-  const hasTarget = ["followup", "submit", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel"].includes(action);
+  const hasTarget = ["followup", "submit", "status", "result", "events", "questions", "answer", "limits", "pause", "resume", "cancel", "backup-check"].includes(action);
   for (let index = hasTarget ? 2 : 1; index < args.length; index++) {
     const flag = args[index]!;
     if (valueFlags.has(flag)) { if (!args[index + 1] || args[index + 1]!.startsWith("--")) throw new Error(`${flag} requires a value`); index++; }

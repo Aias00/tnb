@@ -16,3 +16,5 @@ export { serveDurableRuntime, runtimeRequest, RUNTIME_CAPABILITIES } from "./ser
 export type { DurableRun, DurableTask, DurableAttempt, ExecutionPolicy, RuntimeEvent } from "./types";
 export { DomainRegistry } from "../../agent/domain";
 export type { AgentDomainAdapter, DomainDescriptor, DomainContext, ResourceClaim, CapabilityGrant } from "../../agent/domain";
+export { checkRuntimeBackup } from "./maintenance";
+export type { BackupInspection } from "./maintenance";

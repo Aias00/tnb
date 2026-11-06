@@ -281,6 +281,7 @@ tnb runtime resume RUN_ID
 tnb runtime stop
 # stop 返回的是停止请求；等服务退出/锁释放后再维护。
 tnb runtime backup /path/to/new-backup-directory
+tnb runtime backup-check /path/to/new-backup-directory
 tnb runtime storage
 # 只清理已结束、没有在途或未知效果的 Run。
 tnb runtime prune TERMINAL_RUN_ID
@@ -288,7 +289,9 @@ tnb runtime prune TERMINAL_RUN_ID
 tnb runtime restore /path/to/backup --config-dir /path/to/restored-config
 ```
 
-维护操作与服务共用 owner 锁，活跃服务会拒绝离线备份/恢复/清理。备份先核对/修复 journal/transcript bridge，再保存包含 WAL 已提交页的独立 SQLite 镜像、操作日志和不可变产物；逐文件校验，manifest 最后发布。单数据库备份镜像限制 512 MiB，恢复总量限制 10 GiB。不会导出控制密钥、Provider 配置、Shell 日志或用户项目。恢复逐文件有界校验，整个暂存目录验证后才发布；有问题的备份不会留下半个可执行数据库。恢复的活跃 Run 改为 paused，须核对快照之后的效果再显式 resume；原 owner 必须已永久退役，不能同时运行原数据和恢复副本。
+维护操作与服务共用 owner 锁，活跃服务会拒绝离线备份/恢复/清理。备份先核对/修复 journal/transcript bridge，再保存包含 WAL 已提交页的独立 SQLite 镜像、操作日志和不可变产物；逐文件校验，manifest 最后发布。v2 还保存历史插件包、私有文件、空目录及可执行标记，并核对数据库中的领域/渠道包引用。单数据库备份镜像限制 512 MiB，恢复总量限制 10 GiB。不会导出控制密钥、Provider 配置、Shell 日志或用户项目；安装目录和当前信任仍须另行准备。插件私有文件按原样复制，不提供脱敏或加密。恢复逐文件有界校验，整个暂存目录验证后才发布；有问题的备份不会留下半个可执行数据库。恢复的活跃 Run 改为 paused，须核对快照之后的效果再显式 resume；原 owner 必须已永久退役，不能同时运行原数据和恢复副本。
+
+`backup-check` 只读检查已保存的备份，不需要停止其他服务，不创建 owner、不 import 插件或运行迁移。结果区分材料完整性与静态兼容性；通过检查不代表配置、信任或业务服务已经就绪。旧 v1 仍可恢复，但明确报告插件材料未覆盖。对话可用 `/runtime backup-check /path/to/backup`；完整范围、权限和平台限制见[插件备份指南](guides/plugin-backup.md)。
 
 清理保留 command ID 回执作为去重墓碑，删除所选 Run 的状态/事件/任务日志，并回收不再被任何保留任务、事件或执行记录引用的产物。已清理的回执可能包含失效 artifact 引用，这是显式删除的结果，不会把 ID 再用成一项新业务。磁盘空间充足时整理 SQLite 以释放页。旧 Goal/Task/Workflow 不自动导入，也不改写旧 session；只有新 runtime 接纳的任务拥有这里的恢复协议。
 

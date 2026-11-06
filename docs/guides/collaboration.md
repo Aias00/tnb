@@ -120,7 +120,7 @@ tnb collaboration outbox-resolve NOTIFICATION_ID --revision N --decision retry -
 
 已过期的问题通知会标记 suppressed；不会把旧问题再交给用户。轮询、接单投影、通知发送和 PR 查询分别推进，慢来源不会阻塞其他渠道通知。PR 每轮最多并发查询 4 个，每 30 秒轮转检查；通知每轮最多发送 16 个目标线程，每线程按持久序号发起发送。unknown 不阻止后续独立问题/结果通知，因此跨渠道不承诺严格送达顺序或 exactly-once。
 
-协作事实和原执行事实在同一 SQLite 中。沿用 `runtime stop/backup/restore`；备份运行时数据库与证据，不包含配置文件或凭据，需要单独保管 configuration/env。仍被工单引用的 Run 不能直接 prune。每个应用命名空间最多 10,000 条、单条最多 128 KiB，达到容量后明确停止接收/投影并暴露错误，不静默丢弃或解除去重身份。自动归档/清理策略留待后续；本版上线前应根据事件频率评估容量并保留离线备份。
+协作事实和原执行事实在同一 SQLite 中。沿用 `runtime stop/backup/restore`；备份 v2 同时保存证据、历史渠道包和插件私有文件，新增 `runtime backup-check` 只读检查，见[备份指南](plugin-backup.md)。用户配置、安装包、trust store 和 configuration/env 仍需另行准备；插件私有文件按原样保存，可能包含其自行保管的秘密。仍被工单引用的 Run 不能直接 prune。每个应用命名空间最多 10,000 条、单条最多 128 KiB，达到容量后明确停止接收/投影并暴露错误，不静默丢弃或解除去重身份。自动归档/清理策略留待后续；本版上线前应根据事件频率评估容量并保留离线备份。
 
 ## 当前交付与后续
 

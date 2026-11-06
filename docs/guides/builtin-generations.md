@@ -41,4 +41,4 @@ SDK `openAgentRuntime` 自动提供批准表；直接使用 `loadHostPlugins` �
 
 macOS/Linux 验证完整运行与跨升级恢复；Windows 只验证安装、装载、归档与恢复选择，不扩大现有 owner 支持边界。默认 channels 后续也增加了独立包和固定来源恢复，详见 [渠道代际](channel-generations.md)。历史应用、Web 交互、热替换与插件进程隔离尚未实现；领域和渠道仍分别校验原 provenance。
 
-runtime backup 仍不包含历史可执行包，灾备需同时保存历史目录和相关配置；内置包还需保留 SQLite 中的宿主批准。外部凭据、原生依赖与远端服务也须继续满足任务原来的执行合同。
+runtime backup v2 已包含历史可执行包及插件私有文件，`backup-check` 会区分材料完整性和当前恢复 ABI；v1 不具有该覆盖。内置宿主批准随原 SQLite 保存，恢复仍须满足当前 ABI、配置和原执行合同。详见[备份指南](plugin-backup.md)。
