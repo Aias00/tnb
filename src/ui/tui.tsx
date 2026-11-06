@@ -781,32 +781,39 @@ function StatusLine({
     : busy ? `enter queue · esc interrupt · ${queuedPromptCount} queued · ${queueKey} manage`
     : `enter send · ${toggleKey} tool · ${allKey} all · ${queueKey} queue`;
   const width = Math.max(1, columns - 2);
-  const totals = `${cost ? cost.replace(/^ · /, "") + " · " : ""}会话累计 ↑${inputTokens.toLocaleString()} ↓${usage.outputTokens.toLocaleString()} tokens`;
+  const cumulative = `会话累计 ↑${inputTokens.toLocaleString()} ↓${usage.outputTokens.toLocaleString()} tokens`;
+  const costText = cost.replace(/^ · /, ""), primaryCost = costText.split(" · ")[0] ?? "";
   const modelWidth = Math.min(stringWidth(`${model} · ${permissionMode}`), Math.floor(width * 0.45));
-  const contextWidth = Math.min(stringWidth(context), Math.floor(width * 0.35));
-  const workspaceWidth = workspaceLabel ? Math.max(0, Math.min(stringWidth(workspaceLabel), width - modelWidth - contextWidth - 4)) : 0;
-  const metadataRow = <Box width={width} height={1} gap={2} justifyContent="space-between">
-    <Box width={modelWidth} flexShrink={0}><Text wrap="truncate-end"><Text bold>{model}</Text><Text dimColor> · {permissionMode}</Text></Text></Box>
-    <Box width={contextWidth} flexShrink={0}><Text dimColor wrap="truncate-end">{context}</Text></Box>
-    {workspaceWidth > 0 ? <Box width={workspaceWidth} flexShrink={0}><Text dimColor wrap="truncate-middle">{workspaceLabel}</Text></Box> : null}
-  </Box>;
   if (columns >= 80) {
-    const totalsWidth = Math.min(stringWidth(totals), Math.floor(width * 0.75));
+    const available = Math.max(0, width - modelWidth - 4);
+    const rightMinimum = Math.min(available, stringWidth(primaryCost));
+    const middle = Math.min(Math.max(stringWidth(context), stringWidth(cumulative)), available - rightMinimum);
+    const right = Math.min(Math.max(stringWidth(workspaceLabel ?? ""), stringWidth(costText)), available - middle);
+    const left = width - middle - right - 4;
+    const visibleCost = right < stringWidth(costText) ? primaryCost : costText;
     return <Box flexShrink={0} height={2} flexDirection="column" width={width}>
-      {metadataRow}
       <Box height={1} width={width} gap={2}>
-        <Box flexGrow={1} flexBasis={0} minWidth={0}><Text dimColor wrap="truncate-end">{hints}</Text></Box>
-        <Box width={totalsWidth} flexShrink={0}><Text dimColor wrap="truncate-end">{totals}</Text></Box>
+        <Box width={left} flexShrink={0}><Text wrap="truncate-end"><Text bold>{model}</Text><Text dimColor> · {permissionMode}</Text></Text></Box>
+        <Box width={middle} flexShrink={0}><Text dimColor wrap="truncate-end">{context}</Text></Box>
+        <Box width={right} flexShrink={0}><Text dimColor wrap="truncate-middle">{workspaceLabel ?? ""}</Text></Box>
+      </Box>
+      <Box height={1} width={width} gap={2}>
+        <Box width={left} flexShrink={0}><Text dimColor wrap="truncate-end">{hints}</Text></Box>
+        <Box width={middle} flexShrink={0}><Text dimColor wrap="truncate-end">{cumulative}</Text></Box>
+        <Box width={right} flexShrink={0}><Text dimColor wrap="truncate-end">{visibleCost}</Text></Box>
       </Box>
     </Box>;
   }
-  return statusLineRows(rows, columns) === 3 ? (
-    <Box flexShrink={0} height={3} flexDirection="column">
-      {metadataRow}
-      <Text dimColor wrap="truncate-end">{totals}</Text>
-      <Text dimColor wrap="truncate-end">{hints}</Text>
-    </Box>
-  ) : (
+  if (statusLineRows(rows, columns) === 3) {
+    const right = Math.min(Math.max(stringWidth(context), stringWidth(cumulative), stringWidth(primaryCost)), Math.max(0, width - modelWidth - 2));
+    const left = Math.max(0, width - right - 2), visibleCost = right < stringWidth(costText) ? primaryCost : costText;
+    return <Box flexShrink={0} height={3} width={width} flexDirection="column">
+      <Box height={1} gap={2}><Box width={left} flexShrink={0}><Text wrap="truncate-end"><Text bold>{model}</Text><Text dimColor> · {permissionMode}</Text></Text></Box><Box width={right} flexShrink={0}><Text dimColor wrap="truncate-end">{context}</Text></Box></Box>
+      <Box height={1} gap={2}><Box width={left} flexShrink={0}><Text dimColor wrap="truncate-middle">{workspaceLabel ?? ""}</Text></Box><Box width={right} flexShrink={0}><Text dimColor wrap="truncate-end">{cumulative}</Text></Box></Box>
+      <Box height={1} gap={2}><Box width={left} flexShrink={0}><Text dimColor wrap="truncate-end">{hints}</Text></Box><Box width={right} flexShrink={0}><Text dimColor wrap="truncate-end">{visibleCost}</Text></Box></Box>
+    </Box>;
+  }
+  return (
     <Box flexShrink={0} height={2} flexDirection="column">
       <Text dimColor wrap="truncate-end">{hints}</Text>
       <Text wrap="truncate-end"><Text bold>{model}</Text><Text dimColor>{cost} · {context} · {permissionMode}</Text></Text>

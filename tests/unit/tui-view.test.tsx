@@ -772,3 +772,13 @@ test("horizontal footer stays within standard widths and keeps the invocation bu
     for (const line of frame.split("\n")) expect(stringWidth(line)).toBeLessThanOrEqual(columns);
   }
 });
+
+test("context and session totals share a fixed column across both footer rows", () => {
+  const { stringWidth } = require("../../src/ui/ink/stringWidth");
+  const state = { ...createTuiState("glm-5", "bypassPermissions", { usage: { inputTokens:540769, outputTokens:3114, cacheReadInputTokens:0, cacheCreationInputTokens:0, costUsd:0 } }), contextSource:"history" as const, lastInputTokens:5819 };
+  for (const columns of [60,80,100,180]) {
+    const frame = renderToString(<TuiView state={state} input="" cursor={0} columns={columns} rows={24} workspaceLabel="/Users/aias/Work/claude-code (main)" />, { columns });
+    const lines=frame.split("\n"), history=lines.find(line=>line.includes("历史文本"))!, totals=lines.find(line=>line.includes("会话累计"))!;
+    expect(stringWidth(history.slice(0,history.indexOf("历史文本")))).toBe(stringWidth(totals.slice(0,totals.indexOf("会话累计"))));
+  }
+});
