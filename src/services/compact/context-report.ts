@@ -38,6 +38,6 @@ export function formatContextReport(report: ContextReport): string {
     ...(report.outputReserve !== undefined ? [`Output reserve: ${report.outputReserve.toLocaleString()} tokens`] : ["Output reserve: unavailable"]),
     ...(report.mediaBlocks ? [`Media attachments: ${report.mediaBlocks} · token cost not included`] : []),
     ...(report.source === "history" ? ["System instructions and tool definitions unavailable until the next model request."] : [`Snapshot: ${report.capturedAt} · follow-up messages may differ.`]),
-    "Estimates use serialized text length, not the Provider tokenizer. Provider-reported input is shown separately in the status bar.",
+    "Estimates use serialized text length, not the Provider tokenizer. The status bar distinguishes Provider-reported input, request estimates and restored-history text estimates.",
   ].join("\n");
 }

@@ -256,6 +256,8 @@ export const TuiView = memo(function TuiView({
         busy={state.busy}
         usage={state.usage}
         lastInputTokens={state.lastInputTokens}
+        contextSource={state.contextSource}
+        contextMediaBlocks={state.contextMediaBlocks}
         contextWindowTokens={state.contextWindowTokens}
         modal={Boolean(permission || question || management || transcriptSearch || historySearch || shellPanel || queuePanel || workbench)}
         {...(workspaceLabel ? { workspaceLabel } : {})}
@@ -738,6 +740,8 @@ function StatusLine({
   busy,
   usage,
   lastInputTokens,
+  contextSource,
+  contextMediaBlocks,
   contextWindowTokens,
   modal,
   transcriptOffset,
@@ -753,6 +757,8 @@ function StatusLine({
   busy: boolean;
   usage: TuiState["usage"];
   lastInputTokens: number;
+  contextSource?: TuiState["contextSource"];
+  contextMediaBlocks?: number;
   contextWindowTokens: number;
   modal: boolean;
   transcriptOffset: number;
@@ -765,7 +771,7 @@ function StatusLine({
   const allKey = useKeybindingLabel("toggleTranscript");
   const inputTokens = usage.inputTokens + usage.cacheReadInputTokens + usage.cacheCreationInputTokens;
   const cost = invocationBudgetUsd !== undefined || usage.costUsd || invocationUsage.costUsd ? ` · 本轮 $${invocationUsage.costUsd.toFixed(4)}${invocationBudgetUsd !== undefined ? `/$${invocationBudgetUsd.toFixed(2)}` : ""} · 会话 $${usage.costUsd.toFixed(4)}` : "";
-  const context = contextLabel(lastInputTokens, contextWindowTokens);
+  const context = contextLabel(lastInputTokens, contextWindowTokens, contextSource, contextMediaBlocks);
   const hints = modal ? "follow dialog controls"
     : transcriptOffset > 0 ? `PgUp/PgDn · Shift+↑/↓ · Ctrl+End latest · ${transcriptOffset} newer`
     : busy ? `enter queue · esc interrupt · ${queuedPromptCount} queued · ${queueKey} manage`
@@ -785,10 +791,14 @@ function StatusLine({
   );
 }
 
-function contextLabel(input: number, window: number): string {
-  if (!input || !window) return "上下文 待获取";
+function contextLabel(input: number, window: number, source?: TuiState["contextSource"], mediaBlocks = 0): string {
+  const media = mediaBlocks ? " +媒体" : "";
+  if (source === "history") return `历史文本 ≈${input.toLocaleString()} tokens${media}`;
+  if (!input && !source) return "上下文 待获取";
+  const estimated = source === "request" ? "≈" : "";
+  if (!window) return `上下文 ${estimated}${input.toLocaleString()} tokens${media}`;
   const percentage = Math.min(100, input / window * 100);
-  return `上下文 ${percentage > 0 && percentage < 1 ? "<1" : percentage.toFixed(0)}%`;
+  return `${source === "request" && mediaBlocks ? "文本上下文" : "上下文"} ${estimated}${percentage > 0 && percentage < 1 ? "<1" : percentage.toFixed(0)}%${media}`;
 }
 
 function compactJson(value: unknown): string {

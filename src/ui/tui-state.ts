@@ -1,3 +1,4 @@
+import type { ContextReport } from "../services/compact/context-report";
 import type { PromptInputSubmit } from "./prompt-input/types";
 import type { PermissionMode } from "../core/permissions";
 import type { ModelEvent } from "../providers/types";
@@ -39,12 +40,15 @@ export type TuiState = {
   invocationUsage: UsageTotals;
   usageFromLedger: boolean;
   lastInputTokens: number;
+  contextSource?: "provider" | "request" | "history";
+  contextMediaBlocks?: number;
   contextWindowTokens: number;
   transcript: TranscriptEntry[];
   nextTranscriptSequence: number;
 };
 
 export type TuiAction =
+  | { type: "context-report"; report: ContextReport }
   | { type: "ledger-usage"; usage: UsageTotals; delta: UsageTotals; sessionUsage?: UsageTotals; currentInvocation: boolean }
   | { type: "activity"; phase: "working" | "compacting" }
   | { type: "notice"; message: string; noticeId?: string }
@@ -60,6 +64,7 @@ export type TuiAction =
       restoredMessages?: TuiMessage[];
       restoredTranscript?: TranscriptEntry[];
       restoredUsage?: UsageTotals;
+      restoredContextReport?: ContextReport;
     }
   | { type: "model-event"; event: ModelEvent }
   | { type: "tool-start"; id: string; name: string; input: unknown; startedAt?: number }
@@ -76,6 +81,7 @@ export function createTuiState(
     transcript?: TranscriptEntry[];
     usage?: UsageTotals;
     contextWindowTokens?: number;
+    contextReport?: ContextReport;
   },
 ): TuiState {
   const transcript = initial?.transcript ? structuredClone(initial.transcript) : [];
@@ -90,7 +96,9 @@ export function createTuiState(
     usage: initial?.usage ? { ...initial.usage } : { ...EMPTY_USAGE },
     invocationUsage: { ...EMPTY_USAGE },
     usageFromLedger: false,
-    lastInputTokens: 0,
+    lastInputTokens: initial?.contextReport?.estimatedInput ?? 0,
+    contextSource: initial?.contextReport?.source,
+    contextMediaBlocks: initial?.contextReport?.mediaBlocks ?? 0,
     contextWindowTokens: initial?.contextWindowTokens ?? 0,
     transcript,
     nextTranscriptSequence: transcript.reduce(
@@ -125,6 +133,7 @@ function commitStreamingText(state: TuiState): TuiState {
 }
 
 export function reduceTuiState(state: TuiState, action: TuiAction): TuiState {
+  if (action.type === "context-report") return { ...state, lastInputTokens: action.report.estimatedInput, contextSource: action.report.source, contextMediaBlocks: action.report.mediaBlocks };
   if (action.type === "ledger-usage") {
     const saved = action.sessionUsage;
     const usage: UsageTotals = saved ? {
@@ -196,18 +205,21 @@ export function reduceTuiState(state: TuiState, action: TuiAction): TuiState {
       usage: action.restoredUsage ? { ...action.restoredUsage } : action.resetSession ? { ...EMPTY_USAGE } : state.usage,
       invocationUsage: action.resetSession ? { ...EMPTY_USAGE } : state.invocationUsage,
       usageFromLedger: action.resetSession ? false : state.usageFromLedger,
-      lastInputTokens: action.resetSession ? 0 : state.lastInputTokens,
+      lastInputTokens: action.restoredContextReport?.estimatedInput ?? (action.resetSession || action.restoredTranscript || action.model && action.model !== state.model ? 0 : state.lastInputTokens),
+      contextSource: action.restoredContextReport?.source ?? (action.resetSession || action.restoredTranscript || action.model && action.model !== state.model ? undefined : state.contextSource),
+      contextMediaBlocks: action.restoredContextReport?.mediaBlocks ?? (action.resetSession || action.restoredTranscript || action.model && action.model !== state.model ? 0 : state.contextMediaBlocks),
     };
   }
   if (action.type === "model-event") {
     if (action.event.type === "response-end") return commitStreamingText(state);
     if (action.event.type === "usage") {
       const lastInputTokens = action.event.usage.inputTokens + action.event.usage.cacheReadInputTokens + action.event.usage.cacheCreationInputTokens;
-      if (state.usageFromLedger) return { ...state, lastInputTokens };
+      const context = Number.isFinite(lastInputTokens) && lastInputTokens > 0 ? { lastInputTokens, contextSource: "provider" as const, contextMediaBlocks: 0 } : {};
+      if (state.usageFromLedger) return { ...state, ...context };
       const usage = addUsage(state.usage, action.event.usage);
       return {
         ...state,
-        lastInputTokens,
+        ...context,
         invocationUsage: addUsage(state.invocationUsage, action.event.usage) as UsageTotals,
         usage: {
           ...usage,

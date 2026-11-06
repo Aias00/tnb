@@ -1148,7 +1148,6 @@ export async function runCli(options: CliOptions): Promise<number> {
     }).transport;
     const { transport } = createModelExecution({ selection, fallbackSelection, reasoningEffort: parsed.thinking,
       fastMode: effectiveFastMode, transport: options.transport, budget, workspace: options.cwd,
-      onRequest: request => { if (options.onContextReport) options.onContextReport(contextReport({ request, messages: [], contextWindow: selection.model.contextWindow, maxOutputTokens: selection.model.maxTokens })); },
     });
     options.onInvocationTransport?.(transport);
     const hooks = options.hookRunner ?? new HookRunner({
@@ -2014,6 +2013,7 @@ export async function runCli(options: CliOptions): Promise<number> {
     const mainMaxTurns = parsed.maxTurns ?? mainAgentProfile?.maxTurns;
     const result = await runAgentLoop({
       transport,
+      ...(options.onContextReport ? { onModelRequest: (request: import("../providers/types").ModelRequest) => options.onContextReport?.(contextReport({ request, messages: [], contextWindow: options.contextWindowOverride ?? selection.model.contextWindow, maxOutputTokens: selection.model.maxTokens })) } : {}),
       model: selectedModel,
       prompt: explicitPromptContent ?? expandedCommand?.prompt ?? parsed.prompt,
       ...(options.promptInput ? { promptInput: options.promptInput } : {}),
@@ -2149,6 +2149,7 @@ export async function runCli(options: CliOptions): Promise<number> {
           permissionMode: mode.mode,
           ...(mode.prePlanMode ? { prePlanMode: mode.prePlanMode } : {}),
         });
+        try { options.onContextReport?.(contextReport({ messages, contextWindow: options.contextWindowOverride ?? selection.model.contextWindow })); } catch { /* UI observer only. */ }
         try { options.onCompaction?.(preTokens, postTokens, info); } catch { /* UI observer only. */ }
       },
       authorize: (tool, input, { toolUseId, preApproved }) =>
@@ -2760,6 +2761,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
       ...(preparedSession.state
         ? {
             initialTranscript: conversationDisplayTranscript(preparedSession.state.messages),
+            ...(preparedSession.state.messages.length ? { initialContextReport: contextReport({ messages: preparedSession.state.messages, contextWindow: activeContextWindow }) } : {}),
             initialInputHistory: preparedSession.state.promptHistory ?? [],
             ...(preparedSession.state.usage ? { initialUsage: preparedSession.state.usage } : {}),
           }
@@ -3077,7 +3079,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
             askUser: turn.questionPrompt,
             quiet: true,
             signal: turn.signal,
-            onContextReport: report => { lastContextReport = { sessionId: turn.sessionId, report }; },
+            onContextReport: report => { lastContextReport = { sessionId: turn.sessionId, report }; turn.onContextReport?.(report); },
             onInvocationUsage: turn.onUsage,
             onEvent: turn.onModelEvent,
             onActivity: turn.onActivity,
@@ -3577,7 +3579,9 @@ export async function runInteractiveSlashCommand(
     }
     const selection = resolveInteractiveModel(context.providerCatalog, command.argument);
     context.switchSelection(selection);
+    const state = await readInteractiveSessionState(context, command.sessionId);
     return {
+      ...(state.messages.length ? { restoredContextReport: contextReport({ messages: state.messages, contextWindow: context.currentContextWindow() }) } : {}),
       model: selection.model.id,
       contextWindowTokens: selection.model.contextWindow,
       message: `Switched to ${selection.provider.id}/${selection.model.id}.`,
@@ -3992,6 +3996,7 @@ export async function runInteractiveSlashCommand(
       resumeSession: messages.length > 0,
       sessionId: command.sessionId,
       restoredTranscript: conversationDisplayTranscript(messages),
+      restoredContextReport: contextReport({ messages, contextWindow: context.currentContextWindow() }),
       restoredUsage: state.usage ?? { ...EMPTY_USAGE },
       restoredInputHistory: sessionInputHistory(messages),
       permissionMode: context.currentPermissionMode(),
@@ -4047,7 +4052,8 @@ export async function runInteractiveSlashCommand(
     try { await context.resetSession(command.sessionId, "resume"); }
     catch (error) { throw new Error(`Restoration completed, but reloading the active session failed: ${String(error)}`); }
     return { resetSession: true, resumeSession: result.messages!.length > 0, sessionId: command.sessionId,
-      restoredTranscript: conversationDisplayTranscript(result.messages!), restoredUsage: result.usage ?? { ...EMPTY_USAGE },
+      restoredTranscript: conversationDisplayTranscript(result.messages!),
+      restoredContextReport: contextReport({ messages: result.messages!, contextWindow: context.currentContextWindow() }), restoredUsage: result.usage ?? { ...EMPTY_USAGE },
       restoredInputHistory: sessionInputHistory(result.messages!), permissionMode: context.currentPermissionMode(),
       message: `Restored ${scope === "both" ? "files and conversation" : "conversation only"} from checkpoint ${id}.` };
   }
@@ -4443,6 +4449,7 @@ export async function runInteractiveSlashCommand(
       resumeSession: true,
       sessionId: command.nextSessionId,
       restoredTranscript: conversationDisplayTranscript(state.messages),
+      restoredContextReport: contextReport({ messages: state.messages, contextWindow: context.currentContextWindow() }),
       restoredUsage: state.usage ?? { ...EMPTY_USAGE },
       restoredInputHistory: sessionInputHistory(state.messages),
       permissionMode: context.currentPermissionMode(),
@@ -4468,6 +4475,7 @@ export async function runInteractiveSlashCommand(
     return {
       resetSession: true, resumeSession: true, sessionId: command.nextSessionId,
       restoredTranscript: conversationDisplayTranscript(state.messages),
+      restoredContextReport: contextReport({ messages: state.messages, contextWindow: context.currentContextWindow() }),
       restoredUsage: state.usage ?? { ...EMPTY_USAGE },
       restoredInputHistory: sessionInputHistory(state.messages),
       permissionMode: context.currentPermissionMode(),
@@ -4593,6 +4601,7 @@ export async function runInteractiveSlashCommand(
     });
     return {
       message: `Compacted ${result.preTokens.toLocaleString()} estimated tokens to ${result.postTokens.toLocaleString()}.`,
+      restoredContextReport: contextReport({ messages: result.messages, contextWindow: context.currentContextWindow() }),
     };
   }
   if (command.name === "clear") {
@@ -4694,6 +4703,7 @@ async function resumeInteractiveSession(
     resumeSession: true,
     sessionId,
     restoredTranscript: conversationDisplayTranscript(state.messages),
+      restoredContextReport: contextReport({ messages: state.messages, contextWindow: context.currentContextWindow() }),
       restoredUsage: state.usage ?? { ...EMPTY_USAGE },
     restoredInputHistory: sessionInputHistory(state.messages),
     permissionMode: context.currentPermissionMode(),

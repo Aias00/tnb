@@ -616,3 +616,22 @@ test("footer separates session totals from model context and silent cleanup does
     await ui.resize(42, 12); expect(ui.screen()).toContain("enter queue"); expect(ui.screen().split("\n").at(-1)).toContain("test");
   } finally { finish(); ui.close(); }
 });
+
+test("resumed context displays history estimates, then request estimates and provider input without using cumulative totals", async () => {
+  const { contextReport } = await import("../../src/services/compact/context-report");
+  const report = contextReport({ messages: [{ role: "user", content: [{ type: "text", text: "saved context" }] }], contextWindow: 200000 });
+  let turn: TuiTurn | undefined, finish=()=>{};
+  const ui = await interactive({ contextWindowTokens: 200000, initialContextReport: report, initialUsage: { inputTokens:139128, outputTokens:265, cacheReadInputTokens:0, cacheCreationInputTokens:0, costUsd:0 }, runTurn: current => { turn=current; return new Promise<void>(resolve=>{finish=resolve;}); }, runCommand: async request => ({ resetSession: true, sessionId: request.nextSessionId, message: "cleared" }) });
+  try {
+    await until(() => ui.screen().includes("历史文本 ≈"));
+    expect(ui.screen()).toContain("历史文本 ≈"); expect(ui.screen()).toContain("139,128"); expect(ui.screen()).not.toContain("上下文 待获取");
+    await ui.send("continue"); await ui.send("\r"); await until(()=>Boolean(turn));
+    turn!.onContextReport?.({ ...report, source:"request", estimatedInput:8000 }); await until(()=>ui.screen().includes("上下文 ≈4%"));
+    turn!.onModelEvent({type:"usage",usage:{inputTokens:6000,cacheReadInputTokens:1000,cacheCreationInputTokens:0,outputTokens:0}}); await until(()=>ui.screen().includes("上下文 4%"));
+    turn!.onModelEvent({type:"usage",usage:{inputTokens:0,cacheReadInputTokens:0,cacheCreationInputTokens:0,outputTokens:265}}); await Bun.sleep(40); expect(ui.screen()).not.toContain("待获取"); expect(ui.screen()).toContain("上下文 4%");
+    finish(); await until(()=>ui.screen().includes("enter send"));
+    await ui.send("/clear"); await ui.send("\r"); await until(()=>ui.screen().includes("cleared"));
+    turn!.onContextReport?.({ ...report, source:"request", estimatedInput:100000 }); await Bun.sleep(40);
+    expect(ui.screen()).toContain("上下文 待获取"); expect(ui.screen()).not.toContain("上下文 ≈50%");
+  } finally { finish(); ui.close(); }
+});

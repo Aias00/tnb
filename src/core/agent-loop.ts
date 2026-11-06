@@ -11,7 +11,7 @@ import { executeTool } from "./tool-runtime";
 import { assertBalancedToolHistory } from "./history";
 import { toolCallScope, type ToolCallJournal } from "./call-journal";
 import type { ToolCatalog } from "./tool-search";
-import type { ModelEvent, ModelTransport, StopReason, TokenUsage } from "../providers/types";
+import type { ModelEvent, ModelRequest, ModelTransport, StopReason, TokenUsage } from "../providers/types";
 import { addUsage, EMPTY_USAGE } from "../services/usage/cost";
 import type { PersistedPromptInput } from "./prompt-input";
 
@@ -60,6 +60,8 @@ export type AgentLoopOptions = {
     input: unknown,
     context: { toolUseId: string; preApproved?: boolean },
   ): Promise<AuthorizationDecision>;
+  /** Observes this loop's prepared request only; never a child or maintenance request. */
+  onModelRequest?(request: ModelRequest): void;
   onEvent?(event: ModelEvent): void;
   onToolEvent?(event: ToolExecutionEvent): void;
   onMessage?(message: ConversationMessage, context?: { stopReason?: StopReason }): void | Promise<void>;
@@ -164,8 +166,7 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<{
       blocks.clear();
       stopReason = undefined;
       try {
-        for await (const event of options.transport.stream(
-          {
+        const request: ModelRequest = {
             model: options.model,
             ...(options.systemPrompt
               ? { systemPrompt: typeof options.systemPrompt === "function" ? options.systemPrompt() : options.systemPrompt }
@@ -176,9 +177,9 @@ export async function runAgentLoop(options: AgentLoopOptions): Promise<{
               description,
               inputSchema,
             })),
-          },
-          signal,
-        )) {
+        };
+        try { options.onModelRequest?.(structuredClone(request)); } catch { /* Observation cannot change execution. */ }
+        for await (const event of options.transport.stream(request, signal)) {
           signal.throwIfAborted();
           options.onEvent?.(event);
           if (event.type === "usage") {

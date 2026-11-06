@@ -209,7 +209,7 @@ describe("TUI state", () => {
     expect(state.permissionMode).toBe("plan");
   });
 
-  test("tracks the latest provider input against the active context window", () => {
+  test("tracks provider input and invalidates it when switching models", () => {
     let state = createTuiState("test", "default", { contextWindowTokens: 200_000 });
     state = reduceTuiState(state, {
       type: "model-event",
@@ -231,7 +231,7 @@ describe("TUI state", () => {
       model: "larger-model",
       contextWindowTokens: 300_000,
     });
-    expect(state).toMatchObject({ model: "larger-model", contextWindowTokens: 300_000, lastInputTokens: 90_000 });
+    expect(state).toMatchObject({ model: "larger-model", contextWindowTokens: 300_000, lastInputTokens: 0, contextSource: undefined });
   });
 });
 
@@ -255,4 +255,27 @@ test("restoring a conversation restores its ledger totals without reusing the pr
   state = reduceTuiState(state, { type: "submit", text: "next" });
   expect(state.usage.costUsd).toBe(4);
   expect(state.invocationUsage.costUsd).toBe(0);
+});
+
+test("output-only usage does not erase the last request's input context", () => {
+  let state = createTuiState("fixture", "default", { contextWindowTokens: 200000 });
+  state = reduceTuiState(state, { type: "model-event", event: { type: "usage", usage: { inputTokens: 3000, cacheReadInputTokens: 2000, cacheCreationInputTokens: 0, outputTokens: 0 } } });
+  state = reduceTuiState(state, { type: "model-event", event: { type: "usage", usage: { inputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, outputTokens: 265 } } });
+  expect(state.lastInputTokens).toBe(5000);
+  expect(state.usage.outputTokens).toBe(265);
+});
+
+test("request estimates and restored history are distinct from cumulative ledgers and provider context", async () => {
+  const { contextReport } = await import("../../src/services/compact/context-report");
+  const report = contextReport({ messages: [{ role: "user", content: [{ type: "text", text: "restored history" }] }], contextWindow: 200000 });
+  let state = createTuiState("fixture", "default", { contextWindowTokens: 200000, contextReport: report, usage: { inputTokens: 139128, outputTokens: 265, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUsd: 0 } });
+  expect(state.contextSource).toBe("history"); expect(state.lastInputTokens).toBe(report.estimatedInput); expect(state.lastInputTokens).not.toBe(139128);
+  state = reduceTuiState(state, { type: "context-report", report: { ...report, source: "request", estimatedInput: 8000 } });
+  const saved = state.usage;
+  state = reduceTuiState(state, { type: "ledger-usage", usage: { ...saved, inputTokens: 300000 }, delta: { ...saved, inputTokens: 3000 }, sessionUsage: { ...saved, inputTokens: 600000 }, currentInvocation: false });
+  expect(state.contextSource).toBe("request"); expect(state.lastInputTokens).toBe(8000);
+  state = reduceTuiState(state, { type: "model-event", event: { type: "usage", usage: { inputTokens: 6000, cacheReadInputTokens: 1000, cacheCreationInputTokens: 0, outputTokens: 0 } } });
+  expect(state.contextSource).toBe("provider"); expect(state.lastInputTokens).toBe(7000);
+  state = reduceTuiState(state, { type: "command-complete", model: "different-model" }); expect(state.lastInputTokens).toBe(0); expect(state.contextSource).toBeUndefined();
+  state = reduceTuiState(state, { type: "command-complete", resetSession: true, restoredContextReport: report }); expect(state.contextSource).toBe("history"); expect(state.lastInputTokens).toBe(report.estimatedInput);
 });

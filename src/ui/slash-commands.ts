@@ -431,6 +431,7 @@ export type SlashCommandResult = {
   >;
   restoredTranscript?: TranscriptEntry[];
   restoredUsage?: import("../services/usage/cost").UsageTotals;
+  restoredContextReport?: import("../services/compact/context-report").ContextReport;
   restoredInputHistory?: string[];
   management?: ManagementView;
   clipboardText?: string;

@@ -1,3 +1,4 @@
+import type { ContextReport } from "../services/compact/context-report";
 import { CompactionNotices } from "../services/compact/notice";
 import { AwayRecap } from "../services/notifications/away-recap";
 import TerminalFocusContext from "./ink/components/TerminalFocusContext";
@@ -66,6 +67,7 @@ export type TuiTurn = {
   sessionId: string;
   resume: boolean;
   signal: AbortSignal;
+  onContextReport?(report: ContextReport): void;
   onModelEvent(event: ModelEvent): void;
   /** Authoritative ledger snapshot, delivered before its model usage event. */
   onUsage(usage: UsageTotals, sessionUsage?: UsageTotals): void;
@@ -110,6 +112,7 @@ export type TuiAppOptions = {
   initialTranscript?: TranscriptEntry[];
   initialInputHistory?: PromptHistoryEntry[];
   initialUsage?: UsageTotals;
+  initialContextReport?: ContextReport;
   stdout?: NodeJS.WriteStream;
 };
 
@@ -239,6 +242,7 @@ export function TuiApp(options: TuiAppOptions) {
     createTuiState(options.model, options.permissionMode, {
       ...(options.initialTranscript ? { transcript: options.initialTranscript } : {}),
       ...(options.initialUsage ? { usage: options.initialUsage } : {}),
+      ...(options.initialContextReport ? { contextReport: options.initialContextReport } : {}),
       ...(options.contextWindowTokens ? { contextWindowTokens: options.contextWindowTokens } : {}),
     }),
   );
@@ -617,6 +621,9 @@ export function TuiApp(options: TuiAppOptions) {
           type: "ledger-usage", usage: reportedUsage, delta, sessionUsage,
           currentInvocation: invocationSequence.current === invocation && usageSessionEpoch.current === invocationEpoch,
         });
+      },
+      onContextReport(report) {
+        if (sessionId.current === invocationSession && usageSessionEpoch.current === invocationEpoch && invocationSequence.current === invocation) dispatch({ type: "context-report", report });
       },
       onModelEvent(event) {
         if (event.type === "retry") setPhase(event.phase === "waiting"
