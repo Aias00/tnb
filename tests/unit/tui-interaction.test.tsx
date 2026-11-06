@@ -43,6 +43,7 @@ test("queues prompts without losing drafts and navigates slash commands", async 
     finish[1]!();
     await until(() => turns.length === 3);
     expect(turns[2]!.input.expanded).toBe("third");
+    await until(() => screen().includes("enter queue"));
     await send("\u001b");
     await until(() => turns[2]!.signal.aborted);
     finish[2]!();
@@ -51,6 +52,7 @@ test("queues prompts without losing drafts and navigates slash commands", async 
     await until(() => turns.length === 4);
     expect(turns[3]!.input.expanded).toBe("unfinished draft");
     finish[3]!();
+    await until(() => screen().includes("enter send"));
     await send("/mo");
     await send("\u001b[B");
     await send("\r");
@@ -380,4 +382,56 @@ test("theme changes, clear and a new waiting turn do not leave stale prompt/foot
     expect(ui.screen()).not.toContain("STALE_GHOST_ROW");
     expect(ui.screen().match(/enter queue/g)).toHaveLength(1);
   } finally { finish(); ui.close(); }
+});
+
+test("ledger snapshots keep invocation limits separate from session totals and late background usage", async () => {
+  const turns: TuiTurn[] = [];
+  const finishes: Array<() => void> = [];
+  const ui = await interactive({ invocationBudgetUsd: 3, runTurn: turn => { turns.push(turn); return new Promise<void>(resolve => finishes.push(resolve)); } });
+  const usage = (costUsd: number) => ({ inputTokens: Math.round(costUsd * 1000), outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUsd });
+  try {
+    await ui.send("first"); await ui.send("\r");
+    turns[0]!.onUsage(usage(1));
+    turns[0]!.onModelEvent({ type: "usage", usage: usage(1) });
+    await until(() => ui.screen().includes("会话 $1.0000"));
+    expect(ui.screen()).toContain("本轮 $1.0000/$3.00");
+    expect(ui.screen()).not.toContain("会话 $2.0000");
+    finishes[0]!(); await until(() => ui.screen().includes("enter send"));
+    await ui.send("second"); await ui.send("\r");
+    turns[1]!.onUsage(usage(0.5));
+    await until(() => ui.screen().includes("会话 $1.5000"));
+    expect(ui.screen()).toContain("本轮 $0.5000/$3.00");
+    turns[0]!.onUsage(usage(1.2));
+    turns[0]!.onUsage(usage(1.1));
+    turns[0]!.onUsage(usage(1.3));
+    await until(() => ui.screen().includes("会话 $1.8000"));
+    expect(ui.screen()).toContain("本轮 $0.5000/$3.00");
+    turns[1]!.onUsage(usage(3.1));
+    await until(() => ui.screen().includes("本轮 $3.1000/$3.00"));
+    expect(ui.screen()).toContain("会话 $4.4000");
+  } finally { for (const finish of finishes) finish(); ui.close(); }
+});
+
+test("a restored ledger rejects late snapshots from a previous activation of the same session", async () => {
+  const turns: TuiTurn[] = [];
+  const finishes: Array<() => void> = [];
+  const snapshot = (costUsd: number) => ({ inputTokens: 100, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUsd });
+  const ui = await interactive({ sessionIdFactory: () => "same-session", runTurn: turn => { turns.push(turn); return new Promise<void>(resolve => finishes.push(resolve)); },
+    runCommand: async () => ({ resetSession: true, resumeSession: true, sessionId: "same-session", restoredUsage: snapshot(5) }),
+  });
+  try {
+    await ui.send("first"); await ui.send("\r");
+    turns[0]!.onUsage(snapshot(1));
+    finishes[0]!(); await until(() => ui.screen().includes("enter send"));
+    await ui.send("/resume same-session"); await ui.send("\r");
+    await until(() => ui.screen().includes("会话 $5.0000"));
+    turns[0]!.onUsage(snapshot(2)); await Bun.sleep(30);
+    expect(ui.screen()).toContain("会话 $5.0000");
+    turns[0]!.onUsage(snapshot(2), snapshot(6));
+    await until(() => ui.screen().includes("会话 $6.0000"));
+    expect(ui.screen()).not.toContain("本轮 $2.0000");
+    await ui.send("new turn"); await ui.send("\r");
+    turns[1]!.onUsage(snapshot(0.5));
+    await until(() => ui.screen().includes("会话 $6.5000"));
+  } finally { for (const finish of finishes) finish(); ui.close(); }
 });

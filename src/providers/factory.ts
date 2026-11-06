@@ -86,8 +86,9 @@ export function createConfiguredTransportWithFallback(
   reasoningEffort?: ReasoningEffort,
   onFallback?: () => void,
   fastMode = false,
+  execution?: { maxRetries?: number },
 ): ModelTransport {
-  const primary = createConfiguredTransport(primarySelection, reasoningEffort, fastMode);
+  const primary = createConfiguredTransport(primarySelection, reasoningEffort, fastMode, execution);
   if (!fallbackSelection) return primary;
   if (
     fallbackSelection.provider.id === primarySelection.provider.id &&
@@ -97,7 +98,7 @@ export function createConfiguredTransportWithFallback(
   }
   return createFallbackTransport({
     primary,
-    fallback: createConfiguredTransport(fallbackSelection, reasoningEffort),
+    fallback: createConfiguredTransport(fallbackSelection, reasoningEffort, false, execution),
     fallbackModel: fallbackSelection.model.id,
     ...(onFallback ? { onFallback } : {}),
   });

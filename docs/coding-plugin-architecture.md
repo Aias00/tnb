@@ -76,3 +76,55 @@ Coding 使用原同用户工作区协调器，保留父子路径互斥、前后�
 - [`assembly.rs`](https://github.com/arcships/dim/blob/64f877286f2b5b078d5697cda7bd0c392030388f/crates/dim-agent-runtime/src/assembly.rs)：Agent/Session/Branch Loader 分组。TNB 没有照搬多级插件实例树，也没有把持久回执改成 Timeline。
 
 后续已补齐按引用保留领域/渠道代码和精确历史恢复，详见 [默认 Coding 代际](guides/builtin-generations.md) 与 [渠道代际](guides/channel-generations.md)。仍没有热升级、跨平台进行中任务迁移、不受信插件隔离、分布式 owner 或数小时 soak 承诺。
+
+## 共享执行宿主（2026-11-05）
+
+CLI/TUI 与持久任务原本已经共用 `runAgentLoop`；本次继续收拢的是宿主装配，
+没有增加第二套会话引擎，也没有将 React、文件或 Shell 实现放进 headless Core。
+
+| 层 | 当前责任 |
+| --- | --- |
+| `core/agent-loop.ts`、`core/tool-runtime.ts` | 通用模型/工具循环、授权协议、事件、取消和调用日志 |
+| `services/execution/model.ts` | 模型传输懒加载、fallback/推理/fast 配置、计费路由和借用的调用预算 |
+| `services/session/bootstrap.ts` | 会话选择、continue/fork、ID 冲突检查与启动预览；执行端继续持锁后读取恢复状态 |
+| `services/execution/workspace-tools.ts` | 工作区文件能力装配、每宿主独立读取凭据、文件/搜索附加根目录和媒体能力 |
+| `entrypoints/cli.ts` | 交互宿主、会话/命令编排；主调用和子调用预算、文件工具改用上述公共服务 |
+| `adapters/coding/worker.ts` | Coding 沙箱、领域权限、持久 Skill/MCP 准入、验收命令及运行身份 |
+
+持久 worker 同样通过公共模型服务创建 transport，但明确指定 `maxRetries: 0`，
+不借用交互会话的内存预算。它的重试、持久预算预留和恢复仍由 Runtime 调度器拥有。
+CLI 的主/子模型服务借用同一 `UsageBudget`，服务本身不会关闭调用方的 ledger。
+文件能力提供器返回具名工具，调用方仍保留原工具顺序，避免更改持久目录身份。
+只读 Coding worker 不构造 write/edit；各宿主读取凭据独立，附加文件根目录不会
+自动扩展 grep/glob 的搜索权限。
+
+这是迁移的第一阶段。CLI 中的完整会话启动、交互命令、Hook/MCP 资源生命周期
+尚未全部提取为独立会话服务，TUI 也尚未包装成插件。后续应沿当前公共宿主边界
+迁移这些职责，保留普通会话与持久 Run 的不同生命周期，而不是把 Coding 插件
+整体搬进 Core。具体计划见 [共享执行宿主计划](superpowers/plans/2026-11-05-execution-host-consolidation.md)。
+
+## 终端宿主与用户可见边界（第二阶段）
+
+本轮不修改 Web。
+
+- `services/execution/resources.ts` 是终端/CLI 的统一发现入口，负责插件策略
+  重校验、Agent/命令/Skill 的来源与优先级，以及重载签名。它只读取资源，不运行
+  插件工厂、Hook 或 MCP 进程。CLI 主执行、行式终端与 Ink TUI 使用同一组服务；
+  Hook/MCP 的启动与清理仍由原宿主掌握，不在发现时产生副作用。
+- `/plugins` 可以显示和配置内置组件，标明 configured-enabled/disabled；它不
+  把配置状态当成运行状态。`tnb plugins show tnb-coding` 也能检查内置声明。
+  Coding 开关控制持久编程任务适配器，普通终端对话的 Core/文件能力继续工作。
+  内置宿主插件应全局配置，后台重启才应用启停/代际变化；实际状态查询仍使用
+  `tnb runtime plugins`。终端普通扩展按原生命周期刷新。
+- 每次前台执行借用一个独立 UsageBudget。`onInvocationUsage` 在账本写入后发送
+  单调累计快照，包含主/子/维护请求及达到上限的最后一次报告。TUI 按快照增量
+  更新“会话”累计，真实执行同时读取 SessionStore 的持久累计快照，按当前
+  invocation 显示“本轮”消耗和本轮配置上限；模型事件不重复计入已由账本报告的费用。此改变不提高限额，也不改变软限额的执行方式。
+- 前一轮后台活动迟到的使用量只更新同一激活周期的会话总额，不覆盖当前一轮。
+  恢复会话使用 SessionStore 的累计用量并重置本轮状态；旧激活周期不能覆盖
+  本轮状态，只有带持久会话累计快照的回报可更新同一会话的总额。普通会话账本与持久 Run 预算仍分别管理。
+- 前台完成/中断时，先释放同步的占用标志，再通知 UI 空闲，避免画面已经提示
+  可以输入、但马上按 Enter 却把草稿错误留在排队输入后的竞态。
+
+剩余迁移边界仍包括完整 Hook/MCP 生命周期与交互命令编排；本轮没有引入新的
+持久状态协议、TUI 插件实例树或自动跨代际迁移。

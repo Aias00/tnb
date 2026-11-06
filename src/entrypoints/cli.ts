@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import { BUILTIN_PLUGIN_SCOPES, builtinPluginScope, pluginActivationNotice } from "../services/plugins/builtin-scope";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readdir, readFile, stat, unlink, realpath } from "node:fs/promises";
@@ -31,7 +32,6 @@ import { getAutoCompactThresholdForCapabilities } from "../providers/models";
 import {
   createConfiguredTransport,
   createConfiguredTransportWithFallback,
-  resolveBillingRoute,
   type ReasoningEffort,
 } from "../providers/factory";
 import { ProviderHttpError, ProviderStreamError } from "../providers/retry";
@@ -114,23 +114,16 @@ import {
   isInsideGitRepository,
   loadProjectInstructionFiles,
 } from "../services/project-context";
-import { loadSkills, renderSkillPrompt, type LoadedSkill } from "../services/skills/loader";
-import { bundledSkills } from "../services/skills/bundled";
+import { renderSkillPrompt, type LoadedSkill } from "../services/skills/loader";
 import { createSkillTool, selectSkillTools } from "../services/skills/tool";
-import { loadAgents, parseAgentsJson, type LoadedAgent } from "../services/agents/loader";
+import { parseAgentsJson, type LoadedAgent } from "../services/agents/loader";
 import {
   expandCommandInput,
-  loadCommands,
   type LoadedCommand,
 } from "../services/commands/loader";
 import {
-  createEditTool,
   isolateFileToolReads,
-  createGlobTool,
-  createGrepTool,
-  createReadTool,
   createWebFetchTool,
-  createWriteTool,
 } from "../tools/builtins";
 import { createShellTools } from "../tools/shell";
 import { createLspTool } from "../tools/lsp";
@@ -171,10 +164,9 @@ import {
   mergePluginHooks,
   mergePluginMcpConfig,
 } from "../services/plugins/loader";
-import { pluginTrustStorePath } from "../services/plugins/trust";
 import { createExternalPluginTools, PluginToolRuntimeManager } from "../services/plugins/tools";
 import { PluginLifecycleManager, reconcilePluginCatalog } from "../services/plugins/lifecycle";
-import { applyPluginPolicy } from "../services/plugins/policy";
+import { loadConfiguredPlugins, selectExecutionPlugins, loadExecutionAgents, loadExecutionCommands, loadExecutionSkills, loadExecutionResources } from "../services/execution/resources";
 import { configuredMarketplaceSources, loadPluginMarketplace } from "../services/plugins/marketplace";
 import { scanSecurity } from "../services/security/scanner";
 import {
@@ -200,7 +192,10 @@ import { CLI_COMMANDS, isUnknownCliCommand, SIMPLE_COMMAND_HELP } from "../servi
 import { loadKeybindings } from "../ui/keybindings";
 import { completeWorkspaceFiles } from "../ui/file-completion";
 import { renderTerminalImage } from "../ui/terminal-image";
-import { createFileStateCacheWithSizeLimit, READ_FILE_STATE_CACHE_SIZE } from "../utils/file-state-cache";
+import { selectSession, assertSessionIdAvailable, prepareInteractiveSession } from "../services/session/bootstrap";
+export { prepareInteractiveSession } from "../services/session/bootstrap";
+import { createModelExecution } from "../services/execution/model";
+import { createWorkspaceFileTools } from "../services/execution/workspace-tools";
 import { registerCleanup } from "../utils/cleanup-registry";
 import { setShutdownResumeHint, setupGracefulShutdown } from "../utils/graceful-shutdown";
 import { McpActivityController } from "../ui/mcp-activity-controller";
@@ -232,6 +227,7 @@ export type CliOptions = {
   transport?: ModelTransport;
   /** Route requests from shared MCP connections through the current invocation ledger. */
   onInvocationTransport?(transport: ModelTransport | undefined): void;
+  onInvocationUsage?(usage: import("../services/usage/cost").UsageTotals, sessionUsage?: import("../services/usage/cost").UsageTotals): void;
   shellManager?: ShellSessionManager;
   mcpConnections?: McpConnections;
   taskManager?: TaskManager;
@@ -1036,20 +1032,14 @@ export async function runCli(options: CliOptions): Promise<number> {
       loadProviderCatalog({ configDir, env: options.env }),
       loadSettings({ configDir, cwd: options.cwd, ...(parsed.settingsInput ? { additional: parsed.settingsInput } : {}) }),
     ]);
-    const pluginResult = options.pluginCatalog
-      ? { plugins: options.pluginCatalog.map(plugin => applyPluginPolicy(plugin, { enabled: settings.enabledPlugins, blockedFingerprints: settings.blockedPluginFingerprints })), errors: [] }
-      : await loadConfiguredPlugins(configDir, options.cwd, settings.enabledPlugins, settings.blockedPluginFingerprints);
+    const pluginResult = await selectExecutionPlugins({ configDir, cwd: options.cwd, enabled: settings.enabledPlugins,
+      blockedFingerprints: settings.blockedPluginFingerprints, catalog: options.pluginCatalog });
     activePlugins = pluginResult.plugins;
     for (const error of pluginResult.errors) options.stderr.write(`tnb plugin: ${error.path}: ${error.error}\n`);
     for (const plugin of pluginResult.plugins.filter((item) => item.trust === "untrusted" || item.trust === "changed")) {
       options.stderr.write(`tnb plugin: ${plugin.name} is ${plugin.trust}; contributions are disabled. Review it, then run 'tnb plugins trust ${plugin.name} --yes'.\n`);
     }
-    const customAgents = await loadAgents([
-      { directory: join(configDir, "agents"), source: "user" },
-      { directory: join(options.cwd, ".claude", "agents"), source: "claude-project" },
-      { directory: join(options.cwd, ".tnb", "agents"), source: "project" },
-      ...pluginResult.plugins.filter((plugin) => plugin.active).map((plugin) => ({ directory: plugin.agentsDir, source: "plugin" as const })),
-    ]);
+    const customAgents = await loadExecutionAgents({ configDir, cwd: options.cwd, plugins: pluginResult.plugins });
     const agentProfiles = mergeAgentProfiles([
       ...customAgents.agents,
       ...(parsed.agentsJson ? parseAgentsJson(parsed.agentsJson, options.cwd) : []),
@@ -1111,26 +1101,9 @@ export async function runCli(options: CliOptions): Promise<number> {
     if (resolvedPermissionMode.reason) {
       options.stderr.write(`${resolvedPermissionMode.reason}; using default mode\n`);
     }
-    const resumedSessionId = parsed.continueLatest
-      ? await SessionStore.latestSessionId({ configDir, cwd: options.cwd })
-      : parsed.resume;
-    if (parsed.continueLatest && !resumedSessionId) {
-      throw new Error("No previous session found for this workspace");
-    }
-    let session: SessionStore;
-    if (parsed.forkSession) {
-      if (!resumedSessionId) throw new Error("--fork-session requires --resume or --continue");
-      const targetSessionId = parsed.sessionId ?? (options.sessionIdFactory ?? randomUUID)();
-      await assertSessionIdAvailable(configDir, options.cwd, targetSessionId);
-      session = await new SessionStore({ configDir, cwd: options.cwd, sessionId: resumedSessionId }).forkTo(targetSessionId);
-    } else {
-      session = new SessionStore({
-        configDir,
-        cwd: options.cwd,
-        sessionId: resumedSessionId ?? parsed.sessionId ?? (options.sessionIdFactory ?? randomUUID)(),
-      });
-      if (parsed.sessionId) await assertSessionIdAvailable(configDir, options.cwd, parsed.sessionId);
-    }
+    const { session, sourceSessionId: resumedSessionId } = await selectSession({
+      parsed, configDir, cwd: options.cwd, sessionIdFactory: options.sessionIdFactory ?? randomUUID,
+    });
     releaseSession = await session.acquireRun();
     const restoredSession = resumedSessionId
       ? await session.readState()
@@ -1149,17 +1122,24 @@ export async function runCli(options: CliOptions): Promise<number> {
     usageBudget = new UsageBudget({
       ...(parsed.maxBudgetUsd !== undefined ? { maxCostUsd: parsed.maxBudgetUsd } : {}),
       maxConcurrentRequests: positiveInteger(options.env.TNB_MAX_CONCURRENT_MODEL_REQUESTS, "TNB_MAX_CONCURRENT_MODEL_REQUESTS"),
-      onUsage: (record) => session.appendUsage(record),
+      onUsage: async (record) => {
+        await session.appendUsage(record);
+        if (options.onInvocationUsage) {
+          const invocation = budget.totals;
+          const saved = await session.readState();
+          options.onInvocationUsage(invocation, saved.usage ?? { ...EMPTY_USAGE });
+        }
+      },
     });
     const budget = usageBudget;
     // A local options copy shares cancellation with tools, children and maintenance work.
     options = { ...options, signal: options.signal
       ? AbortSignal.any([options.signal, budget.signal]) : budget.signal };
-    const meter = (raw: ModelTransport, route: ProviderSelection) => budget.wrap(raw,
-      (request) => resolveBillingRoute(route, request.model), { workspace: options.cwd });
-    const transport = meter(options.transport ?? lazyModelTransport(() => createConfiguredTransportWithFallback(
-      selection, fallbackSelection, parsed.thinking, undefined, effectiveFastMode,
-    )), selection);
+    const meter = (raw: ModelTransport, route: ProviderSelection) => createModelExecution({
+      selection: route, transport: raw, budget, workspace: options.cwd,
+    }).transport;
+    const { transport } = createModelExecution({ selection, fallbackSelection, reasoningEffort: parsed.thinking,
+      fastMode: effectiveFastMode, transport: options.transport, budget, workspace: options.cwd });
     options.onInvocationTransport?.(transport);
     const hooks = options.hookRunner ?? new HookRunner({
         ...(Object.keys(effectiveHooks).length ? { hooks: effectiveHooks } : {}),
@@ -1452,17 +1432,8 @@ export async function runCli(options: CliOptions): Promise<number> {
       ...mcp.tools,
     ];
     const [skills, customCommands] = await Promise.all([
-      loadSkills([
-        { directory: join(configDir, "skills"), source: "user" },
-        { directory: join(options.cwd, ".tnb", "skills"), source: "project" },
-        ...pluginResult.plugins.filter((plugin) => plugin.active).map((plugin) => ({ directory: plugin.skillsDir, source: "plugin" as const })),
-      ], bundledSkills()),
-      loadCommands([
-        { directory: join(configDir, "commands"), source: "user" },
-        { directory: join(options.cwd, ".claude", "commands"), source: "compat-project" },
-        { directory: join(options.cwd, ".tnb", "commands"), source: "project" },
-        ...pluginResult.plugins.filter((plugin) => plugin.active).map((plugin) => ({ directory: plugin.commandsDir, source: "plugin" as const })),
-      ]),
+      loadExecutionSkills({ configDir, cwd: options.cwd, plugins: pluginResult.plugins }),
+      loadExecutionCommands({ configDir, cwd: options.cwd, plugins: pluginResult.plugins }),
     ]);
     const [projectInstructionFiles, isGitRepository] = await Promise.all([
       loadProjectInstructionFiles(options.cwd),
@@ -2312,12 +2283,7 @@ export async function runInteractiveCli(options: InteractiveCliOptions): Promise
     loadPluginMcpConfig(plugins.plugins, options.env),
   ]);
   const effectiveHooks = mergePluginHooks(settings.hooks, pluginHooks);
-  const interactiveAgents = await loadAgents([
-    { directory: join(configDir, "agents"), source: "user" },
-    { directory: join(options.cwd, ".claude", "agents"), source: "claude-project" },
-    { directory: join(options.cwd, ".tnb", "agents"), source: "project" },
-    ...plugins.plugins.filter((plugin) => plugin.active).map((plugin) => ({ directory: plugin.agentsDir, source: "plugin" as const })),
-  ]);
+  const interactiveAgents = await loadExecutionAgents({ configDir, cwd: options.cwd, plugins: plugins.plugins });
   const mainAgentProfile = resolveMainAgentProfile(mergeAgentProfiles([
     ...interactiveAgents.agents,
     ...(parsed.agentsJson ? parseAgentsJson(parsed.agentsJson, options.cwd) : []),
@@ -2552,39 +2518,13 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
       const currentSettings = await loadSettings({ configDir, cwd: options.cwd, ...(parsed.settingsInput ? { additional: parsed.settingsInput } : {}) });
       // Host credential revocation applies before package discovery or vetoable ConfigChange hooks.
       await sharedPluginToolRuntime.configureEnvironment(currentSettings.pluginToolEnvironment ?? []);
-      const discoveredPlugins = await loadConfiguredPlugins(configDir, options.cwd, currentSettings.enabledPlugins, currentSettings.blockedPluginFingerprints);
-      const plugins = pluginOverride ? pluginOverride.map(plugin => applyPluginPolicy(plugin, { enabled: currentSettings.enabledPlugins, blockedFingerprints: currentSettings.blockedPluginFingerprints })) : discoveredPlugins.plugins;
-      const [agents, commands, skills] = await Promise.all([
-        loadAgents([
-          { directory: join(configDir, "agents"), source: "user" },
-          { directory: join(options.cwd, ".claude", "agents"), source: "claude-project" },
-          { directory: join(options.cwd, ".tnb", "agents"), source: "project" },
-          ...plugins.filter((plugin) => plugin.active).map((plugin) => ({ directory: plugin.agentsDir, source: "plugin" as const })),
-        ]),
-        loadCommands([
-          { directory: join(configDir, "commands"), source: "user" },
-          { directory: join(options.cwd, ".claude", "commands"), source: "compat-project" },
-          { directory: join(options.cwd, ".tnb", "commands"), source: "project" },
-          ...plugins.filter((plugin) => plugin.active).map((plugin) => ({ directory: plugin.commandsDir, source: "plugin" as const })),
-        ]),
-        loadSkills([
-          { directory: join(configDir, "skills"), source: "user" },
-          { directory: join(options.cwd, ".tnb", "skills"), source: "project" },
-          ...plugins.filter((plugin) => plugin.active).map((plugin) => ({ directory: plugin.skillsDir, source: "plugin" as const })),
-        ], bundledSkills()),
-      ]);
-      const signature = JSON.stringify({ plugins, agents, commands, skills, environmentGrants: currentSettings.pluginToolEnvironment ?? [] });
-      return {
-        plugins,
-        agents,
-        commands,
-        skills,
-        agentProfiles: mergeAgentProfiles([
-          ...agents.agents,
-          ...(parsed.agentsJson ? parseAgentsJson(parsed.agentsJson, options.cwd) : []),
-        ]),
-        signature,
-      };
+      const resources = await loadExecutionResources({ configDir, cwd: options.cwd, enabled: currentSettings.enabledPlugins,
+        blockedFingerprints: currentSettings.blockedPluginFingerprints, catalog: pluginOverride });
+      return { ...resources, agentProfiles: mergeAgentProfiles([
+        ...resources.agents.agents,
+        ...(parsed.agentsJson ? parseAgentsJson(parsed.agentsJson, options.cwd) : []),
+      ]) };
+
     };
     let interactiveResources = await loadInteractiveResources();
     const pluginHooks = await loadPluginHooks(interactiveResources.plugins);
@@ -2772,6 +2712,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
       ? await createResumeManagement(configDir, options.cwd)
       : undefined;
     const tuiExitCode = await runTui({
+      invocationBudgetUsd: parsed.maxBudgetUsd,
       model: activeSelection.model.id,
       contextWindowTokens: activeContextWindow,
       permissionMode: activePermissionMode,
@@ -3109,6 +3050,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
             askUser: turn.questionPrompt,
             quiet: true,
             signal: turn.signal,
+            onInvocationUsage: turn.onUsage,
             onEvent: turn.onModelEvent,
             onActivity: turn.onActivity,
             onToolEvent: turn.onToolEvent,
@@ -3972,6 +3914,7 @@ async function runInteractiveSlashCommand(
       resumeSession: messages.length > 0,
       sessionId: command.sessionId,
       restoredTranscript: conversationDisplayTranscript(messages),
+      restoredUsage: state.usage ?? { ...EMPTY_USAGE },
       restoredInputHistory: sessionInputHistory(messages),
       permissionMode: context.currentPermissionMode(),
       message: `Rewound ${turns} conversation turn${turns === 1 ? "" : "s"}. Workspace files were not changed.`,
@@ -4015,6 +3958,7 @@ async function runInteractiveSlashCommand(
       resumeSession: messages.length > 0,
       sessionId: command.sessionId,
       restoredTranscript: conversationDisplayTranscript(messages),
+      restoredUsage: state.usage ?? { ...EMPTY_USAGE },
       restoredInputHistory: sessionInputHistory(messages),
       permissionMode: context.currentPermissionMode(),
       message: `Restored checkpoint ${record.id}: ${record.label}. Workspace and conversation were rewound together.`,
@@ -4054,11 +3998,7 @@ async function runInteractiveSlashCommand(
     }
     const settings = await loadSettings({ configDir: context.configDir, cwd: context.cwd });
     const plugins = await loadConfiguredPlugins(context.configDir, context.cwd, settings.enabledPlugins, settings.blockedPluginFingerprints);
-    const skills = await loadSkills([
-      { directory: join(context.configDir, "skills"), source: "user" },
-      { directory: join(context.cwd, ".tnb", "skills"), source: "project" },
-      ...plugins.plugins.filter((plugin) => plugin.active).map((plugin) => ({ directory: plugin.skillsDir, source: "plugin" as const })),
-    ], bundledSkills());
+    const skills = await loadExecutionSkills({ configDir: context.configDir, cwd: context.cwd, plugins: plugins.plugins });
     if (command.argument) {
       const skill = skills.find((item) => item.name.toLowerCase() === command.argument.toLowerCase());
       if (!skill) throw new Error(`Unknown skill: ${command.argument}`);
@@ -4095,14 +4035,16 @@ async function runInteractiveSlashCommand(
       const settings = await loadSettings({ configDir: context.configDir, cwd: context.cwd });
       const all = await loadConfiguredPlugins(context.configDir, context.cwd, {}, settings.blockedPluginFingerprints);
       const plugin = all.plugins.find((item) => item.name.toLowerCase() === name.toLowerCase());
-      if (!plugin) throw new Error(`Unknown plugin: ${name}`);
+      const builtin = builtinPluginScope(name);
+      if (!plugin && !(builtin && (action === "enable" || action === "disable"))) throw new Error(`Unknown plugin: ${name}`);
+      const pluginName = plugin?.name ?? name.toLowerCase();
       let output = "";
       let error = "";
       const code = await runResourceListCommand({
         argv: [
-          "plugins", action, plugin.name,
+          "plugins", action, pluginName,
           ...(action === "remove" || action === "trust" || action === "untrust" ? ["--yes"] : []),
-          ...(plugin.source === "project" ? ["--project"] : []),
+          ...(plugin?.source === "project" && !builtin ? ["--project"] : []),
         ],
         env: context.env,
         cwd: context.cwd,
@@ -4122,7 +4064,7 @@ async function runInteractiveSlashCommand(
       kind: "plugins",
       title: "Plugins",
       description: "Enter trusts changed/untrusted content, otherwise toggles persisted enablement.",
-      items: all.plugins.map((plugin) => {
+      items: [...all.plugins.map((plugin) => {
         const configured = settings.enabledPlugins?.[plugin.name] ?? settings.enabledPlugins?.[plugin.name.toLowerCase()];
         const active = plugin.active;
         const requiresTrust = plugin.trust === "untrusted" || plugin.trust === "changed";
@@ -4133,8 +4075,14 @@ async function runInteractiveSlashCommand(
           command: `/plugins ${requiresTrust ? "trust" : active ? "disable" : "enable"} ${plugin.name}`,
           active,
           badges: [plugin.trust, configured === false ? "disabled" : "enabled"],
+          ...(builtinPluginScope(plugin.name) ? { details: [pluginActivationNotice(plugin.name)] } : {}),
         };
-      }),
+      }), ...Object.entries(BUILTIN_PLUGIN_SCOPES).filter(([name]) => !all.plugins.some(plugin => plugin.name.toLowerCase() === name)).map(([name, scope]) => {
+        const enabled = settings.enabledPlugins?.[name] !== false;
+        return { id: name, label: name, description: `builtin · configured ${enabled ? "enabled" : "disabled"} · ${scope}`,
+          command: `/plugins ${enabled ? "disable" : "enable"} ${name}`, badges: ["builtin", enabled ? "configured-enabled" : "configured-disabled"],
+          details: [pluginActivationNotice(name), "This view shows configuration. Runtime inventory reports the actual running generation."] };
+      })],
     } };
   }
   if (command.name === "marketplace") {
@@ -4356,6 +4304,7 @@ async function runInteractiveSlashCommand(
         items: await Promise.all(filtered.slice(0, 20).filter((session) => !session.error).map(async (session) => ({
           id: session.sessionId,
           label: session.title || session.firstPrompt || session.sessionId,
+          sessionMetadata: { messageCount: session.messageCount, lastModified: session.lastModified },
           description: `${session.sessionId} · ${session.messageCount} messages · ${new Date(session.lastModified).toLocaleString()}${session.summary ? ` · ${session.summary}` : session.lastPrompt && session.lastPrompt !== session.firstPrompt ? ` · ${session.lastPrompt}` : ""}`,
           ...(session.userInputs?.length ? { preview: sessionInputPreview(session.userInputs) } : {}),
           transcriptPreview: conversationDisplayTranscript((await new SessionStore({ configDir: context.configDir, cwd: context.cwd, sessionId: session.sessionId }).readState()).messages),
@@ -4396,6 +4345,7 @@ async function runInteractiveSlashCommand(
       resumeSession: true,
       sessionId: command.nextSessionId,
       restoredTranscript: conversationDisplayTranscript(state.messages),
+      restoredUsage: state.usage ?? { ...EMPTY_USAGE },
       restoredInputHistory: sessionInputHistory(state.messages),
       permissionMode: context.currentPermissionMode(),
       message: `Forked session ${command.sessionId} to ${command.nextSessionId}${title ? ` as ${title}` : ""}.`,
@@ -4420,6 +4370,7 @@ async function runInteractiveSlashCommand(
     return {
       resetSession: true, resumeSession: true, sessionId: command.nextSessionId,
       restoredTranscript: conversationDisplayTranscript(state.messages),
+      restoredUsage: state.usage ?? { ...EMPTY_USAGE },
       restoredInputHistory: sessionInputHistory(state.messages),
       permissionMode: context.currentPermissionMode(),
       message: `Forked session ${sourceId} to ${command.nextSessionId}${title ? ` as ${title}` : ""}.`,
@@ -4447,6 +4398,7 @@ async function runInteractiveSlashCommand(
           items: sessions.filter((session) => !session.error).map((session) => ({
             id: session.sessionId,
             label: session.title || session.firstPrompt || session.sessionId,
+            sessionMetadata: { messageCount: session.messageCount, lastModified: session.lastModified },
             description: `${session.sessionId} · ${session.messageCount} messages · ${new Date(session.lastModified).toLocaleString()}`,
             ...(session.userInputs?.length ? { preview: sessionInputPreview(session.userInputs) } : {}),
             command: `/resume ${session.sessionId}`,
@@ -4603,6 +4555,7 @@ export async function createResumeManagement(
     items: sessions.filter((session) => !session.error).map((session) => ({
       id: session.sessionId,
       label: session.title || session.firstPrompt || session.sessionId,
+      sessionMetadata: { messageCount: session.messageCount, lastModified: session.lastModified },
       description: `${session.sessionId} · ${session.messageCount} messages · ${new Date(session.lastModified).toLocaleString()}`,
       ...(session.userInputs?.length ? { preview: sessionInputPreview(session.userInputs) } : {}),
       command: `/resume ${session.sessionId}`,
@@ -4640,6 +4593,7 @@ async function resumeInteractiveSession(
     resumeSession: true,
     sessionId,
     restoredTranscript: conversationDisplayTranscript(state.messages),
+      restoredUsage: state.usage ?? { ...EMPTY_USAGE },
     restoredInputHistory: sessionInputHistory(state.messages),
     permissionMode: context.currentPermissionMode(),
     message: `Resumed session ${sessionId}${state.title ? ` (${state.title})` : ""}.`,
@@ -5155,15 +5109,16 @@ function createTools(
   semanticProviderForRoot?: Parameters<typeof createCodebaseInvestigatorTool>[4],
 ): AgentTool[] {
   const approvedRoots = () => [...additionalWorkspaceRoots(), ...(memory?.enabled ? [memory.directory] : [])];
-  const readFileState = createFileStateCacheWithSizeLimit(READ_FILE_STATE_CACHE_SIZE);
+  const files = createWorkspaceFileTools({ workspace: cwd, allowWrite: true, media: mediaCapabilities,
+    fileRoots: approvedRoots, searchRoots: additionalWorkspaceRoots });
   const tools: AgentTool[] = [
-    createReadTool(cwd, mediaCapabilities, approvedRoots, readFileState),
-    createWriteTool(cwd, approvedRoots, readFileState),
-    createEditTool(cwd, approvedRoots, readFileState),
+    files.read,
+    files.write!,
+    files.edit!,
     createNotebookEditTool(cwd, additionalWorkspaceRoots),
     ...createShellTools(shellManager, env),
-    createGrepTool(cwd, {}, additionalWorkspaceRoots),
-    createGlobTool(cwd, {}, additionalWorkspaceRoots),
+    files.grep,
+    files.glob,
     createCodebaseInvestigatorTool(
       cwd,
       codebaseCacheDirectory,
@@ -5515,44 +5470,6 @@ async function pathExists(path: string): Promise<boolean> {
   }
 }
 
-async function assertSessionIdAvailable(configDir: string, cwd: string, sessionId: string): Promise<void> {
-  const session = new SessionStore({ configDir, cwd, sessionId });
-  if (await pathExists(session.filePath)) throw new Error(`Session ID ${sessionId} is already in use`);
-}
-
-export async function prepareInteractiveSession(options: {
-  parsed: ParsedArguments;
-  configDir: string;
-  cwd: string;
-  sessionIdFactory: () => string;
-}): Promise<{ sessionId: string; resume: boolean; state?: SessionState }> {
-  const sourceSessionId = options.parsed.continueLatest
-    ? await SessionStore.latestSessionId({ configDir: options.configDir, cwd: options.cwd })
-    : options.parsed.resume;
-  if (options.parsed.continueLatest && !sourceSessionId) {
-    throw new Error("No previous session found for this workspace");
-  }
-  if (options.parsed.forkSession) {
-    const targetSessionId = options.parsed.sessionId ?? options.sessionIdFactory();
-    await assertSessionIdAvailable(options.configDir, options.cwd, targetSessionId);
-    const source = new SessionStore({ configDir: options.configDir, cwd: options.cwd, sessionId: sourceSessionId! });
-    const target = await source.forkTo(targetSessionId);
-    if (options.parsed.sessionName) await target.setTitle(options.parsed.sessionName);
-    return { sessionId: targetSessionId, resume: true, state: await target.readState() };
-  }
-  if (sourceSessionId) {
-    const source = new SessionStore({
-      configDir: options.configDir,
-      cwd: options.cwd,
-      sessionId: sourceSessionId,
-    });
-    return { sessionId: sourceSessionId, resume: true, state: await source.readState() };
-  }
-  const sessionId = options.parsed.sessionId ?? options.sessionIdFactory();
-  if (options.parsed.sessionId) await assertSessionIdAvailable(options.configDir, options.cwd, sessionId);
-  return { sessionId, resume: false };
-}
-
 function stripSessionBootstrapOptions(argv: string[]): string[] {
   const result: string[] = [];
   const valueOptions = new Set(["--resume", "-r", "--session-id", "--name", "-n"]);
@@ -5628,15 +5545,6 @@ function createHookModelHandler(options: {
   };
 }
 
-function lazyModelTransport(factory: () => ModelTransport): ModelTransport {
-  let transport: ModelTransport | undefined;
-  return {
-    stream(request, signal) {
-      transport ??= factory();
-      return transport.stream(request, signal);
-    },
-  };
-}
 
 function splitOptionValues(values: string[]): string[] {
   return [...new Set(values.flatMap((value) => value.split(",")).map((value) => value.trim()).filter(Boolean))];
@@ -6291,16 +6199,4 @@ function stripOptions(argv: string[], names: Set<string>): string[] {
     output.push(argument);
   }
   return output;
-}
-
-function loadConfiguredPlugins(
-  configDir: string,
-  cwd: string,
-  enabled: Record<string, boolean> | undefined,
-  blockedFingerprints?: readonly string[],
-) {
-  return loadPlugins([
-    { directory: join(configDir, "plugins"), source: "user" },
-    { directory: join(cwd, ".tnb", "plugins"), source: "project" },
-  ], enabled, { trustStorePath: pluginTrustStorePath(configDir), blockedFingerprints });
 }

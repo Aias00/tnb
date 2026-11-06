@@ -244,3 +244,15 @@ test("interruption finalizes running tool cards rather than leaving spinners beh
   expect(card?.kind === "tool" && card.status).toBe("failed");
   expect(card?.kind === "tool" && card.output).toBe("Interrupted");
 });
+
+test("restoring a conversation restores its ledger totals without reusing the previous invocation", () => {
+  const usage = { inputTokens: 100, outputTokens: 20, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUsd: 1.25 };
+  let state = reduceTuiState(createTuiState("test", "default"), { type: "submit", text: "first" });
+  state = reduceTuiState(state, { type: "ledger-usage", usage, delta: usage, currentInvocation: true });
+  state = reduceTuiState(state, { type: "command-complete", resetSession: true, restoredUsage: { ...usage, costUsd: 4 } });
+  expect(state.usage.costUsd).toBe(4);
+  expect(state.invocationUsage.costUsd).toBe(0);
+  state = reduceTuiState(state, { type: "submit", text: "next" });
+  expect(state.usage.costUsd).toBe(4);
+  expect(state.invocationUsage.costUsd).toBe(0);
+});

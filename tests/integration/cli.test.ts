@@ -2649,3 +2649,33 @@ async function gitWorkspace(): Promise<string> {
   await git(["commit", "-qm", "base"]);
   return root;
 }
+
+test("invocation ledger reports usage that crosses its ceiling before stream cancellation", async () => {
+  const cwd = await workspace(), configDir = await workspace();
+  const snapshots: import("../../src/services/usage/cost").UsageTotals[] = [];
+  const transport = new ScriptedTransport([[{ type: "usage", usage: { inputTokens: 1_000_000, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 } }, { type: "response-end", reason: "end-turn" }]]);
+  let error = "";
+  const code = await runCli({ argv: ["-p", "test", "--provider", "openai", "--model", "gpt-4o", "--max-budget-usd", "0.01"], env: {}, cwd, configDir, transport,
+    stdout: { write() {} }, stderr: { write: value => { error += value; } }, sessionIdFactory: () => "ledger-ceiling", onInvocationUsage: usage => snapshots.push(usage) });
+  expect(code).toBe(1);
+  expect(error).toContain("Maximum budget");
+  expect(snapshots).toHaveLength(1);
+  expect(snapshots[0]!.costUsd).toBeGreaterThan(0.01);
+  const saved = (await new SessionStore({ configDir, cwd, sessionId: "ledger-ceiling" }).readState()).usage;
+  expect(saved?.costUsd).toBe(snapshots[0]!.costUsd);
+});
+
+test("restored session spending does not consume a new invocation's separate ceiling", async () => {
+  const cwd = await workspace(), configDir = await workspace();
+  const session = new SessionStore({ configDir, cwd, sessionId: "quota-history" });
+  await session.append([{ role: "user", content: [{ type: "text", text: "previous" }] }, { role: "assistant", content: [{ type: "text", text: "done" }] }]);
+  await session.appendUsage({ provider: "openai", model: "gpt-4o", usage: { inputTokens: 100, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 }, costUsd: 100 });
+  let invocationCost = 0, sessionCost = 0;
+  const code = await runCli({ argv: ["-p", "continue", "--resume", "quota-history", "--provider", "openai", "--model", "gpt-4o", "--max-budget-usd", "1"], env: {}, cwd, configDir,
+    transport: new ScriptedTransport([[{ type: "text", index: 0, text: "next" }, { type: "usage", usage: { inputTokens: 1, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 } }, { type: "response-end", reason: "end-turn" }]]),
+    stdout: { write() {} }, stderr: { write() {} }, onInvocationUsage: (usage, saved) => { invocationCost = usage.costUsd; sessionCost = saved!.costUsd; },
+  });
+  expect(code).toBe(0);
+  expect(invocationCost).toBeGreaterThan(0); expect(invocationCost).toBeLessThan(1);
+  expect(sessionCost).toBeGreaterThan(100);
+});

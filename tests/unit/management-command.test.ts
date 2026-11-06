@@ -358,3 +358,22 @@ async function gitWorkspace(): Promise<string> {
   await git(["commit", "-qm", "base"]);
   return root;
 }
+
+test("builtin Coding enablement explains its durable-only scope and requires global configuration", async () => {
+  const configDir = await temporaryDirectory(), cwd = await temporaryDirectory();
+  let stdout = "", stderr = "";
+  const common = { configDir, cwd, env: {}, stdout: { write: (value: string) => { stdout += value; } }, stderr: { write: (value: string) => { stderr += value; } } };
+  expect(await runResourceListCommand({ ...common, argv: ["plugins", "disable", "tnb-coding"] })).toBe(0);
+  expect(stdout).toContain("durable Coding tasks");
+  expect(stdout).toContain("not ordinary terminal conversation tools");
+  expect(stdout).toContain("runtime restart");
+  expect(JSON.parse(await readFile(join(configDir, "settings.json"), "utf8")).enabledPlugins["tnb-coding"]).toBe(false);
+  expect(await runResourceListCommand({ ...common, argv: ["plugins", "enable", "tnb-coding", "--project"] })).toBe(1);
+  expect(stderr).toContain("globally");
+  expect(JSON.parse(await readFile(join(configDir, "settings.json"), "utf8")).enabledPlugins["tnb-coding"]).toBe(false);
+  stdout = "";
+  expect(await runResourceListCommand({ ...common, argv: ["plugins", "show", "TNB-CODING"] })).toBe(0);
+  expect(JSON.parse(stdout)).toMatchObject({ source: "builtin", enabled: false, runtimeStatus: "not-queried" });
+  expect(await runResourceListCommand({ ...common, argv: ["plugins", "enable", "TNB-CODING"] })).toBe(0);
+  expect(JSON.parse(await readFile(join(configDir, "settings.json"), "utf8")).enabledPlugins["tnb-coding"]).toBe(true);
+});

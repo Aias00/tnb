@@ -38,7 +38,7 @@ import type { ScheduleManager } from "../services/scheduler/manager";
 import type { ShellRuntimeSnapshot, ShellSessionManager } from "../services/shell/manager";
 import type { ExternalEditorResult } from "./external-editor";
 import { DEFAULT_KEYBINDINGS, matchesKeybinding, type KeybindingMap } from "./keybindings";
-import type { UsageTotals } from "../services/usage/cost";
+import { EMPTY_USAGE, type UsageTotals } from "../services/usage/cost";
 import type { TranscriptEntry } from "./transcript/model";
 import { InputQueue, type InputQueueStorage } from "./input-queue";
 import { workbenchItems, runDetailLines, type WorkbenchTab } from "./workbench";
@@ -61,6 +61,8 @@ export type TuiTurn = {
   resume: boolean;
   signal: AbortSignal;
   onModelEvent(event: ModelEvent): void;
+  /** Authoritative ledger snapshot, delivered before its model usage event. */
+  onUsage(usage: UsageTotals, sessionUsage?: UsageTotals): void;
   onToolEvent(event: ToolExecutionEvent): void;
   permissionPrompt: PermissionController["request"];
   questionPrompt: AskUser;
@@ -69,6 +71,7 @@ export type TuiTurn = {
 };
 
 export type TuiAppOptions = {
+  invocationBudgetUsd?: number;
   model: string;
   permissionMode: PermissionMode;
   permissionController?: PermissionController;
@@ -348,6 +351,8 @@ export function TuiApp(options: TuiAppOptions) {
     return () => { questionUiMounted.current = false; activeDurableQuestion.current?.controller.abort(); };
   }, []);
   const preparingTool = useRef<string | undefined>(undefined);
+  const invocationSequence = useRef(0);
+  const usageSessionEpoch = useRef(0);
 
   // Structural transitions move the prompt/footer; never reuse their old pixels.
   useLayoutEffect(() => {
@@ -507,6 +512,7 @@ export function TuiApp(options: TuiAppOptions) {
         if (result.theme !== undefined) setTheme(result.theme);
         setManagement(result.management);
         if (result.resetSession) {
+          usageSessionEpoch.current += 1;
           setQueuePanel(false); setEntryExpansion({}); setSelectedTranscriptEntryId(undefined);
           sessionId.current = result.sessionId ?? nextSessionId;
           hasRun.current = result.resumeSession === true;
@@ -533,11 +539,36 @@ export function TuiApp(options: TuiAppOptions) {
     dispatch({ type: "submit", text: structured.display });
     const controller = new AbortController();
     abortController.current = controller;
+    const releaseForeground = () => {
+      if (abortController.current === controller) {
+        abortController.current = undefined;
+        turnRunning.current = false;
+      }
+    };
+    const invocation = ++invocationSequence.current;
+    const invocationSession = sessionId.current;
+    const invocationEpoch = usageSessionEpoch.current;
+    let reportedUsage: UsageTotals = { ...EMPTY_USAGE };
     void options.runTurn({
       input: structured,
       sessionId: sessionId.current,
       resume: hasRun.current,
       signal: controller.signal,
+      onUsage(usage, sessionUsage) {
+        const delta: UsageTotals = {
+          inputTokens: Math.max(0, usage.inputTokens - reportedUsage.inputTokens),
+          outputTokens: Math.max(0, usage.outputTokens - reportedUsage.outputTokens),
+          cacheReadInputTokens: Math.max(0, usage.cacheReadInputTokens - reportedUsage.cacheReadInputTokens),
+          cacheCreationInputTokens: Math.max(0, usage.cacheCreationInputTokens - reportedUsage.cacheCreationInputTokens),
+          costUsd: Math.max(0, usage.costUsd - reportedUsage.costUsd),
+        };
+        reportedUsage = { inputTokens: reportedUsage.inputTokens + delta.inputTokens, outputTokens: reportedUsage.outputTokens + delta.outputTokens,
+          cacheReadInputTokens: reportedUsage.cacheReadInputTokens + delta.cacheReadInputTokens, cacheCreationInputTokens: reportedUsage.cacheCreationInputTokens + delta.cacheCreationInputTokens, costUsd: reportedUsage.costUsd + delta.costUsd };
+        if (sessionId.current === invocationSession && (sessionUsage || usageSessionEpoch.current === invocationEpoch)) dispatch({
+          type: "ledger-usage", usage: reportedUsage, delta, sessionUsage,
+          currentInvocation: invocationSequence.current === invocation && usageSessionEpoch.current === invocationEpoch,
+        });
+      },
       onModelEvent(event) {
         if (event.type === "text") setPhase("Writing response");
         if (event.type === "thinking") setPhase("Thinking");
@@ -587,8 +618,10 @@ export function TuiApp(options: TuiAppOptions) {
     }).then(async () => {
       hasRun.current = true;
       if (queuedId && !controller.signal.aborted) await inputQueue.remove(queuedId);
+      releaseForeground();
       dispatch(controller.signal.aborted ? { type: "turn-error", message: "Interrupted" } : { type: "turn-complete" });
     }).catch((error: unknown) => {
+      releaseForeground();
       dispatch({
         type: "turn-error",
         message: controller.signal.aborted
@@ -597,9 +630,6 @@ export function TuiApp(options: TuiAppOptions) {
             ? error.message
             : String(error),
       });
-    }).finally(() => {
-      turnRunning.current = false;
-      if (abortController.current === controller) abortController.current = undefined;
     });
   }, [exit, history, options, permissionController.request, questionController, state.busy, inputQueue, queuedInputs, workspacePath, inputTarget, restoredDraft]);
 
@@ -1257,6 +1287,7 @@ export function TuiApp(options: TuiAppOptions) {
         {...(promptMouse ? { mousePosition: promptMouse } : {})}
       />
     <TuiView
+      invocationBudgetUsd={options.invocationBudgetUsd}
       keybindings={keybindings}
       state={state}
       input={buffer.value}

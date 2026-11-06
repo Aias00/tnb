@@ -732,3 +732,18 @@ describe("Ink TUI view", () => {
     expect(frame).toContain("I send PTY input · K stop");
   });
 });
+
+
+test("session metadata keeps timestamps and IDs on their own indented rows", () => {
+  const timestamp = new Date(2026, 10, 4, 7, 31).getTime();
+  for (const columns of [60, 100, 160]) {
+    const frame = renderToString(<TuiView state={createTuiState("test", "default")} input="" cursor={0} columns={columns} rows={28}
+      management={{ kind: "sessions", title: "Resume session", items: [{ id: "1eb5b835-c643-40c5-be1a-1f409a1ac04b", label: "分析下当前工程", description: "legacy long description", sessionMetadata: { messageCount: 42, lastModified: timestamp }, preview: ["分析下当前工程"], command: "/resume example" }] }} />, { columns });
+    expect(frame).toContain("42 messages");
+    expect(frame).toContain("2026-11-04 07:31");
+    const dateRow = frame.split("\n").find(line => line.includes("2026-11-04"))!;
+    expect(dateRow.indexOf("2026-11-04")).toBeGreaterThan(4);
+    expect(dateRow).not.toContain("messages");
+    expect(dateRow).not.toContain("1eb5b835");
+  }
+});

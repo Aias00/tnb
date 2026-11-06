@@ -1,3 +1,4 @@
+import { builtinPluginScope, pluginActivationNotice } from "../plugins/builtin-scope";
 import { randomUUID } from "node:crypto";
 import { cp, mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -873,6 +874,7 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
       if (["install", "update", "remove", "enable", "disable", "trust", "untrust"].includes(action)) {
         const sourceOrName = options.argv[2];
         if (!sourceOrName) throw new Error(`plugins ${action} requires an argument`);
+        const notify = (name: string) => { const notice = pluginActivationNotice(name); if (notice) options.stdout.write(`${notice}\n`); };
         if (action === "trust" || action === "untrust") {
           if (!options.argv.includes("--yes")) throw new Error(`plugins ${action} requires --yes`);
           const settings = await loadSettings({ configDir, cwd: options.cwd });
@@ -889,16 +891,19 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
             await revokePluginTrust(pluginTrustStorePath(configDir), plugin.root);
             options.stdout.write(`Revoked trust for plugin ${plugin.name}\n`);
           }
+          notify(plugin.name);
           return 0;
         }
         if (action === "enable" || action === "disable") {
+          if (builtinPluginScope(sourceOrName) && options.argv.includes("--project")) throw new Error("Built-in host plugins are configured globally; omit --project.");
           const path = settingsPath(options);
           const document = await readJsonObject(path);
           const enabled = objectOrEmpty(document.enabledPlugins, `enabledPlugins must be an object: ${path}`);
-          enabled[validateResourceName(sourceOrName)] = action === "enable";
+          enabled[validateResourceName(builtinPluginScope(sourceOrName) ? sourceOrName.toLowerCase() : sourceOrName)] = action === "enable";
           document.enabledPlugins = enabled;
           await writeJsonAtomic(path, document);
           options.stdout.write(`${action === "enable" ? "Enabled" : "Disabled"} plugin ${sourceOrName} in ${path}\n`);
+          notify(sourceOrName);
           return 0;
         }
         const root = options.argv.includes("--project")
@@ -913,6 +918,7 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
           if (!requested) throw new Error(`Marketplace plugin not found: ${sourceOrName}`);
           const result = await updateMarketplacePlugin({ plugin: requested, targetRoot: root, sourceType });
           options.stdout.write(`Updated plugin ${result.plugin.name} from ${result.previousVersion ?? "unknown"} to ${result.plugin.version ?? requested.version}\n`);
+          notify(result.plugin.name);
           return 0;
         }
         if (action === "install") {
@@ -926,12 +932,14 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
             const plugin = await installMarketplacePlugin({ plugin: requested, targetRoot: root, sourceType });
             await trustPlugin(pluginTrustStorePath(configDir), plugin.root);
             options.stdout.write(`Installed marketplace plugin ${plugin.name}@${plugin.version ?? requested.version} to ${plugin.root}\n`);
+            notify(plugin.name);
             return 0;
           }
           const source = resolve(sourceOrName);
           const plugin = await installLocalPlugin({ source, targetRoot: root, sourceType });
           await trustPlugin(pluginTrustStorePath(configDir), plugin.root);
           options.stdout.write(`Installed plugin ${plugin.name} to ${plugin.root}\n`);
+          notify(plugin.name);
           return 0;
         }
         if (!options.argv.includes("--yes")) throw new Error("plugins remove requires --yes");
@@ -942,6 +950,7 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
           runtimeCacheRoot: join(configDir, "plugins", ".runtime"),
         });
         options.stdout.write(`Removed plugin ${sourceOrName} from ${target}\n`);
+        notify(sourceOrName);
         return 0;
       }
       if (action === "show") {
@@ -953,6 +962,12 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
           { directory: join(options.cwd, ".tnb", "plugins"), source: "project" },
         ], settings.enabledPlugins, { trustStorePath: pluginTrustStorePath(configDir), includeDisabled: true, blockedFingerprints: settings.blockedPluginFingerprints });
         const plugin = result.plugins.find(({ name }) => name.toLowerCase() === requested.toLowerCase());
+        if (!plugin && builtinPluginScope(requested)) {
+          const name = requested.toLowerCase();
+          options.stdout.write(`${JSON.stringify({ name, source: "builtin", enabled: settings.enabledPlugins?.[name] !== false,
+            scope: builtinPluginScope(name), notice: pluginActivationNotice(name), runtimeStatus: "not-queried" }, null, 2)}\n`);
+          return 0;
+        }
         if (!plugin) throw new Error(`Plugin not found: ${requested}`);
         const configured = settings.enabledPlugins?.[plugin.name] ?? settings.enabledPlugins?.[plugin.name.toLowerCase()];
         const runtime = (await loadPluginRuntimeCache(join(configDir, "plugins", ".runtime"))).get(plugin.name.toLowerCase());
@@ -962,6 +977,7 @@ export async function runResourceListCommand(options: ManagementCommandOptions):
           description: plugin.description ?? null,
           source: plugin.source,
           scope: plugin.source,
+          ...(builtinPluginScope(plugin.name) ? { capabilityScope: builtinPluginScope(plugin.name), activationNotice: pluginActivationNotice(plugin.name) } : {}),
           manifestVersion: plugin.manifestVersion,
           manifestPath: plugin.manifestPath ?? null,
           root: plugin.root,

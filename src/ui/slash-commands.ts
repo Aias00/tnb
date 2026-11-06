@@ -424,6 +424,7 @@ export type SlashCommandResult = {
     | { role: "system"; text: string; tone: "info" | "error" }
   >;
   restoredTranscript?: TranscriptEntry[];
+  restoredUsage?: import("../services/usage/cost").UsageTotals;
   restoredInputHistory?: string[];
   management?: ManagementView;
   clipboardText?: string;
@@ -440,6 +441,7 @@ export type ManagementView = {
 };
 
 export type ManagementItem = {
+  sessionMetadata?: { messageCount: number; lastModified: number };
   id: string;
   label: string;
   description?: string;

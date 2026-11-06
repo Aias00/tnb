@@ -5,6 +5,7 @@ import { Box, ScrollBox, Text, type DOMElement, type ScrollBoxHandle, useInput }
 
 import type { PermissionAskRequest, PermissionMode, PermissionPromptDecision } from "../core/permissions";
 import { Markdown } from "./markdown";
+import type { UsageTotals } from "../services/usage/cost";
 import type { TuiState } from "./tui-state";
 import { TranscriptViewport, type TranscriptViewportController } from "./transcript/TranscriptViewport";
 import { measureTranscriptHeight } from "./transcript/layout";
@@ -31,6 +32,7 @@ import { Ansi } from "./ink/Ansi";
 import { AccentProvider, UI_COLORS, useAccent } from "./theme";
 
 export type TuiViewProps = {
+  invocationBudgetUsd?: number;
   state: TuiState;
   keybindings?: KeybindingMap;
   input: string;
@@ -91,6 +93,7 @@ export type TuiViewProps = {
 };
 
 export const TuiView = memo(function TuiView({
+  invocationBudgetUsd,
   state,
   keybindings = DEFAULT_KEYBINDINGS,
   input,
@@ -245,6 +248,8 @@ export const TuiView = memo(function TuiView({
         </>
       )}
       <StatusLine
+        invocationUsage={state.invocationUsage}
+        invocationBudgetUsd={invocationBudgetUsd}
         model={state.model}
         permissionMode={state.permissionMode}
         busy={state.busy}
@@ -414,10 +419,16 @@ function ManagementDialog({
               if (element) itemRefs.current.set(item.id, element);
               else itemRefs.current.delete(item.id);
             }} flexDirection="column" flexShrink={0}>
-              <Text {...(selection === index ? { color: accent } : {})} bold={selection === index}>
+              <Text wrap="truncate-end" {...(selection === index ? { color: accent } : {})} bold={selection === index}>
                 {selection === index ? figures.pointer : " "} {item.active ? figures.tick : " "} {item.label}
               </Text>
-              {selection === index && item.description ? <Text dimColor>    {item.description}</Text> : null}
+              {selection === index && view.kind === "sessions" && item.sessionMetadata ? (
+                <Box flexDirection="column" paddingLeft={4}>
+                  <Text dimColor wrap="truncate-end">{item.sessionMetadata.messageCount} messages</Text>
+                  <Text dimColor wrap="truncate-end">{new Date(item.sessionMetadata.lastModified).toLocaleString("sv-SE", { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}</Text>
+                  <Text dimColor wrap="truncate-end">ID: {item.id}</Text>
+                </Box>
+              ) : selection === index && item.description ? <Box paddingLeft={4}><Text dimColor wrap="truncate-end">{item.description}</Text></Box> : null}
             </Box>
           )) : <Text dimColor>No items available.</Text>}
         </ScrollBox> : null}
@@ -707,6 +718,8 @@ function PermissionDialog({ request, selection, offset, width, height }: { reque
 }
 
 function StatusLine({
+  invocationUsage,
+  invocationBudgetUsd,
   model,
   permissionMode,
   busy,
@@ -719,6 +732,8 @@ function StatusLine({
   workspaceLabel,
   queuedPromptCount,
 }: {
+  invocationUsage: UsageTotals;
+  invocationBudgetUsd?: number;
   model: string;
   permissionMode: PermissionMode;
   busy: boolean;
@@ -735,7 +750,7 @@ function StatusLine({
   const toggleKey = useKeybindingLabel("toggleTool");
   const allKey = useKeybindingLabel("toggleTranscript");
   const inputTokens = usage.inputTokens + usage.cacheReadInputTokens + usage.cacheCreationInputTokens;
-  const cost = usage.costUsd ? ` · $${usage.costUsd.toFixed(4)}` : "";
+  const cost = invocationBudgetUsd !== undefined || usage.costUsd || invocationUsage.costUsd ? ` · 本轮 $${invocationUsage.costUsd.toFixed(4)}${invocationBudgetUsd !== undefined ? `/$${invocationBudgetUsd.toFixed(2)}` : ""} · 会话 $${usage.costUsd.toFixed(4)}` : "";
   const context = contextLabel(lastInputTokens, contextWindowTokens);
   return (
     <Box flexShrink={0} height={2} flexDirection="column">
@@ -748,7 +763,7 @@ function StatusLine({
               ? `enter queue · esc interrupt · ${queuedPromptCount} queued · ${queueKey} manage`
               : `enter send · ${toggleKey} tool · ${allKey} all · ${queueKey} queue`}
       </Text>
-      <Text wrap="truncate-end"><Text bold>{model}</Text><Text dimColor> · {permissionMode} · {context} · 前台 ↑{inputTokens.toLocaleString()} ↓{usage.outputTokens.toLocaleString()}{cost}{workspaceLabel ? ` · ${workspaceLabel.slice(-36)}` : ""}</Text></Text>
+      <Text wrap="truncate-end"><Text bold>{model}</Text><Text dimColor> · {permissionMode}{cost} · {context} · 前台 ↑{inputTokens.toLocaleString()} ↓{usage.outputTokens.toLocaleString()}{workspaceLabel ? ` · ${workspaceLabel.slice(-36)}` : ""}</Text></Text>
     </Box>
   );
 }

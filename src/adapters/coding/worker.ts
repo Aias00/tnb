@@ -1,12 +1,11 @@
 import { mkdir, realpath } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { homedir } from "node:os";
-import { createReadTool, createWriteTool, createEditTool, createGlobTool, createGrepTool } from "../../tools/builtins";
+import { createWorkspaceFileTools } from "../../services/execution/workspace-tools";
+import { createModelExecution } from "../../services/execution/model";
 import { createShellTools } from "../../tools/shell";
-import { createFileStateCacheWithSizeLimit } from "../../utils/file-state-cache";
 import { createPermissionChecker } from "../../core/permissions";
 import { loadProviderCatalog, resolveProviderSelection } from "../../providers/config";
-import { createConfiguredTransport, resolveBillingRoute } from "../../providers/factory";
 import { createSandboxRuntime } from "../../services/sandbox/factory";
 import { createSandboxHost } from "../../services/sandbox/shared";
 import { ShellSessionManager } from "../../services/shell/manager";
@@ -22,11 +21,11 @@ export function createRuntimeWorkerFactory(options: { configDir: string; runtime
   const factory: RuntimeWorkerFactory = async ({ task, configuration, signal }) => {
     const catalog = await loadProviderCatalog({ configDir: options.configDir, env: options.env });
     const selection = resolveProviderSelection(catalog, configuration.provider ?? options.env.TNB_PROVIDER ?? "anthropic", configuration.model ?? options.env.TNB_MODEL);
-    const reads = createFileStateCacheWithSizeLimit(100);
     const workspace = await realpath(configuration.workspace);
     const settings = await loadSettings({ configDir: options.configDir, cwd: workspace });
-    const tools = [createReadTool(workspace, { supportsVision: false, supportsPdf: false }, undefined, reads), createGlobTool(workspace), createGrepTool(workspace)];
-    if (configuration.allowWrite) tools.push(createWriteTool(workspace, undefined, reads), createEditTool(workspace, undefined, reads));
+    const files = createWorkspaceFileTools({ workspace, allowWrite: configuration.allowWrite, media: { supportsVision: false, supportsPdf: false } });
+    const tools = [files.read, files.glob, files.grep];
+    if (files.write && files.edit) tools.push(files.write, files.edit);
     let shell: ShellSessionManager | undefined;
     if (configuration.allowShell || configuration.checks.length) {
       const home = join(workspace, ".tnb", "runtime-home"); await mkdir(home, { recursive: true, mode: 0o700 });
@@ -76,12 +75,13 @@ export function createRuntimeWorkerFactory(options: { configDir: string; runtime
     catch (error) { await shell?.close(); throw error; }
     const capabilityChecker = createPermissionChecker({ cwd: workspace, mode: "default",
       rules: { deny: settings.permissions?.deny, ask: settings.permissions?.ask, allow: configuration.mcpTools } });
+    // Each physical request has one persistent reservation. The scheduler owns retries.
+    const execution = createModelExecution({ selection, maxRetries: 0 });
     return {
-      // Each physical request has one persistent reservation. Retries belong to the durable scheduler.
-      transport: { stream: (request, requestSignal) => createConfiguredTransport(selection, undefined, false, { maxRetries: 0 }).stream(request, requestSignal) }, model: selection.model.id,
+      transport: execution.transport, model: execution.model,
       tools: [...extra.restrict([...tools, ...extra.tools.filter(tool => tool.capability?.name === "mcp.call")]), ...extra.tools.filter(tool => tool.capability?.name === "skill.read")],
-      route: resolveBillingRoute(selection, selection.model.id), maxOutputTokens: Math.min(selection.model.maxTokens, 8192),
-      contextWindowTokens: selection.model.contextWindow,
+      route: execution.route, maxOutputTokens: Math.min(execution.maxOutputTokens, 8192),
+      contextWindowTokens: execution.contextWindowTokens,
       binding: { provider: selection.provider.id, api: selection.provider.api, endpoint: selection.provider.baseUrl, model: selection.model,
         headers: digestJson(selection.provider.headers), permissions: { deny: settings.permissions?.deny, ask: settings.permissions?.ask },
         ...(Object.keys(extra.pins).length ? { capabilities: extra.pins, catalog: digestJson(extra.tools.map(tool => ({ name: tool.name, description: tool.description, schema: tool.inputSchema }))) } : {}) },

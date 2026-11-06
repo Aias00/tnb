@@ -35,6 +35,8 @@ export type TuiState = {
   busy: boolean;
   activity?: "working" | "compacting";
   usage: UsageTotals;
+  invocationUsage: UsageTotals;
+  usageFromLedger: boolean;
   lastInputTokens: number;
   contextWindowTokens: number;
   transcript: TranscriptEntry[];
@@ -42,6 +44,7 @@ export type TuiState = {
 };
 
 export type TuiAction =
+  | { type: "ledger-usage"; usage: UsageTotals; delta: UsageTotals; sessionUsage?: UsageTotals; currentInvocation: boolean }
   | { type: "activity"; phase: "working" | "compacting" }
   | { type: "notice"; message: string; noticeId?: string }
   | { type: "submit"; text: string }
@@ -55,6 +58,7 @@ export type TuiAction =
       resetSession?: boolean;
       restoredMessages?: TuiMessage[];
       restoredTranscript?: TranscriptEntry[];
+      restoredUsage?: UsageTotals;
     }
   | { type: "model-event"; event: ModelEvent }
   | { type: "tool-start"; id: string; name: string; input: unknown; startedAt?: number }
@@ -83,6 +87,8 @@ export function createTuiState(
     streamingText: "",
     busy: false,
     usage: initial?.usage ? { ...initial.usage } : { ...EMPTY_USAGE },
+    invocationUsage: { ...EMPTY_USAGE },
+    usageFromLedger: false,
     lastInputTokens: 0,
     contextWindowTokens: initial?.contextWindowTokens ?? 0,
     transcript,
@@ -118,6 +124,15 @@ function commitStreamingText(state: TuiState): TuiState {
 }
 
 export function reduceTuiState(state: TuiState, action: TuiAction): TuiState {
+  if (action.type === "ledger-usage") {
+    const saved = action.sessionUsage;
+    const usage: UsageTotals = saved ? {
+      inputTokens: Math.max(state.usage.inputTokens, saved.inputTokens), outputTokens: Math.max(state.usage.outputTokens, saved.outputTokens),
+      cacheReadInputTokens: Math.max(state.usage.cacheReadInputTokens, saved.cacheReadInputTokens),
+      cacheCreationInputTokens: Math.max(state.usage.cacheCreationInputTokens, saved.cacheCreationInputTokens), costUsd: Math.max(state.usage.costUsd, saved.costUsd),
+    } : addUsage(state.usage, action.delta) as UsageTotals;
+    return { ...state, usage, ...(action.currentInvocation ? { invocationUsage: { ...action.usage }, usageFromLedger: true } : {}) };
+  }
   if (action.type === "activity") return { ...state, activity: action.phase };
   if (action.type === "notice") {
     const id = action.noticeId ? `runtime-notice:${action.noticeId}` : undefined;
@@ -134,6 +149,8 @@ export function reduceTuiState(state: TuiState, action: TuiAction): TuiState {
       ...appendTranscript(state, { kind: "user", text: action.text }),
       messages: [...state.messages, { role: "user", text: action.text }],
       streamingText: "",
+      invocationUsage: { ...EMPTY_USAGE },
+      usageFromLedger: false,
       busy: true,
     };
   }
@@ -175,17 +192,22 @@ export function reduceTuiState(state: TuiState, action: TuiAction): TuiState {
       todos: action.resetSession ? [] : state.todos,
       streamingText: "",
       busy: false,
-      usage: action.resetSession ? { ...EMPTY_USAGE } : state.usage,
+      usage: action.restoredUsage ? { ...action.restoredUsage } : action.resetSession ? { ...EMPTY_USAGE } : state.usage,
+      invocationUsage: action.resetSession ? { ...EMPTY_USAGE } : state.invocationUsage,
+      usageFromLedger: action.resetSession ? false : state.usageFromLedger,
       lastInputTokens: action.resetSession ? 0 : state.lastInputTokens,
     };
   }
   if (action.type === "model-event") {
     if (action.event.type === "response-end") return commitStreamingText(state);
     if (action.event.type === "usage") {
+      const lastInputTokens = action.event.usage.inputTokens + action.event.usage.cacheReadInputTokens + action.event.usage.cacheCreationInputTokens;
+      if (state.usageFromLedger) return { ...state, lastInputTokens };
       const usage = addUsage(state.usage, action.event.usage);
       return {
         ...state,
-        lastInputTokens: action.event.usage.inputTokens + action.event.usage.cacheReadInputTokens + action.event.usage.cacheCreationInputTokens,
+        lastInputTokens,
+        invocationUsage: addUsage(state.invocationUsage, action.event.usage) as UsageTotals,
         usage: {
           ...usage,
           costUsd: (state.usage.costUsd ?? 0) + (action.event.usage.costUsd ?? 0),
