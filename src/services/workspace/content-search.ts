@@ -21,12 +21,12 @@ export async function searchWorkspaceContent(root: string, query: string, signal
       for (const line of lines) {
         const event = JSON.parse(line);
         if (!["match", "context"].includes(event.type) || !event.data.path.text || !event.data.lines.text) continue;
-        const file = event.data.path.text.replace(/^\.\//, "");
+        const file = event.data.path.text.replaceAll("\\", "/").replace(/^\.\//, "");
         const rows = context.get(file) ?? new Map<number, string>();
         rows.set(event.data.line_number, event.data.lines.text.trimEnd().slice(0, 1000)); context.set(file, rows);
         if (event.type !== "match") continue;
         if (matches.length >= 200) { truncated = true; stop(); break; }
-        matches.push({ file: event.data.path.text.replace(/^\.\//, ""), line: event.data.line_number, text: event.data.lines.text.trimEnd().slice(0, 1000), preview: [] });
+        matches.push({ file, line: event.data.line_number, text: event.data.lines.text.trimEnd().slice(0, 1000), preview: [] });
       }
       if (truncated) break;
     }

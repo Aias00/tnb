@@ -9,7 +9,7 @@ import { createServiceRef } from "../../src/plugin-sdk";
 
 const roots: string[] = [], hosts: PluginTestHost[] = [];
 afterEach(async () => { for (const host of hosts.splice(0)) await host.close(); for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); });
-async function fixture(code?: string, timeoutMs = 1000) {
+async function fixture(code?: string, timeoutMs = 3000) {
   const root = await mkdtemp(join(tmpdir(), "tnb-process-integration-")); roots.push(root);
   const directory = join(root, "plugin"); await initializePlugin(directory, "application", "process-fixture", { execution: "process" });
   const manifest = JSON.parse(await readFile(join(directory, "plugin.json"), "utf8"));
@@ -20,6 +20,11 @@ async function fixture(code?: string, timeoutMs = 1000) {
 }
 const ref = { kind: "application" as const, id: "process-fixture", version: "1" };
 const request = (path = "/", signal?: AbortSignal) => new Request("http://plugin" + path, { signal });
+async function rejects(job: Promise<unknown>, fragment: string) {
+  // Await the outcome before using Bun's matcher: RPC may need to re-enter JS on this thread.
+  const error = await job.then(() => null, error => error);
+  expect(error).toBeInstanceOf(Error); expect(error.message).toContain(fragment);
+}
 async function open(directory: string) { const host = await createPluginTestHost({ packageDirectory: directory }); hosts.push(host); return host; }
 
 for (const template of ["application", "channel"] as const) test(`process ${template} template executes the real manifest/test contracts`, async () => {
@@ -48,8 +53,8 @@ test("blocked process times out while owner stays responsive; no automatic resta
   const { directory } = await fixture(`export default { protocol: "tnb.process-plugin/v1", start() { return { async handle() { while (true) {} } }; } };`, 200);
   const host = await open(directory); let responsive = false;
   const timer = setTimeout(() => { responsive = true; }, 10);
-  await expect(host.request(ref, request())).rejects.toThrow("timed out"); clearTimeout(timer); expect(responsive).toBe(true);
-  await expect(host.request(ref, request())).rejects.toThrow("timed out");
+  await rejects(host.request(ref, request()), "timed out"); clearTimeout(timer); expect(responsive).toBe(true);
+  await rejects(host.request(ref, request()), "timed out");
 });
 
 test("cancel kills a non-cooperative process and invalidates its concurrent requests", async () => {
@@ -70,12 +75,12 @@ test("process service calls require declared grants and JSON results; invalid re
   manifest.contributes.applications[0].services = ["test.process/v1"];
   await writeFile(join(directory, "plugin.json"), JSON.stringify(manifest));
   const service = createServiceRef<{ echo(text: string): Promise<any> }>({ id: "test.process", version: 1, scope: "contribution", methods: { echo: true } });
-  await expect(open(directory)).rejects.toThrow("not granted");
+  await rejects(open(directory), "not granted");
   let valid = true;
   const host = await createPluginTestHost({ packageDirectory: directory, serviceGrants: { "process-fixture": [service.name] },
     serviceProviders: [provideService(service, () => ({ async echo(text) { return valid ? { text } : { secretHandle() {} }; } }))] }); hosts.push(host);
   expect(await (await host.request(ref, request())).json()).toEqual({ text: "hello" }); valid = false;
-  await expect(host.request(ref, request())).rejects.toThrow("Host capability call rejected");
+  await rejects(host.request(ref, request()), "Host capability call rejected");
 });
 
 test("process rejects oversized output and recovers only after explicit owner restart", async () => {
@@ -85,10 +90,10 @@ test("process rejects oversized output and recovers only after explicit owner re
     return { status: 200, body: "ready" };
   } }; } };`);
   const host = await open(directory);
-  await expect(host.request(ref, request("/crash"))).rejects.toThrow("exited");
-  await expect(host.request(ref, request())).rejects.toThrow("exited");
+  await rejects(host.request(ref, request("/crash")), "exited");
+  await rejects(host.request(ref, request()), "exited");
   await host.restart(); expect(await (await host.request(ref, request())).text()).toBe("ready");
-  await expect(host.request(ref, request("/large"))).rejects.toThrow("frame exceeds limit");
+  await rejects(host.request(ref, request("/large")), "frame exceeds limit");
 });
 
 test("read-only validation rejects unsupported process protocols and synchronous migration callbacks", async () => {
@@ -121,9 +126,9 @@ test("committed state survives a timed-out process without automatic effect repl
       while (true) {}
     }
     return { status: 200, body: JSON.stringify(await context.state.get("effect")) };
-  } }; } };`, 300);
+  } }; } };`, 1000);
   const host = await open(directory);
-  await expect(host.request(ref, request("/commit"))).rejects.toThrow("outcomes may be unknown");
+  await rejects(host.request(ref, request("/commit")), "outcomes may be unknown");
   await host.restart(); const record = await (await host.request(ref, request())).json();
   expect(record.value).toBe(1); expect(record.revision).toBe(1);
 });
@@ -133,7 +138,7 @@ test("non-JSON plugin output is rejected instead of silently dropping functions"
     return { status: 200, body: "ok", hiddenFunction() {} };
   } }; } };`);
   const host = await open(directory);
-  await expect(host.request(ref, request())).rejects.toThrow("requires JSON data");
+  await rejects(host.request(ref, request()), "requires JSON data");
 });
 
 test.skipIf(process.platform === "win32")("supervisor reclaims a synchronously blocked plugin after its owner is killed", async () => {

@@ -27,7 +27,9 @@
 
 本机 macOS 类型检查、完整构建、独立 SDK 模板/工单接入、编译版 CLI 进程测试和全套回归均纳入交付检查。Windows CI 加入进程插件、作者合同和活动模型测试；macOS/Linux 运行全套。最终数量与远端结果记录在下方交付记录。
 
-本机交付验证：`TNB_REQUIRE_NATIVE_SANDBOX=1 bun test` 为 **1336 pass、3 skip、0 fail，5901 assertions，199 files**；`bun run typecheck`、`bun run build` 和编译 CLI 的应用/渠道进程冒烟全部通过。54 处本地文档链接检查及 `git diff --check` 通过。GitHub 三平台结果以交付提交关联的 `Verify runtime` 检查为准；Windows 是定向覆盖，Agent 任务完整持久化执行及强杀进程组验证由 macOS/Linux 承担。
+首次本机交付验证（265f5e5）：`TNB_REQUIRE_NATIVE_SANDBOX=1 bun test` 为 **1336 pass、3 skip、0 fail，5901 assertions，199 files**；`bun run typecheck`、`bun run build` 和编译 CLI 的应用/渠道进程冒烟全部通过。54 处本地文档链接检查及 `git diff --check` 通过。GitHub 三平台结果以最终交付提交关联的 `Verify runtime` 检查为准；Windows 是定向覆盖，Agent 任务完整持久化执行及强杀进程组验证由 macOS/Linux 承担。
+
+首轮 Windows CI 暴露异步异常 matcher 与同线程 RPC 重入的时序问题：改为先 await 捕获失败，再作同步断言，避免误触超时或在状态提交前结束测试。同时补齐 Windows CI 的 ripgrep 依赖，并将原有 Web 内容搜索的 Windows 分隔符统一为 `/`。这些修复没有跳过失败用例；本机相关进程/搜索/Web 测试 **25 pass、0 fail**，类型检查通过。
 
 ## 明确边界
 
