@@ -1138,6 +1138,7 @@ export async function runCli(options: CliOptions): Promise<number> {
     if (parsed.sessionName) await session.setTitle(parsed.sessionName);
     pluginToolRuntime = options.pluginToolRuntime ?? new PluginToolRuntimeManager(options.env);
     ownsPluginToolRuntime = options.pluginToolRuntime === undefined;
+    await pluginToolRuntime.configureEnvironment(settings.pluginToolEnvironment ?? []);
     pluginLifecycle = new PluginLifecycleManager(
       join(configDir, "plugins", ".runtime", `${session.sessionId}.json`),
       session.sessionId,
@@ -2389,7 +2390,7 @@ export async function runInteractiveCli(options: InteractiveCliOptions): Promise
   const workspaceState = new WorkspaceState(options.cwd);
   applyAdditionalWorkspaceRoots(workspaceState, parsed.additionalDirectories);
   const durableQuestions = new DurableQuestionInbox({ configDir, workspace: workspaceState.current });
-  const sharedPluginToolRuntime = new PluginToolRuntimeManager(options.env);
+  const sharedPluginToolRuntime = new PluginToolRuntimeManager(options.env, {}, settings.pluginToolEnvironment ?? []);
   let interactiveMcp: McpConnections | undefined;
   try {
     const mcpConfig = await resolveRuntimeMcpConfig({
@@ -2549,6 +2550,8 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
     ]);
     const loadInteractiveResources = async (pluginOverride?: Awaited<ReturnType<typeof loadPlugins>>["plugins"]) => {
       const currentSettings = await loadSettings({ configDir, cwd: options.cwd, ...(parsed.settingsInput ? { additional: parsed.settingsInput } : {}) });
+      // Host credential revocation applies before package discovery or vetoable ConfigChange hooks.
+      await sharedPluginToolRuntime.configureEnvironment(currentSettings.pluginToolEnvironment ?? []);
       const discoveredPlugins = await loadConfiguredPlugins(configDir, options.cwd, currentSettings.enabledPlugins, currentSettings.blockedPluginFingerprints);
       const plugins = pluginOverride ? pluginOverride.map(plugin => applyPluginPolicy(plugin, { enabled: currentSettings.enabledPlugins, blockedFingerprints: currentSettings.blockedPluginFingerprints })) : discoveredPlugins.plugins;
       const [agents, commands, skills] = await Promise.all([
@@ -2570,7 +2573,7 @@ export async function runInkCli(options: InkCliOptions): Promise<number> {
           ...plugins.filter((plugin) => plugin.active).map((plugin) => ({ directory: plugin.skillsDir, source: "plugin" as const })),
         ], bundledSkills()),
       ]);
-      const signature = JSON.stringify({ plugins, agents, commands, skills });
+      const signature = JSON.stringify({ plugins, agents, commands, skills, environmentGrants: currentSettings.pluginToolEnvironment ?? [] });
       return {
         plugins,
         agents,

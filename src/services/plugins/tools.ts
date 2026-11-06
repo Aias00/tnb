@@ -6,6 +6,8 @@ import { requestPluginHttp } from "./http";
 import { pluginHttpTarget } from "./network";
 import { compilePluginToolInputSchema, snapshotPluginToolInput, PluginToolInputError, type PluginToolInputContract } from "./tool-input";
 import { DEFAULT_PLUGIN_TOOL_LIMITS } from "./io";
+import { PluginToolEnvironments, PluginToolEnvironmentError, parsePluginToolEnvironment, redactPluginCredentials, redactPluginError, type PluginToolEnvironmentGrant } from "./environment";
+import { digestJson } from "../runtime/json";
 
 import { defineTool, type AgentTool } from "../../core/tool";
 import {
@@ -32,41 +34,75 @@ export class PluginToolRuntimeManager {
   private readonly stopEpochs = new Map<string, number>();
   private readonly limits: Readonly<PluginToolLimits>;
   private readonly inputs = new Map<string, WeakMap<ExternalPluginToolContribution, Promise<PluginToolInputContract>>>();
+  private readonly environments: PluginToolEnvironments;
+  private environmentTail: Promise<void> = Promise.resolve();
+  private environmentUpdates = 0;
+  private environmentFailure?: unknown;
   private closing?: Promise<void>;
   private closed = false;
 
-  constructor(private readonly env: Record<string, string | undefined>, limits: Partial<PluginToolLimits> = {}) {
+  constructor(env: Record<string, string | undefined>, limits: Partial<PluginToolLimits> = {}, grants: readonly PluginToolEnvironmentGrant[] = []) {
     this.limits = pluginToolLimits(limits);
+    this.environments = new PluginToolEnvironments(env, grants, this.limits.maxProcessEnvironments);
+  }
+
+  /** Host policy only. Refuse new calls first; drain all old effects before replacing process homes. */
+  configureEnvironment(grants: readonly PluginToolEnvironmentGrant[] = []): Promise<void> {
+    const next = parsePluginToolEnvironment(grants);
+    if (this.closed) return Promise.reject(new Error("Plugin tool runtime is closed"));
+    if (!this.environmentUpdates && !this.environmentFailure && digestJson(next) === this.environments.policyIdentity()) return Promise.resolve();
+    this.environmentUpdates++;
+    const change = this.environmentTail.catch(() => {}).then(async () => {
+      if (this.closed) throw new Error("Plugin tool runtime is closed");
+      this.environments.replace(next);
+      try { await this.drain(); await this.environments.clear(); this.environmentFailure = undefined; }
+      catch (error) { this.environmentFailure = error; throw error; }
+    });
+    this.environmentTail = change.finally(() => { this.environmentUpdates--; }); return this.environmentTail;
+  }
+
+  environmentIdentity(plugin: LoadedPlugin, contribution: ExternalPluginToolContribution): string {
+    this.assertAdmitted(plugin); return this.environments.bind(plugin, contribution).identity;
   }
 
   async startEager(plugins: readonly LoadedPlugin[]): Promise<void> {
+    const epochs = new Map(plugins.map(plugin => { const generation = this.generation(plugin); return [generation, this.stopEpochs.get(generation) ?? 0]; }));
+    await this.environmentTail;
     if (this.closed) throw new Error("Plugin tool runtime is closed");
     for (const plugin of plugins) {
       if (!isPluginActive(plugin)) continue;
       const generation = this.generation(plugin);
-      const epoch = this.stopEpochs.get(generation) ?? 0;
+      const epoch = epochs.get(generation)!;
       await this.stopping.get(generation);
       if (this.closed) throw new Error("Plugin tool runtime is closed");
       if ((this.stopEpochs.get(generation) ?? 0) !== epoch) throw new Error("Plugin activation was superseded by a stop request");
       this.retired.delete(generation);
+      const secrets: string[] = [];
       try {
         // Preflight every contract before starting this package's eager processes.
-        for (const contribution of plugin.toolContributions) if (contribution.type === "external") await this.inputContract(plugin, contribution);
+        for (const contribution of plugin.toolContributions) if (contribution.type === "external") {
+          await this.inputContract(plugin, contribution); secrets.push(...this.environments.bind(plugin, contribution).secrets);
+        }
         for (const contribution of plugin.toolContributions) {
           if (contribution.type === "external" && contribution.lifecycle.transport === "stdio" && contribution.lifecycle.start === "eager") {
-            await this.ensureStdio(plugin, contribution);
+            await this.ensureStdio(plugin, contribution, undefined, epoch);
             this.assertAdmitted(plugin);
           }
         }
       } catch (error) {
-        try { await this.stopPlugin(plugin); } catch (cleanup) { throw new AggregateError([error, cleanup], "Plugin eager activation and cleanup failed"); }
-        throw error;
+        // An obsolete activation must not stop resources acquired by a newer explicit activation.
+        if ((this.stopEpochs.get(generation) ?? 0) === epoch) {
+          try { await this.stopPlugin(plugin); } catch (cleanup) { throw redactPluginError(new AggregateError([error, cleanup], "Plugin eager activation and cleanup failed"), secrets); }
+        }
+        throw redactPluginError(error, secrets);
       }
     }
   }
 
-  async call(plugin: LoadedPlugin, contribution: ExternalPluginToolContribution, input: Record<string, unknown>, signal: AbortSignal): Promise<string> {
+  async call(plugin: LoadedPlugin, contribution: ExternalPluginToolContribution, input: Record<string, unknown>, signal: AbortSignal, expectedEnvironment?: string): Promise<string> {
     this.assertAdmitted(plugin); signal.throwIfAborted();
+    const binding = this.environments.bind(plugin, contribution);
+    if (expectedEnvironment !== undefined && expectedEnvironment !== binding.identity) throw new PluginToolEnvironmentError("PLUGIN_TOOL_ENVIRONMENT_CHANGED", "This tool handle belongs to an earlier host environment policy; rebuild the catalog");
     if (this.calls.size >= this.limits.maxConcurrentCalls) throw new Error("Plugin tool concurrent call limit reached");
     const admittedInput = snapshotPluginToolInput(input, this.limits.maxInputBytes);
     const body = JSON.stringify(admittedInput);
@@ -82,12 +118,17 @@ export class PluginToolRuntimeManager {
       this.assertAdmitted(plugin); controller.signal.throwIfAborted();
       contract.validate(admittedInput, this.limits.maxInputBytes);
       try {
-        if (contribution.lifecycle.transport === "oneshot") return await runOneShotTool(plugin, contribution, body, this.env, controller.signal, this.limits);
+        if (contribution.lifecycle.transport === "oneshot") {
+          const env = await this.environments.prepare(plugin, contribution, binding);
+          this.assertAdmitted(plugin); controller.signal.throwIfAborted();
+          return await runOneShotTool(plugin, contribution, body, env, controller.signal, this.limits);
+        }
         if (contribution.lifecycle.transport === "http") return await runHttpTool(plugin, contribution, admittedInput, controller.signal, this.limits);
         if (contribution.lifecycle.transport !== "stdio") throw new Error(`Plugin ${plugin.name} tool ${contribution.id} cannot use ${contribution.lifecycle.transport} as an external transport`);
         return await this.callStdio(plugin, contribution, admittedInput, controller.signal);
       } catch (error) { controller.signal.throwIfAborted(); throw error; }
-    }).finally(() => { clearTimeout(timer); signal.removeEventListener("abort", abort); this.calls.delete(call); });
+    }).then(value => redactPluginCredentials(value, binding.secrets), error => { throw redactPluginError(error, binding.secrets); })
+      .finally(() => { clearTimeout(timer); signal.removeEventListener("abort", abort); this.calls.delete(call); });
     this.calls.add(call);
     return call.done;
   }
@@ -108,7 +149,10 @@ export class PluginToolRuntimeManager {
   close(): Promise<void> {
     if (!this.closing) {
       this.closed = true;
-      this.closing = this.drain().finally(() => this.inputs.clear());
+      this.closing = (async () => {
+        await this.environmentTail.catch(() => {});
+        await this.drain(); await this.environments.clear(); this.inputs.clear();
+      })();
     }
     return this.closing;
   }
@@ -119,7 +163,7 @@ export class PluginToolRuntimeManager {
     this.retired.add(generation);
     let stopping = this.stopping.get(generation);
     if (!stopping) {
-      stopping = this.drain(generation).finally(() => this.stopping.delete(generation));
+      stopping = this.drain(generation).then(() => this.environments.clear(generation)).finally(() => this.stopping.delete(generation));
       this.stopping.set(generation, stopping);
     }
     return stopping;
@@ -144,6 +188,7 @@ export class PluginToolRuntimeManager {
   private assertAdmitted(plugin: LoadedPlugin): void {
     assertPluginActive(plugin);
     if (this.closed || this.retired.has(this.generation(plugin))) throw new Error(`Plugin ${plugin.name} tool generation is stopped`);
+    if (this.environmentUpdates || this.environmentFailure) throw new PluginToolEnvironmentError("PLUGIN_TOOL_ENVIRONMENT_CHANGED", "Host environment policy is changing or could not drain; new calls are blocked");
   }
 
   private async stopRuntime(runtime: StdioRuntime, error: Error): Promise<void> {
@@ -154,37 +199,46 @@ export class PluginToolRuntimeManager {
   }
 
   private async callStdio(plugin: LoadedPlugin, contribution: ExternalPluginToolContribution, input: Record<string, unknown>, signal: AbortSignal): Promise<string> {
-    const runtime = await this.ensureStdio(plugin, contribution);
-    this.assertAdmitted(plugin); signal.throwIfAborted();
-    if (this.processes.get(this.key(plugin, contribution)) !== runtime || runtime.process.signal.aborted) throw new Error(`Plugin ${plugin.name} tool generation is stopped`);
-    const id = `${process.pid}-${runtime.nextId++}`;
-    const request = JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name: contribution.id, input } });
-    if (Buffer.byteLength(request) > this.limits.maxInputBytes) throw new Error(`Plugin tool request exceeds ${this.limits.maxInputBytes} byte limit`);
-    const abort = () => { void this.stopRuntime(runtime, errorValue(signal.reason)); };
-    signal.addEventListener("abort", abort, { once: true });
+    let runtime: StdioRuntime | undefined;
+    const abort = () => { if (runtime) void this.stopRuntime(runtime, errorValue(signal.reason)); };
     try {
+      const active = await this.ensureStdio(plugin, contribution, signal); runtime = active;
+      this.assertAdmitted(plugin); signal.throwIfAborted();
+      if (this.processes.get(this.key(plugin, contribution)) !== active || active.process.signal.aborted) throw new Error(`Plugin ${plugin.name} tool generation is stopped`);
+      const id = `${process.pid}-${active.nextId++}`;
+      const request = JSON.stringify({ jsonrpc: "2.0", id, method: "tools/call", params: { name: contribution.id, input } });
+      if (Buffer.byteLength(request) > this.limits.maxInputBytes) throw new Error(`Plugin tool request exceeds ${this.limits.maxInputBytes} byte limit`);
+      signal.addEventListener("abort", abort, { once: true });
       return await new Promise<string>((resolve, reject) => {
-        runtime.pending.set(id, { resolve, reject });
-        try { runtime.process.child.stdin.write(`${request}\n`); } catch (error) { runtime.pending.delete(id); reject(error); }
+        active.pending.set(id, { resolve, reject });
+        try { active.process.child.stdin.write(`${request}\n`); } catch (error) { active.pending.delete(id); reject(error); }
       });
     } finally {
       signal.removeEventListener("abort", abort);
-      if (signal.aborted || runtime.process.signal.aborted) await this.stopRuntime(runtime, errorValue(signal.reason ?? runtime.process.signal.reason));
+      if (runtime && (signal.aborted || runtime.process.signal.aborted)) await this.stopRuntime(runtime, errorValue(signal.reason ?? runtime.process.signal.reason));
     }
   }
 
-  private async ensureStdio(plugin: LoadedPlugin, contribution: ExternalPluginToolContribution): Promise<StdioRuntime> {
-    this.assertAdmitted(plugin);
+  private async ensureStdio(plugin: LoadedPlugin, contribution: ExternalPluginToolContribution, signal?: AbortSignal, epoch?: number): Promise<StdioRuntime> {
+    const check = () => {
+      this.assertAdmitted(plugin); signal?.throwIfAborted();
+      if (epoch !== undefined && (this.stopEpochs.get(this.generation(plugin)) ?? 0) !== epoch) throw new Error("Plugin activation was superseded by a stop request");
+    };
+    check();
     const key = this.key(plugin, contribution), existing = this.processes.get(key);
     if (existing) {
       if (!existing.process.signal.aborted) return existing;
       await existing.done;
-      this.assertAdmitted(plugin);
+      check();
       // Another caller may have replaced it while cleanup was awaited.
-      return this.ensureStdio(plugin, contribution);
+      return this.ensureStdio(plugin, contribution, signal, epoch);
     }
+    const binding = this.environments.bind(plugin, contribution);
+    const env = await this.environments.prepare(plugin, contribution, binding);
+    check();
+    if (this.processes.has(key)) return this.ensureStdio(plugin, contribution, signal, epoch);
     if (this.processes.size >= this.limits.maxStdioProcesses) throw new Error("Plugin stdio process limit reached");
-    const process = spawnPluginProcess(plugin, contribution, this.env, this.limits);
+    const process = spawnPluginProcess(plugin, contribution, env, this.limits);
     const runtime: StdioRuntime = { process, pending: new Map(), nextId: 1, generation: this.generation(plugin), done: Promise.resolve() };
     this.processes.set(key, runtime);
     let failure: Error | undefined;
@@ -203,6 +257,7 @@ export class PluginToolRuntimeManager {
       runtime.pending.clear();
     });
     await Promise.resolve();
+    if (signal?.aborted) { await this.stopRuntime(runtime, errorValue(signal.reason)); signal.throwIfAborted(); }
     if (process.signal.aborted || process.child.exitCode !== null) { await runtime.done; throw failure ?? new Error(`Plugin ${plugin.name} tool runtime ${contribution.id} failed to start`); }
     return runtime;
   }
@@ -268,6 +323,7 @@ async function createExternalPluginTool(
   runtime: PluginToolRuntimeManager,
 ): Promise<AgentTool> {
   const contract = await runtime.inputContract(plugin, contribution);
+  const environment = runtime.environmentIdentity(plugin, contribution);
   if (contribution.lifecycle.transport !== "http") {
     const { inputSchemaPath: _path, ...prepared } = contribution;
     // Resolving a command creates a new contribution object. Carry the already pinned schema,
@@ -281,7 +337,7 @@ async function createExternalPluginTool(
     validate(input) {
       return contract.validate(input, DEFAULT_PLUGIN_TOOL_LIMITS.maxInputBytes);
     },
-    execute: (input, signal) => runtime.call(plugin, contribution, input, signal),
+    execute: (input, signal) => runtime.call(plugin, contribution, input, signal, environment),
     access: contribution.security.access,
     isReadOnly: () => contribution.security.access === "read",
     isConcurrencySafe: () => contribution.security.access === "read",

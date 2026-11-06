@@ -210,6 +210,14 @@ subprocess workspace/network/shell metadata remains declarative. See the
 host override rules. Unknown identifiers, unsupported transports, and escaping paths fail
 startup instead of being silently ignored.
 
+Process tools receive a minimal environment and private HOME/temp/config paths.
+Host credentials require user-only `pluginToolEnvironment` references bound to
+the exact package fingerprint and tool ID. Project settings, overlays and tool
+manifests cannot grant themselves ambient environment access. Policy changes
+drain existing calls/processes; stale tool handles reject changed credential
+bindings. See the [environment contract](guides/plugin-tool-environment.md) for
+configuration, limits, compatibility changes and the boundary with OS isolation.
+
 Interactive REPL and Ink sessions own one shared plugin runtime, so `stdio`
 tool processes survive across multiple Agent turns and are terminated only when
 the interactive session exits. Print-mode and SDK calls that do not inject a

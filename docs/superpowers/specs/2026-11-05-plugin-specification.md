@@ -4,7 +4,7 @@
 
 首批实现为统一包准入策略，覆盖发现时的指纹阻止、资源刷新撤权、停止后的外部工具句柄，以及当前和历史 Coding Worker 的资源策略复验。使用方式见[宿主指南](../../guides/host-plugins.md#统一准入策略和撤权)，实现边界和验收见[准入策略审阅](../reviews/2026-11-05-plugin-policy.md)。这只落实 AUTH-01、AUTH-02、SVC-04 和 REC-01 的部分路径，不表示下列全部规则已交付。
 
-后续已落实外部插件工具的 HTTP loopback 直连约束、拒绝重定向、调用期限、读取字节限额、并发/常驻进程数上限、取消及直接子进程退出等待，见[运行合同](../../guides/plugin-tool-runtime.md)和[实现审阅](../reviews/2026-11-05-plugin-runtime.md)。这部分落实 AUTH-05 和 LIFE-01 至 LIFE-05；任意进程内扩展、后代进程树隔离、最小环境、MCP/Channel 的统一预算及配置/状态迁移仍未交付。
+后续已落实外部插件工具的 HTTP loopback 直连约束、拒绝重定向、调用期限、读取字节限额、并发/常驻进程数上限、取消及直接子进程退出等待，见[运行合同](../../guides/plugin-tool-runtime.md)和[实现审阅](../reviews/2026-11-05-plugin-runtime.md)。这部分落实 AUTH-05 和 LIFE-01 至 LIFE-05 的外部工具路径；任意进程内强撤销、后代进程树隔离和 MCP/Channel 的统一预算仍未交付。环境、配置和状态合同的后续实现见下文。
 
 类型化 ServiceRef、宿主工厂依赖预检、host/contribution 作用域和受管理句柄已落实，默认 Web/协作/渠道使用同一合同；嵌套任务调用及渠道构造清理也纳入等待，见[服务规格](2026-11-05-plugin-services.md)、[使用指南](../../guides/plugin-services.md)和[审阅](../reviews/2026-11-05-plugin-services.md)。该阶段部分覆盖 SVC-01 至 SVC-04，Run/call 作用域及任意进程内强撤销仍未交付。
 
@@ -13,6 +13,8 @@
 运行时备份 v2 现已覆盖历史包和插件私有文件，并以数据库引用检查材料齐全；只读 `runtime backup-check` 区分材料完整性与静态 ABI/宿主兼容性，见[备份规格](2026-11-05-plugin-backup.md)、[指南](../../guides/plugin-backup.md)和[审阅](../reviews/2026-11-05-plugin-backup.md)。外部安装、信任、账户、工作目录与远端业务可用性仍需原执行合同验证，不将其宣称为完整自动灾备。
 
 外部工具参数现已接入有界 Schema 实际校验，覆盖内联/文件合同、模型输入、Hook/审批改写与直接执行；预启动和目录使用固定快照，见[参数规格](2026-11-05-plugin-tool-input.md)、[指南](../../guides/plugin-tool-runtime.md)和[审阅](../reviews/2026-11-05-plugin-tool-input.md)。这是 RUN-02/04 的参数路径，不包含结果 Schema 或完整 JSON Schema 方言。
+
+oneshot/stdio 工具已使用最小环境、独立临时 HOME/配置目录和按包指纹/工具授权的宿主环境引用，配置变化先排空，旧句柄不能自动切换凭据。见[环境规格](2026-11-05-plugin-tool-environment.md)、[指南](../../guides/plugin-tool-environment.md)和[审阅](../reviews/2026-11-05-plugin-tool-environment.md)。这部分落实 AUTH-03/05 和 LIFE-01；统一 MCP/Channel 凭据、OS 沙箱、后代进程树与崩溃遗留目录回收仍未交付。
 
 本文使用“必须”表示准入要求，“应”表示通常需要满足且例外须说明的要求，“可以”表示可选能力。规范覆盖包、贡献、宿主服务、模型工具、状态及恢复，不将安装信任等同于恶意代码隔离。
 

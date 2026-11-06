@@ -9,12 +9,13 @@ export type PluginToolLimits = {
   maxConcurrentCalls: number;
   maxStdioProcesses: number;
   killGraceMs: number;
+  maxProcessEnvironments: number;
 };
 
 export const DEFAULT_PLUGIN_TOOL_LIMITS: Readonly<PluginToolLimits> = Object.freeze({
   timeoutMs: 120_000, maxInputBytes: 1024 * 1024, maxOutputBytes: 1024 * 1024,
   maxStderrBytes: 256 * 1024, maxFrameBytes: 1024 * 1024, maxStdioBytes: 8 * 1024 * 1024,
-  maxConcurrentCalls: 32, maxStdioProcesses: 16, killGraceMs: 250,
+  maxConcurrentCalls: 32, maxStdioProcesses: 16, killGraceMs: 250, maxProcessEnvironments: 128,
 });
 
 export function pluginToolLimits(overrides: Partial<PluginToolLimits> = {}): Readonly<PluginToolLimits> {

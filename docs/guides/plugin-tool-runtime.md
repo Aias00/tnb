@@ -33,6 +33,7 @@ HTTP 工具使用 JSON-RPC `tools/call` 的 POST 请求。网络声明在发现�
 | maxConcurrentCalls | 32 | 一个工具 runtime 的全部在途调用，超出立即拒绝，不无界排队 |
 | maxStdioProcesses | 16 | 一个工具 runtime 的常驻 stdio 子进程数 |
 | killGraceMs | 250 ms | 直接子进程正常终止后的强制退出升级间隔 |
+| maxProcessEnvironments | 128 | 每个 runtime 管理的工具代际私有 HOME/临时环境数量 |
 
 stdout/stderr 从子进程启动时同时读取，避免等进程退出后才读 stderr 造成管道阻塞。限制以原始字节计算，JSON 解析前先检查帧大小。生命周期累计上限达到后终止该进程；新的独立调用可以重新建立进程，但宿主不会重发旧调用。展示结果仍保留 100000 字符上限及截断标记，展示截断和读取超限失败是不同结果。
 
@@ -62,6 +63,6 @@ HTTP 调用取消时销毁自己的连接；oneshot 取消时关闭输入、终�
 
 ## 隔离和后续规范
 
-本轮管理直接子进程，不构成后代进程树、文件、网络或系统调用的 OS 沙箱。`workspace`、子进程 `network` 和 `shell` 字段仍是声明信息；启动时不加 shell 包装，也不能阻止可执行程序自行创建 shell。子进程环境沿用宿主传入值，最小环境和凭据引用尚未统一落地。
+本轮管理直接子进程，不构成后代进程树、文件、网络或系统调用的 OS 沙箱。`workspace`、子进程 `network` 和 `shell` 字段仍是声明信息；启动时不加 shell 包装，也不能阻止可执行程序自行创建 shell。oneshot/stdio 默认使用最小运行环境及私有 HOME/TMP，凭据由宿主按指纹/工具授权环境引用，见[环境与凭据指南](plugin-tool-environment.md)。授权变化先排空，旧句柄不能静默切换凭据；依赖隐式环境的旧工具需调整用户配置。
 
-参数校验使用上述明确支持的有界方言，不宣称支持完整 JSON Schema 或输出结果验证。分端 UI SDK、最小环境、统一 MCP/Channel 预算和任意进程内扩展的强撤销仍需后续完善。整个插件规范的目标与当前已交付范围见[规范草案](../superpowers/specs/2026-11-05-plugin-specification.md)。
+参数校验使用上述明确支持的有界方言，不宣称支持完整 JSON Schema 或输出结果验证。分端 UI SDK、统一 MCP/Channel 预算/凭据服务和任意进程内扩展的强撤销仍需后续完善。整个插件规范的目标与当前已交付范围见[规范草案](../superpowers/specs/2026-11-05-plugin-specification.md)。

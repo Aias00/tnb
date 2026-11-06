@@ -12,6 +12,7 @@ import {
 } from "../hooks/runner";
 import type { SandboxSettings } from "../sandbox/macos";
 import { parsePluginConfiguration, type PluginConfiguration } from "../../agent/plugin-data";
+import { parsePluginToolEnvironment, type PluginToolEnvironmentGrant } from "../plugins/environment";
 
 export type TnbSettings = {
   provider?: string;
@@ -22,6 +23,7 @@ export type TnbSettings = {
   enabledPlugins?: Record<string, boolean>;
   pluginServices?: Record<string, string[]>;
   pluginConfiguration?: PluginConfiguration;
+  pluginToolEnvironment?: PluginToolEnvironmentGrant[];
   blockedPluginFingerprints?: string[];
   general?: { vimMode?: boolean; editor?: string };
   ui?: { theme?: "magenta" | "cyan" | "blue" | "green" };
@@ -59,6 +61,10 @@ export async function loadSettings(options: {
   for (const path of projectPaths) {
     const settings = await readSettings(path);
     if (!settings) continue;
+    if (settings.pluginToolEnvironment !== undefined) {
+      warnings.push(`Ignored pluginToolEnvironment from ${path}; process credentials may only be configured in ${userPath}`);
+      delete settings.pluginToolEnvironment;
+    }
     if (settings.pluginConfiguration !== undefined) {
       warnings.push(`Ignored pluginConfiguration from ${path}; background plugin configuration may only be configured in ${userPath}`);
       delete settings.pluginConfiguration;
@@ -76,7 +82,12 @@ export async function loadSettings(options: {
     }
   }
   if (options.additional !== undefined) {
-    result = mergeSettings(result, await loadSettingsInput(options.additional, options.cwd));
+    const additional = await loadSettingsInput(options.additional, options.cwd);
+    if (additional.pluginToolEnvironment !== undefined) {
+      warnings.push(`Ignored pluginToolEnvironment from --settings; process credentials may only be configured in ${userPath}`);
+      delete additional.pluginToolEnvironment;
+    }
+    result = mergeSettings(result, additional);
   }
   return warnings.length ? { ...result, warnings } : result;
 }
@@ -155,6 +166,7 @@ function validateSettings(value: unknown, path: string): TnbSettings {
     result.pluginServices = services as Record<string, string[]>;
   }
   if (root.pluginConfiguration !== undefined) result.pluginConfiguration = parsePluginConfiguration(root.pluginConfiguration);
+  if (root.pluginToolEnvironment !== undefined) result.pluginToolEnvironment = parsePluginToolEnvironment(root.pluginToolEnvironment);
   if (root.blockedPluginFingerprints !== undefined) {
     if (!Array.isArray(root.blockedPluginFingerprints) || root.blockedPluginFingerprints.length > 4096
       || root.blockedPluginFingerprints.some(value => typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value))) throw new Error(`blockedPluginFingerprints must contain SHA256 fingerprints: ${path}`);
@@ -286,6 +298,7 @@ function mergeSettings(
       : {}),
     ...(earlier.pluginServices || later.pluginServices ? { pluginServices: { ...earlier.pluginServices, ...later.pluginServices } } : {}),
     ...(earlier.pluginConfiguration || later.pluginConfiguration ? { pluginConfiguration: { ...earlier.pluginConfiguration, ...later.pluginConfiguration } } : {}),
+    ...(later.pluginToolEnvironment !== undefined || earlier.pluginToolEnvironment !== undefined ? { pluginToolEnvironment: later.pluginToolEnvironment ?? earlier.pluginToolEnvironment } : {}),
     ...(earlier.blockedPluginFingerprints || later.blockedPluginFingerprints ? { blockedPluginFingerprints: [...new Set([...(earlier.blockedPluginFingerprints ?? []), ...(later.blockedPluginFingerprints ?? [])])] } : {}),
     ...(earlier.general || later.general ? { general: { ...earlier.general, ...later.general } } : {}),
     ...(earlier.ui || later.ui ? { ui: { ...earlier.ui, ...later.ui } } : {}),

@@ -447,6 +447,7 @@ function externalToolContribution(
   root: string,
   index: number,
 ): ExternalPluginToolContribution {
+  if (Object.keys(value).some(key => !["id", "type", "description", "command", "args", "inputSchema", "lifecycle", "security"].includes(key))) throw new Error("Unsupported external plugin tool field; environment grants belong to host settings");
   const type = optionalString(value.type, `tools[${index}].type`, path) ?? "external";
   if (type !== "external") throw new Error(`Plugin tools[${index}].type must be "external": ${path}`);
   const id = requiredIdentifier(value.id, `tools[${index}].id`, path);
