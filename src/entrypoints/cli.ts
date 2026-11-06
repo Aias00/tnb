@@ -6043,11 +6043,14 @@ function writeHookExecutionEvent(
   ) })}\n`);
 }
 
-if (import.meta.main && process.argv[2] === "--internal-plugin-process") {
+// The private build identity is injected only into the standalone CLI; it also
+// identifies the entry when bundled import.meta.main metadata is unavailable.
+const cliIsMain = import.meta.main || buildInfo().mode === "compiled";
+if (cliIsMain && process.argv[2] === "--internal-plugin-process") {
   await (await import("../services/plugins/process-host")).runPluginProcessWorker();
-} else if (import.meta.main && process.argv[2] === "--internal-plugin-worker") {
+} else if (cliIsMain && process.argv[2] === "--internal-plugin-worker") {
   await (await import("../services/plugins/process-host")).runPluginProcessEntry();
-} else if (import.meta.main) {
+} else if (cliIsMain) {
   setupGracefulShutdown();
   const suppliedArgv = normalizeCliArguments(Bun.argv.slice(2));
   const remoteControlSocket = suppliedArgv[0] === "remote-control"
