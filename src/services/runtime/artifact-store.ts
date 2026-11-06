@@ -16,7 +16,10 @@ export class RuntimeArtifacts {
     finally { await file.close(); }
     try {
       await rename(temporary, target);
-      const directory = await open(this.root, "r"); try { await directory.sync(); } finally { await directory.close(); }
+      // Node cannot fsync directories on Windows; the artifact file was flushed before rename.
+      if (process.platform !== "win32") {
+        const directory = await open(this.root, "r"); try { await directory.sync(); } finally { await directory.close(); }
+      }
     }
     finally { await unlink(temporary).catch(() => undefined); }
     return hash;

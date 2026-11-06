@@ -10,7 +10,12 @@ import { backupRuntime, restoreRuntime, withOfflineRuntime, pruneRuntime } from 
 import { lock } from "../../src/utils/lockfile";
 
 const roots: string[] = []; const stores: RuntimeStore[] = [];
-afterEach(async () => { stores.splice(0).forEach((s) => s.close()); await Promise.all(roots.splice(0).map((p) => rm(p, { recursive: true, force: true }))); });
+afterEach(async () => {
+  stores.splice(0).forEach((s) => s.close());
+  // Bun's native SQLite statements may retain Windows file handles until collection.
+  if (process.platform === "win32") Bun.gc(true);
+  await Promise.all(roots.splice(0).map((p) => rm(p, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 })));
+});
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "tnb-maintenance-")); roots.push(root);
   const state = join(root, "runtime"); const store = new RuntimeStore(join(state, "state.sqlite")); stores.push(store);
