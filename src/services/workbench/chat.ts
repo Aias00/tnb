@@ -3,7 +3,7 @@ import { searchWorkspaceContent } from "../workspace/content-search";
 import { randomUUID } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import type { ChatService, ChatSummary, ChatMessage, ChatSnapshot, ChatApproval } from "../../agent/chat-service";
+import type { ChatService, ChatSummary, ChatMessage, ChatSnapshot, ChatApproval, ChatActivity, ChatHistoryPage } from "../../agent/chat-service";
 import { query, type QueryInput, type Query, type CanUseToolResult } from "../../sdk/query";
 import { loadProviderCatalog, resolveProviderSelection } from "../../providers/config";
 import { SessionStore } from "../session/storage";
@@ -11,7 +11,7 @@ import type { RuntimeStore } from "../runtime/store";
 import { digestJson, encodeJson, text } from "../runtime/json";
 
 const CHATS = "host.web-chats", MESSAGES = "host.web-chat-messages";
-type LiveTurn = { controller: AbortController; done: Promise<void>; message: ChatMessage;
+type LiveTurn = { activeTools: Map<string, string>; activity: ChatActivity; controller: AbortController; done: Promise<void>; message: ChatMessage;
   approvals: Map<string, { value: ChatApproval; resolve(value: CanUseToolResult): void }> };
 const messageId = (chatId: string, sequence: number) => `${chatId}:${String(sequence).padStart(10, "0")}`;
 const clipped = (value: string, limit = 128 * 1024) => Buffer.byteLength(value) <= limit ? value : Buffer.from(value).subarray(0, limit).toString("utf8") + "\n[显示内容已截断；原会话由执行器保存]";
@@ -55,11 +55,22 @@ export function createChatService(options: { store: RuntimeStore; configDir: str
     }
     if (page.length < 256) break; after = page.at(-1)!.id;
   }
-  const snapshot = (id: string): ChatSnapshot => {
-    const chat = read(id).value, start = Math.max(0, chat.messageCount - 64);
-    const messages = store.applicationRecords<ChatMessage>(MESSAGES, start ? messageId(id, start) : "", 64, { thread: id }).map(row => row.value);
+  const historyPage = (id: string, before?: string): ChatHistoryPage => {
+    const chat = read(id).value;
+    let end = chat.messageCount;
+    if (before !== undefined) {
+      const prefix = `${id}:`, sequence = before.startsWith(prefix) ? before.slice(prefix.length) : "";
+      if (!/^\d{10}$/.test(sequence) || Number(sequence) < 1 || Number(sequence) > chat.messageCount + 1) throw new Error("Invalid conversation history cursor");
+      end = Number(sequence) - 1;
+    }
+    const start = Math.max(0, end - 64);
+    const messages = store.applicationRecords<ChatMessage>(MESSAGES, start ? messageId(id, start) : "", 64, { thread: id }).map(row => row.value).filter(message => message.id <= messageId(id, end));
     const active = live.get(id); if (active) { const index = messages.findIndex(message => message.id === active.message.id); if (index >= 0) messages[index] = structuredClone(active.message); }
-    return { chat, messages, approvals: [...(active?.approvals.values() ?? [])].map(row => row.value), earlierMessages: start };
+    return { messages, earlierMessages: start };
+  };
+  const snapshot = (id: string): ChatSnapshot => {
+    const chat = read(id).value, active = live.get(id);
+    return { chat, ...historyPage(id), approvals: [...(active?.approvals.values() ?? [])].map(row => row.value), ...(active ? { activity: active.approvals.size && active.activity.phase !== "cancelling" ? { phase: "waiting-approval" as const, startedAt: active.activity.startedAt } : { ...active.activity } } : {}) };
   };
   async function run(chat: ChatSummary, prompt: string, resume: boolean, turn: LiveTurn) {
     let client: Query | undefined, completed = false;
@@ -76,6 +87,7 @@ export function createChatService(options: { store: RuntimeStore; configDir: str
           linked.throwIfAborted(); if (turn.approvals.size >= 16) return { behavior: "deny", message: "Too many pending approvals" };
           const value: ChatApproval = { requestId: request.requestId, turnId: chat.turnId!, tool, input: clipped(encodeJson(input, 1024 * 1024), 16 * 1024), message: request.message };
           const decision = Promise.withResolvers<CanUseToolResult>(); turn.approvals.set(value.requestId, { value, resolve: decision.resolve });
+          turn.activity = { phase: "waiting-approval", startedAt: turn.activity.startedAt };
           save({ ...read(chat.id).value, status: "waiting-approval" }); emit(chat.id);
           return decision.promise;
         },
@@ -83,12 +95,17 @@ export function createChatService(options: { store: RuntimeStore; configDir: str
       for await (const message of client) {
         linked.throwIfAborted();
         if (message.type === "model_event") {
-          const event = message.event as { type?: string; text?: string };
+          const event = message.event as { type?: string; text?: string; name?: string; phase?: string; retry?: number; delayMs?: number };
+          if (event?.type === "text" || event?.type === "thinking") turn.activity = { phase: event.type === "text" ? "responding" : "thinking", startedAt: turn.activity.startedAt };
+          if (event?.type === "tool-start") turn.activity = { phase: "preparing-tool", tool: String(event.name ?? "tool").slice(0, 128), startedAt: turn.activity.startedAt };
+          if (event?.type === "retry") turn.activity = { phase: event.phase === "waiting" ? "retrying" : "requesting", startedAt: turn.activity.startedAt, ...(Number.isSafeInteger(event.retry) ? { retry: event.retry } : {}), ...(event.phase === "waiting" && typeof event.delayMs === "number" && Number.isFinite(event.delayMs) && event.delayMs >= 0 ? { retryAt: Date.now() + Math.min(event.delayMs, 3600000) } : {}) };
           if (event?.type === "text" && typeof event.text === "string") turn.message.text = clipped(turn.message.text + event.text);
         }
         if (message.type === "tool_event") {
           const event = message.event as { type: string; id: string; name: string; output?: string; isError?: boolean; data?: { exitCode?: number; agentPhase?: string; latestTool?: string; elapsedTimeSeconds?: number } };
           if (event?.type === "tool-execution-start") {
+            turn.activeTools.set(event.id, String(event.name).slice(0, 128));
+            turn.activity = { phase: "tool", tool: String(event.name).slice(0, 128), startedAt: turn.activity.startedAt };
             turn.message.tools ??= []; if (turn.message.tools.length < 64) turn.message.tools.push({ id: String(event.id).slice(0, 128), name: String(event.name).slice(0, 128), status: "running" });
           }
           if (event?.type === "tool-execution-progress") {
@@ -102,6 +119,9 @@ export function createChatService(options: { store: RuntimeStore; configDir: str
           }
           if (event?.type === "tool-execution-end") {
             const tool = turn.message.tools?.find(item => item.id === event.id); if (tool) { tool.status = event.isError ? "failed" : "complete"; tool.output = clipped(event.output ?? "", 4096); }
+            turn.activeTools.delete(event.id);
+            const running = turn.activeTools.values().next().value;
+            turn.activity = { phase: running ? "tool" : "requesting", ...(running ? { tool: running } : {}), startedAt: turn.activity.startedAt };
           }
         }
         if (message.type === "result") {
@@ -143,6 +163,7 @@ export function createChatService(options: { store: RuntimeStore; configDir: str
         return result.sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 100);
       },
       detail(id) { scoped(id); return snapshot(id); },
+      page(id, before) { scoped(id); return historyPage(id, before); },
       async search(query, searchSignal) { assertLive(); text(query, "search query", 1024); return searchWorkspaceContent(workspace, query, AbortSignal.any([signal, ...(searchSignal ? [searchSignal] : [])])); },
       async command(value) {
         assertLive(); if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Invalid conversation command");
@@ -183,7 +204,7 @@ export function createChatService(options: { store: RuntimeStore; configDir: str
           // Replayed receipts must never launch the accepted model call a second time.
           const current = read(chat.id).value;
           if (current.turnId === result.turnId && current.status === "running" && !live.has(chat.id) && current.messageCount === result.messageCount) {
-            const turn: LiveTurn = { controller: new AbortController(), done: Promise.resolve(), message: store.applicationRecord<ChatMessage>(MESSAGES, messageId(chat.id, current.messageCount))!.value, approvals: new Map() };
+            const turn: LiveTurn = { activeTools: new Map(), activity: { phase: "requesting", startedAt: Date.now() }, controller: new AbortController(), done: Promise.resolve(), message: store.applicationRecord<ChatMessage>(MESSAGES, messageId(chat.id, current.messageCount))!.value, approvals: new Map() };
             live.set(chat.id, turn);
             const execute = () => run(current, input.text as string, resume, turn);
             turn.done = options.track ? options.track(execute) : execute(); void turn.done.catch(() => {}); emit(chat.id);
@@ -198,8 +219,8 @@ export function createChatService(options: { store: RuntimeStore; configDir: str
           return { accepted: true };
         });
         const turn = live.get(chat.id);
-        if (action === "stop") turn?.controller.abort(new Error("用户停止了本轮，请核对工具结果后继续。"));
-        else { const pending = turn?.approvals.get(input.requestId as string); if (pending) { turn!.approvals.delete(input.requestId as string); pending.resolve(input.behavior === "allow" ? { behavior: "allow" } : { behavior: "deny", message: "User denied this operation" });
+        if (action === "stop" && turn) { turn.activity = { phase: "cancelling", startedAt: turn.activity.startedAt }; emit(chat.id); turn.controller.abort(new Error("用户停止了本轮，请核对工具结果后继续。")); }
+        else { const pending = turn?.approvals.get(input.requestId as string); if (pending) { turn!.approvals.delete(input.requestId as string); turn!.activity = { phase: turn!.approvals.size ? "waiting-approval" : "requesting", startedAt: turn!.activity.startedAt }; pending.resolve(input.behavior === "allow" ? { behavior: "allow" } : { behavior: "deny", message: "User denied this operation" });
           save({ ...read(chat.id).value, status: turn!.approvals.size ? "waiting-approval" : "running" }); emit(chat.id); } }
         return result;
       },

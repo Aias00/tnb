@@ -5,7 +5,7 @@ const scope = location.pathname;
 const storageKey = name => 'tnb:web:' + scope + ':' + name;
 const stored = name => { try { return JSON.parse(localStorage.getItem(storageKey(name)) || 'null'); } catch { return null; } };
 const save = (name, value) => { if (value === null) localStorage.removeItem(storageKey(name)); else localStorage.setItem(storageKey(name), JSON.stringify(value)); };
-const state = { runs: [], questions: [], notices: [], selected: null, detail: null, question: null, routeChoice: null, operation: null, stream: null, seen: new Set(), offered: new Set(), connectionError: false, pending: stored('pending'), tab: 'report', sequence: 0, events: [], busy: false, coding: false, view: 'chat', chats: [], chatId: stored('chat-selected'), chatSnapshot: null, chatStream: null, chatBusy: false, chatAvailable: false, chatPending: stored('chat-pending') };
+const state = { runs: [], questions: [], notices: [], selected: null, detail: null, question: null, routeChoice: null, operation: null, stream: null, seen: new Set(), offered: new Set(), connectionError: false, pending: stored('pending'), tab: 'report', sequence: 0, events: [], busy: false, coding: false, view: 'chat', chats: [], chatId: stored('chat-selected'), chatSnapshot: null, chatLoading: false, chatOpenSequence: 0, chatPage: null, chatPageBefore: null, chatPageTrail: [], chatPageLoading: false, chatStream: null, chatBusy: false, chatAvailable: false, chatPending: stored('chat-pending') };
 const statusText = { active: '进行中', paused: '已暂停', pausing: '暂停中', cancelling: '取消中', cancelled: '已取消', succeeded: '已完成', failed: '失败' };
 function error(message) { $('error').textContent = message; $('error').classList.toggle('hidden', !message); document.querySelectorAll('dialog[open] .dialog-error').forEach(element => { element.textContent = message; element.classList.toggle('hidden', !message); }); }
 function toast(message) { $('toast').textContent = message.length > 240 ? message.slice(0, 240) + '…' : message; $('toast').classList.remove('hidden'); clearTimeout(toast.timer); toast.timer = setTimeout(() => $('toast').classList.add('hidden'), 5000); }
@@ -166,21 +166,26 @@ async function boot() {
 function setView(view) { state.view = view; $('chat-view').classList.toggle('hidden', view !== 'chat'); $('task-view').classList.toggle('hidden', view === 'chat'); renderChats(); }
 function updateChatControls() {
   const running = ['running', 'waiting-approval'].includes(state.chatSnapshot?.chat.status), pending = !!state.chatPending;
-  $('new-chat').disabled = state.chatBusy || pending || !state.chatAvailable;
+  $('new-chat').disabled = state.chatBusy || state.chatLoading || pending || !state.chatAvailable;
   $('content-search-open').disabled = !state.chatAvailable;
   for (const kind of ['history','changes','compactions','mcp']) $('inspect-' + kind).disabled = !state.chatAvailable || ['changes','compactions'].includes(kind) && !state.chatId;
   $('chat-input').disabled = !state.chatAvailable || pending;
-  $('chat-send').disabled = !state.chatAvailable || state.chatBusy || running || pending || !$('chat-model').value;
-  $('chat-stop').classList.toggle('hidden', !running); $('chat-stop').disabled = state.chatBusy || pending;
+  $('chat-send').disabled = !state.chatAvailable || state.chatBusy || state.chatLoading || running || pending || !$('chat-model').value;
+  $('chat-stop').classList.toggle('hidden', !running); $('chat-stop').disabled = state.chatBusy || pending || state.chatSnapshot?.activity?.phase === 'cancelling';
   $('chat-model').disabled = !!state.chatId || state.chatBusy || pending;
   $('chat-retry').classList.toggle('hidden', !pending); $('chat-retry-button').disabled = state.chatBusy;
 }
 function renderChats() {
   $('chats').replaceChildren();
-  for (const chat of state.chats) { const item = button('', () => openChat(chat.id), 'run-card' + (state.view === 'chat' && chat.id === state.chatId ? ' active' : ''));
+  const query = $('chat-filter').value.trim().toLocaleLowerCase();
+  const matches = state.chats.filter(chat => !query || [chat.title,chat.id,chat.provider,chat.model].join(' ').toLocaleLowerCase().includes(query));
+  if (!matches.length) $('chats').append(node('p', query ? '没有匹配的会话；可修改关键词或清空筛选。' : '还没有会话。', 'muted small'));
+  for (const chat of matches) { const item = button('', () => openChat(chat.id), 'run-card' + (state.view === 'chat' && chat.id === state.chatId ? ' active' : ''));
     item.append(node('strong', chat.title), node('span', ({ idle: '继续对话', running: '正在执行', 'waiting-approval': '等待你的批准', interrupted: '本轮已中断', failed: '执行失败' })[chat.status], 'muted')); item.dataset.chatId = chat.id; $('chats').append(item); }
 }
 function newChat() {
+  state.chatOpenSequence++; state.chatLoading = false;
+  resetChatPage();
   clearChatRecap();
   state.chatStream?.close(); state.chatStream = null; state.chatId = null; state.chatSnapshot = null; save('chat-selected', null); setView('chat');
   $('chat-title').textContent = '一起把想法变成代码'; $('chat-messages').replaceChildren();
@@ -194,29 +199,76 @@ async function refreshChats() {
 }
 async function openChat(id) {
   if (state.chatPending && state.chatPending.chatId && state.chatPending.chatId !== id) { toast('请先确认上一条对话请求的结果'); return; }
-  if (state.chatId !== id) clearChatRecap();
-  state.chatStream?.close(); state.chatId = id; save('chat-selected', id); setView('chat');
-  try { const snapshot = await api('api/chats/' + encodeURIComponent(id)); if (state.chatId !== id) return; renderChat(snapshot);
+  const sequence = ++state.chatOpenSequence; state.chatLoading = true;
+  if (state.chatId !== id) { clearChatRecap(); resetChatPage(); state.chatSnapshot = null; $('chat-messages').replaceChildren(node('p','正在读取会话…','muted small')); $('chat-approvals').replaceChildren(); }
+  state.chatStream?.close(); state.chatId = id; save('chat-selected', id); setView('chat'); updateChatControls();
+  try { const snapshot = await api('api/chats/' + encodeURIComponent(id)); if (state.chatId !== id || sequence !== state.chatOpenSequence) return; renderChat(snapshot);
     const stream = new EventSource('api/chats/' + encodeURIComponent(id) + '/stream'); state.chatStream = stream;
-    stream.onmessage = event => { if (state.chatId === id) { try { renderChat(JSON.parse(event.data)); } catch (issue) { error(issue.message); } } };
-    stream.onerror = () => { if (state.chatId === id) { $('chat-status').textContent = '对话连接中断，正在重连；不会重新发送消息。'; api('api/info').catch(issue => error(issue.message)); } };
-  } catch (issue) { error(issue.message); }
+    stream.onmessage = event => { if (state.chatId === id && sequence === state.chatOpenSequence) { try { renderChat(JSON.parse(event.data)); } catch (issue) { error(issue.message); } } };
+    stream.onerror = () => { if (state.chatId === id && sequence === state.chatOpenSequence) { $('chat-status').textContent = '对话连接中断，正在重连；不会重新发送消息。'; api('api/info').catch(issue => error(issue.message)); } };
+  } catch (issue) { if (sequence === state.chatOpenSequence) error(issue.message); }
+  finally { if (sequence === state.chatOpenSequence) { state.chatLoading = false; updateChatControls(); } }
 }
+let pageController, pageSequence = 0;
+function resetChatPage() { pageController?.abort(); pageSequence++; state.chatPage = null; state.chatPageBefore = null; state.chatPageTrail = []; state.chatPageLoading = false; }
+async function loadChatPage(direction) {
+  if (!state.chatId || state.chatPageLoading || !state.chatSnapshot) return;
+  const chatId = state.chatId, displayed = state.chatPage || state.chatSnapshot;
+  const before = direction === 'older' ? displayed.messages[0]?.id : state.chatPageTrail.at(-1);
+  if (direction === 'newer' && before === null) { resetChatPage(); renderChat(state.chatSnapshot); return; }
+  if (!before) return;
+  const last = displayed.messages.at(-1)?.id, separator = last?.lastIndexOf(':');
+  const previousBefore = state.chatPageBefore || (last && separator >= 0 ? last.slice(0,separator+1) + String(Number(last.slice(separator+1))+1).padStart(10,'0') : null);
+  pageController?.abort(); const controller = pageController = new AbortController(), sequence = ++pageSequence;
+  state.chatPageLoading = true; renderChat(state.chatSnapshot);
+  try {
+    const page = await api('api/chats/' + encodeURIComponent(chatId) + '/messages?before=' + encodeURIComponent(before), undefined, controller.signal);
+    if (sequence !== pageSequence || controller.signal.aborted || chatId !== state.chatId) return;
+    if (direction === 'older') { state.chatPageTrail.push(previousBefore); if (state.chatPageTrail.length > 256) state.chatPageTrail.shift(); }
+    else state.chatPageTrail.pop();
+    state.chatPage = page; state.chatPageBefore = before;
+    renderChat(state.chatSnapshot); $('chat-messages').scrollTop = 0;
+  } catch (issue) { if (sequence === pageSequence && !controller.signal.aborted) error(issue.message); }
+  finally { if (sequence === pageSequence) { state.chatPageLoading = false; renderChat(state.chatSnapshot); } }
+}
+function renderChatStatus() {
+  const snapshot = state.chatSnapshot; if (!snapshot) return;
+  const chat = snapshot.chat, activity = snapshot.activity;
+  const status = ({ idle:'本轮已完成，可以继续对话。', running:'正在执行', 'waiting-approval':'等待工具授权', interrupted:'本轮已中断，请核对工具结果后继续。', failed:'本轮执行失败，可核对后继续。' })[chat.status];
+  let label = status;
+  if (activity && ['running','waiting-approval'].includes(chat.status)) {
+    label = ({ requesting:'正在请求模型', thinking:'正在思考', responding:'正在生成回复', 'preparing-tool':'正在准备工具', tool:'正在运行工具', retrying:'等待模型重试', 'waiting-approval':'等待工具授权', cancelling:'正在停止本轮' })[activity.phase] || status;
+    if (activity.tool) label += ' · ' + activity.tool;
+    if (activity.phase === 'retrying') label += (activity.retry ? ' · 第 ' + activity.retry + ' 次' : '') + (activity.retryAt ? ' · ' + Math.max(0,Math.ceil((activity.retryAt-Date.now())/1000)) + 's 后重试' : '');
+    if (Number.isFinite(activity.startedAt)) label += ' · 本轮 ' + Math.max(0,Math.floor((Date.now()-activity.startedAt)/1000)) + 's';
+  }
+  $('chat-status').textContent = chat.error || label;
+}
+$('chat-filter').oninput = renderChats;
+const chatStatusTimer = setInterval(renderChatStatus,1000);
 function renderChat(snapshot) {
   state.chatSnapshot = snapshot; const chat = snapshot.chat; $('chat-title').textContent = chat.title; $('chat-model').value = JSON.stringify([chat.provider, chat.model]);
   const index = state.chats.findIndex(item => item.id === chat.id); if (index < 0) state.chats.unshift(chat); else state.chats[index] = chat; renderChats();
   const container = $('chat-messages'), nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 100;
   const opened = new Set([...container.querySelectorAll('details[open]')].map(item => item.dataset.tool));
   const focused = container.contains(document.activeElement) ? document.activeElement.dataset.focusKey : undefined; container.replaceChildren();
-  if (snapshot.earlierMessages) container.append(node('p', '显示最近 64 条消息，更早的对话上下文仍由执行器保留。', 'muted small'));
-  for (const message of snapshot.messages) {
+  const displayed = state.chatPage || snapshot;
+  if (displayed.earlierMessages || state.chatPage) {
+    const navigation = node('nav',undefined,'chat-history-nav'); navigation.setAttribute('aria-label','会话历史分页');
+    navigation.append(node('span', state.chatPage ? '正在查看较早消息；实时状态与授权仍保持更新。' : '还有 ' + displayed.earlierMessages + ' 条较早消息', 'muted small'));
+    if (displayed.earlierMessages && displayed.messages.length) { const older = button(state.chatPageLoading ? '正在读取…' : '加载更早消息', () => loadChatPage('older'), 'quiet'); older.disabled = state.chatPageLoading; older.dataset.focusKey = 'history:older'; navigation.append(older); }
+    if (state.chatPage && state.chatPageTrail.length) { const newer = button('较新一页', () => loadChatPage('newer'), 'quiet'); newer.disabled = state.chatPageLoading; newer.dataset.focusKey = 'history:newer'; navigation.append(newer); }
+    if (state.chatPage) navigation.append(button('返回最新消息', () => { resetChatPage(); renderChat(state.chatSnapshot); container.scrollTop = container.scrollHeight; },'quiet'));
+    container.append(navigation);
+  }
+  for (const message of displayed.messages) {
     const row = node('article', undefined, 'chat-message ' + message.role); row.dataset.messageId = message.id;
     row.append(node('p', message.role === 'user' ? '你' : 'TNB', 'chat-author'), message.role === 'assistant' && message.text ? renderMarkdown(message.text) : node('div', message.text || (message.status === 'running' ? '正在思考…' : '本轮没有文本输出'), 'chat-text'));
     const actions = node('div', undefined, 'message-actions');
     const copy = button('复制显示内容', async () => { try { await navigator.clipboard.writeText(message.text); toast('已复制'); } catch { toast('复制失败，请选择消息文字手动复制'); } }, 'quiet'); copy.dataset.focusKey = message.id + ':copy'; actions.append(copy);
     if (message.role === 'user') { const reuse = button('编辑复用', () => reuseMessage(message.text), 'quiet'); reuse.dataset.focusKey = message.id + ':reuse'; actions.append(reuse); }
     row.append(actions);
-    for (const tool of message.tools || []) { const details = node('details', undefined, 'chat-tool'); details.dataset.tool = tool.id; details.open = opened.has(tool.id);
+    for (const tool of message.tools || []) { const details = node('details', undefined, 'chat-tool'); details.dataset.tool = message.id + ':' + tool.id; details.open = opened.has(details.dataset.tool);
       const phase = ({ requesting: '请求模型', tool: '运行工具', responding: '生成回复' })[tool.phase];
       const progress = tool.status === 'running' ? [phase, tool.latestTool, Number.isFinite(tool.elapsedSeconds) ? Math.round(tool.elapsedSeconds) + 's' : null].filter(Boolean).join(' · ') : '';
       const processResult = tool.name === 'bash' && tool.status !== 'running' && (tool.status === 'complete' || Number.isSafeInteger(tool.exitCode)) ? (Number.isSafeInteger(tool.exitCode) ? '进程退出 ' + tool.exitCode + (tool.status === 'failed' ? ' · 失败' : '') : '工具返回') : null;
@@ -224,12 +276,12 @@ function renderChat(snapshot) {
     container.append(row);
   }
   if (focused) [...container.querySelectorAll('[data-focus-key]')].find(item => item.dataset.focusKey === focused)?.focus({ preventScroll: true });
-  if (nearBottom) container.scrollTop = container.scrollHeight;
+  if (nearBottom && !state.chatPage) container.scrollTop = container.scrollHeight;
   $('chat-approvals').replaceChildren();
   for (const approval of snapshot.approvals) { alertNotice('chat-approval:' + chat.id + ':' + approval.turnId, 'TNB 需要你的批准', approval.tool); const card = node('section', undefined, 'question-card'); card.append(node('h3', '批准本次操作：' + approval.tool), node('p', approval.message), node('pre', approval.input, 'preview'));
     const decide = behavior => chatAction({ action: 'approve', chatId: chat.id, turnId: approval.turnId, requestId: approval.requestId, behavior }).catch(() => {});
     card.append(button('仅允许这一次', () => decide('allow'), 'primary'), button('拒绝', () => decide('deny'), 'quiet')); $('chat-approvals').append(card); }
-  $('chat-status').textContent = chat.error || ({ idle: '本轮已完成，可以继续对话。', running: '正在执行。关闭网页后可以重新打开同一对话查看。', 'waiting-approval': '有工具操作需要你的决定。', interrupted: '本轮已中断，请核对工具结果后继续。', failed: '本轮执行失败，可核对后继续。' })[chat.status]; updateChatControls();
+  renderChatStatus(); updateChatControls();
 }
 async function chatAction(input, retry = false) {
   if (state.chatBusy) throw new Error('正在处理对话请求');
@@ -239,7 +291,7 @@ async function chatAction(input, retry = false) {
   try {
     const result = await api('api/chat/command', command); state.chatPending = null; save('chat-pending', null);
     if (command.action === 'create') { state.chatId = result.id; save('chat-selected', result.id); state.chatSnapshot = null; }
-    if (command.action === 'send') { $('chat-input').value = ''; save('chat-draft', null); }
+    if (command.action === 'send') { resetChatPage(); $('chat-input').value = ''; save('chat-draft', null); }
     if (state.chatId) await openChat(state.chatId); return result;
   } catch (issue) { error(issue.message); throw issue; }
   finally { state.chatBusy = false; updateChatControls(); }
@@ -369,8 +421,8 @@ $('question-form').onsubmit = event => { event.preventDefault(); const question 
 $('reconcile-form').onsubmit = event => { event.preventDefault(); if (state.operation) action({ action: 'reconcile', runId: state.selected, taskId: state.operation.taskId, operationId: state.operation.id, result: $('confirmed-result').value }); };
 document.querySelectorAll('[data-tab]').forEach(element => element.onclick = () => { state.tab = element.dataset.tab; document.querySelectorAll('[data-tab]').forEach(item => item.classList.toggle('active', item === element)); for (const tab of ['report', 'changes', 'events']) $(tab + '-panel').classList.toggle('hidden', tab !== state.tab); if (state.tab === 'events') loadEvents(true); });
 $('retry').onclick = () => perform(null, true).catch(() => {}); $('discard').onclick = () => { if (confirm('请求可能已经执行。先检查任务状态，再决定是否放弃原请求重试。')) { state.pending = null; save('pending', null); showPending(); } };
-$('logout').onclick = async () => { cancelInspection(); $('inspection-dialog').close(); $('inspection-items').replaceChildren(); searchController?.abort(); searchSequence++; $('content-search-dialog').close(); $('content-search-results').replaceChildren(); clearChatRecap(); try { await api('auth/logout', {}); state.stream?.close(); state.chatStream?.close(); clearInterval(state.chatPoll); state.chatAvailable = false; $('chat-messages').replaceChildren(); $('chat-approvals').replaceChildren(); updateChatControls(); connection(false, '已退出'); $('detail').classList.add('hidden'); $('runs').replaceChildren(); $('questions').replaceChildren(); $('notices').replaceChildren(); error('已退出。重新运行 tnb web 获取新入口。'); } catch (issue) { error(issue.message); } };
+$('logout').onclick = async () => { state.chatOpenSequence++; state.chatLoading = false; resetChatPage(); cancelInspection(); $('inspection-dialog').close(); $('inspection-items').replaceChildren(); searchController?.abort(); searchSequence++; $('content-search-dialog').close(); $('content-search-results').replaceChildren(); clearChatRecap(); try { await api('auth/logout', {}); state.stream?.close(); state.chatStream?.close(); clearInterval(state.chatPoll); state.chatAvailable = false; state.chatSnapshot = null; $('chat-messages').replaceChildren(); $('chat-approvals').replaceChildren(); updateChatControls(); connection(false, '已退出'); $('detail').classList.add('hidden'); $('runs').replaceChildren(); $('questions').replaceChildren(); $('notices').replaceChildren(); error('已退出。重新运行 tnb web 获取新入口。'); } catch (issue) { error(issue.message); } };
 $('notify').onclick = async () => { if (!('Notification' in window)) { toast('此浏览器不支持桌面提醒'); return; } const permission = await Notification.requestPermission(); save('notifications', permission === 'granted'); toast(permission === 'granted' ? '已开启。页面在后台时会提醒新问题和结果。' : '未开启桌面提醒，网页内提醒仍然有效。'); };
-window.addEventListener('pagehide', () => { cancelInspection(); searchController?.abort(); state.stream?.close(); state.chatStream?.close(); clearInterval(state.chatPoll); });
+window.addEventListener('pagehide', () => { resetChatPage(); clearInterval(chatStatusTimer); cancelInspection(); searchController?.abort(); state.stream?.close(); state.chatStream?.close(); clearInterval(state.chatPoll); });
 window.addEventListener('pageshow', event => { if (event.persisted) location.reload(); });
 boot().catch(issue => { connection(false, '无法连接'); error(issue.message); });

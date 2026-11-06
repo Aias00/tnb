@@ -120,6 +120,10 @@ test("authenticated HTTP chat endpoints share workspace isolation, SSE limits an
   expect((await inspect({ kind: "history", workspace: f.root })).status).toBe(400);
   expect((await inspect({ kind: "changes", chatId: "not-here" })).status).toBe(400);
   expect((await inspect({ kind: "changes", chatId: chat.id })).status).toBe(200);
+  expect((await fetch(base + `api/chats/${chat.id}/messages?before=${chat.id}:0000000001`, { headers: { cookie } })).status).toBe(200);
+  expect((await fetch(base + `api/chats/${chat.id}/messages?before=foreign:0000000001`, { headers: { cookie } })).status).toBe(400);
+  expect((await fetch(base + `api/chats/${chat.id}/messages?before=${chat.id}:0000000001`)).status).toBe(401);
+
 
   const stream = await fetch(base + "api/chats/" + chat.id + "/stream", { headers: { cookie } }), reader = stream.body!.getReader(); expect(new TextDecoder().decode((await reader.read()).value)).toContain(chat.id);
   await fetch(base + "auth/logout", { method: "POST", headers: { cookie, origin: url.origin, "content-type": "application/json" }, body: "{}" }); expect((await reader.read()).done).toBe(true);
@@ -168,3 +172,67 @@ test("workspace inspection exposes history, changes, compactions and explicit MC
   expect(checked.items[0]?.subtitle).toBe("connected"); expect(JSON.stringify(checked)).not.toContain("DO_NOT_EXPOSE");
   expect(f.requests).toHaveLength(0);
 }, 15000);
+
+test("conversation pages use stable exclusive cursors, stay scoped and do not skip new-turn boundaries", async () => {
+  const f = await fixture(), chat = await f.create();
+  const seed = (end: number, start: number) => f.store.command(crypto.randomUUID(), { kind: "test.seed", end }, Date.now(), tx => {
+    const previous = tx.applicationRecord<ChatSummary>("host.web-chats", chat.id)!;
+    tx.saveApplicationRecord({ namespace: "host.web-chats", id: chat.id, value: { ...previous.value, messageCount: end } }, previous.revision);
+    for (let i = start; i <= end; i++) { const id = `${chat.id}:${String(i).padStart(10,"0")}`;
+      tx.saveApplicationRecord({ namespace: "host.web-chat-messages", id, value: { id, thread: chat.id, role: i % 2 ? "user" : "assistant", text: `message-${i}`, at: i, status: "complete" } }, 0); }
+    return true;
+  });
+  seed(130,1);
+  const latest = f.chats.detail(chat.id); expect(latest.messages).toHaveLength(64); expect(latest.messages[0]?.text).toBe("message-67"); expect(latest.earlierMessages).toBe(66);
+  const older = f.chats.page!(chat.id, latest.messages[0]!.id); expect(older.messages[0]?.text).toBe("message-3"); expect(older.messages.at(-1)?.text).toBe("message-66");
+  const first = f.chats.page!(chat.id, older.messages[0]!.id); expect(first.messages.map(message => message.text)).toEqual(["message-1","message-2"]); expect(first.earlierMessages).toBe(0);
+  seed(132,131);
+  const newer = f.chats.page!(chat.id, `${chat.id}:0000000131`); expect(newer.messages[0]?.text).toBe("message-67"); expect(newer.messages.at(-1)?.text).toBe("message-130");
+  expect(f.chats.detail(chat.id).messages.at(-1)?.text).toBe("message-132");
+  expect(() => f.outside.page!(chat.id, latest.messages[0]!.id)).toThrow("outside");
+  for (const cursor of ["foreign:0000000001", `${chat.id}:0000000000`, `${chat.id}:0000000134`, `${chat.id}:1`]) expect(() => f.chats.page!(chat.id,cursor)).toThrow("cursor");
+  expect(f.requests).toHaveLength(0);
+});
+
+test("live activity follows model, retry, tool and response events without retaining reasoning text", async () => {
+  const gates = Array.from({ length: 6 }, () => Promise.withResolvers<void>());
+  const f = await fixture(() => Object.assign((async function* () {
+    yield { type: "model_event", event: { type: "thinking", text: "PRIVATE_REASONING_NOT_PROJECTED" } }; await gates[0]!.promise;
+    yield { type: "model_event", event: { type: "tool-start", name: "read" } }; await gates[1]!.promise;
+    yield { type: "tool_event", event: { type: "tool-execution-start", id: "read", name: "read" } }; await gates[2]!.promise;
+    yield { type: "tool_event", event: { type: "tool-execution-end", id: "read", name: "read", output: "done" } };
+    yield { type: "model_event", event: { type: "retry", phase: "waiting", retry: 1, delayMs: 2000, reason: "connection" } }; await gates[3]!.promise;
+    yield { type: "model_event", event: { type: "retry", phase: "requesting", retry: 1, delayMs: 0 } }; await gates[4]!.promise;
+    yield { type: "model_event", event: { type: "text", text: "finished" } }; await gates[5]!.promise;
+    yield { type: "result", subtype: "success", result: "finished" };
+  })(), { close() { for (const gate of gates) gate.resolve(); }, waitForExit: async () => {} }) as unknown as import("../../src/sdk/query").Query);
+  const chat = await f.create(); await f.send(chat.id,"inspect live phases");
+  try {
+    for (const [index, phase] of ["thinking","preparing-tool","tool","retrying","requesting","responding"].entries()) {
+      await until(() => f.chats.detail(chat.id).activity?.phase === phase);
+      const snapshot = f.chats.detail(chat.id); expect(JSON.stringify(snapshot)).not.toContain("PRIVATE_REASONING_NOT_PROJECTED");
+      if (phase === "retrying") expect(snapshot.activity?.retryAt).toBeGreaterThan(Date.now());
+      gates[index]!.resolve();
+    }
+    await until(() => f.chats.detail(chat.id).chat.status === "idle"); expect(f.chats.detail(chat.id).activity).toBeUndefined();
+  } finally { for (const gate of gates) gate.resolve(); }
+});
+
+test("parallel activity remains accurate after the bounded tool display fills", async () => {
+  const finish = Promise.withResolvers<void>();
+  const f = await fixture(() => Object.assign((async function* () {
+    for (let i = 0; i < 65; i++) { yield { type: "tool_event", event: { type: "tool-execution-start", id: String(i), name: "read" } }; yield { type: "tool_event", event: { type: "tool-execution-end", id: String(i), name: "read", output: "done" } }; }
+    yield { type: "tool_event", event: { type: "tool-execution-start", id: "late-a", name: "late-a" } };
+    yield { type: "tool_event", event: { type: "tool-execution-start", id: "late-b", name: "late-b" } };
+    yield { type: "tool_event", event: { type: "tool-execution-end", id: "late-b", name: "late-b", output: "done" } };
+    await finish.promise;
+    yield { type: "tool_event", event: { type: "tool-execution-end", id: "late-a", name: "late-a", output: "done" } };
+    yield { type: "result", subtype: "success", result: "done" };
+  })(), { close() { finish.resolve(); }, waitForExit: async () => {} }) as unknown as import("../../src/sdk/query").Query);
+  const chat = await f.create(); await f.send(chat.id,"parallel activity");
+  try {
+    await until(() => f.chats.detail(chat.id).activity?.tool === "late-a");
+    const snapshot = f.chats.detail(chat.id); expect(snapshot.messages[1]?.tools).toHaveLength(64); expect(snapshot.activity?.phase).toBe("tool");
+  } finally { finish.resolve(); }
+  await until(() => f.chats.detail(chat.id).chat.status === "idle");
+});

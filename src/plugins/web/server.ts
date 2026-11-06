@@ -61,6 +61,8 @@ export function createWebWorkbench(options: { tasks: TaskService; chats?: ChatSe
       if (resource === "api/info") return json({ ...await tasks.info(), chat: conversations.has(scope) });
       const chats = conversations.get(scope);
       if (resource === "api/chats") return chats ? json(chats.list()) : json({ error: "会话服务不可用" }, 503);
+      const history = /^api\/chats\/([^/]+)\/messages$/.exec(resource);
+      if (history && chats) { if (!chats.page) return json({ error: "会话历史分页不可用" }, 503); return json(chats.page(decodeURIComponent(history[1]!), url.searchParams.get("before") ?? "")); }
       const conversation = /^api\/chats\/([^/]+)(\/stream)?$/.exec(resource);
       if (conversation && chats) {
         const id = decodeURIComponent(conversation[1]!);
