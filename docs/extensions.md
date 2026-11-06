@@ -187,6 +187,15 @@ Descriptors are validated with resolved command/schema paths and declared
 security metadata (`access`, workspace reach, network reach, shell usage, and
 approval policy). Manual plugins remain loaded without registering tools,
 Hooks, MCP servers, Skills, Agents, or commands until explicitly enabled.
+Input schemas now constrain actual calls as well as the model catalog. Inline
+schemas are checked during discovery; package-local schema files are limited to
+64 KiB and pinned during activation/catalog construction. The root must be an
+object and use the bounded configuration schema dialect, with optional string
+title/description annotations. Unsupported assertions, references and defaults
+fail explicitly. Hook/approval rewrites and direct execute/runtime calls are
+validated before transport effects; values are never coerced or silently dropped.
+Existing schemas using unsupported keywords must be updated to the supported
+dialect. Omitting a schema retains an open object contract with plain JSON limits.
 Session shutdown rejects pending requests and terminates owned
 direct processes, cancels HTTP/oneshot calls and waits for managed cleanup.
 Repeated shutdown awaits the same completion. Calls have a 120-second deadline;

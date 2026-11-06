@@ -1,8 +1,11 @@
-import { readFile } from "node:fs/promises";
+import { open } from "node:fs/promises";
+import { constants } from "node:fs";
 import { assertPluginActive, isPluginActive } from "./policy";
 import { consumePluginLines, pluginToolLimits, readPluginText, type PluginToolLimits } from "./io";
 import { requestPluginHttp } from "./http";
 import { pluginHttpTarget } from "./network";
+import { compilePluginToolInputSchema, snapshotPluginToolInput, PluginToolInputError, type PluginToolInputContract } from "./tool-input";
+import { DEFAULT_PLUGIN_TOOL_LIMITS } from "./io";
 
 import { defineTool, type AgentTool } from "../../core/tool";
 import {
@@ -28,6 +31,7 @@ export class PluginToolRuntimeManager {
   private readonly stopping = new Map<string, Promise<void>>();
   private readonly stopEpochs = new Map<string, number>();
   private readonly limits: Readonly<PluginToolLimits>;
+  private readonly inputs = new Map<string, WeakMap<ExternalPluginToolContribution, Promise<PluginToolInputContract>>>();
   private closing?: Promise<void>;
   private closed = false;
 
@@ -46,6 +50,8 @@ export class PluginToolRuntimeManager {
       if ((this.stopEpochs.get(generation) ?? 0) !== epoch) throw new Error("Plugin activation was superseded by a stop request");
       this.retired.delete(generation);
       try {
+        // Preflight every contract before starting this package's eager processes.
+        for (const contribution of plugin.toolContributions) if (contribution.type === "external") await this.inputContract(plugin, contribution);
         for (const contribution of plugin.toolContributions) {
           if (contribution.type === "external" && contribution.lifecycle.transport === "stdio" && contribution.lifecycle.start === "eager") {
             await this.ensureStdio(plugin, contribution);
@@ -62,9 +68,9 @@ export class PluginToolRuntimeManager {
   async call(plugin: LoadedPlugin, contribution: ExternalPluginToolContribution, input: Record<string, unknown>, signal: AbortSignal): Promise<string> {
     this.assertAdmitted(plugin); signal.throwIfAborted();
     if (this.calls.size >= this.limits.maxConcurrentCalls) throw new Error("Plugin tool concurrent call limit reached");
-    const body = JSON.stringify(input);
+    const admittedInput = snapshotPluginToolInput(input, this.limits.maxInputBytes);
+    const body = JSON.stringify(admittedInput);
     if (Buffer.byteLength(body) > this.limits.maxInputBytes) throw new Error(`Plugin tool input exceeds ${this.limits.maxInputBytes} byte limit`);
-    const admittedInput = JSON.parse(body) as Record<string, unknown>;
     const controller = new AbortController();
     const abort = () => controller.abort(signal.reason);
     signal.addEventListener("abort", abort, { once: true });
@@ -72,7 +78,9 @@ export class PluginToolRuntimeManager {
     const call: OwnedCall = { generation: this.generation(plugin), controller, done: Promise.resolve("") };
     // Register ownership before any transport can start an effect.
     call.done = Promise.resolve().then(async () => {
+      const contract = await this.inputContract(plugin, contribution);
       this.assertAdmitted(plugin); controller.signal.throwIfAborted();
+      contract.validate(admittedInput, this.limits.maxInputBytes);
       try {
         if (contribution.lifecycle.transport === "oneshot") return await runOneShotTool(plugin, contribution, body, this.env, controller.signal, this.limits);
         if (contribution.lifecycle.transport === "http") return await runHttpTool(plugin, contribution, admittedInput, controller.signal, this.limits);
@@ -84,10 +92,23 @@ export class PluginToolRuntimeManager {
     return call.done;
   }
 
+  /** One immutable contract per contribution object and package in this runtime. */
+  inputContract(plugin: LoadedPlugin, contribution: ExternalPluginToolContribution): Promise<PluginToolInputContract> {
+    const generation = this.generation(plugin);
+    let contracts = this.inputs.get(generation);
+    if (!contracts) { contracts = new WeakMap(); this.inputs.set(generation, contracts); }
+    let contract = contracts.get(contribution);
+    if (!contract) {
+      contract = loadInputContract(plugin, contribution); contracts.set(contribution, contract);
+    }
+    // Do not expose the validator's schema snapshot to callers that can mutate the model catalog.
+    return contract.then(value => ({ schema: structuredClone(value.schema), validate: value.validate }));
+  }
+
   close(): Promise<void> {
     if (!this.closing) {
       this.closed = true;
-      this.closing = this.drain();
+      this.closing = this.drain().finally(() => this.inputs.clear());
     }
     return this.closing;
   }
@@ -246,26 +267,19 @@ async function createExternalPluginTool(
   name: string,
   runtime: PluginToolRuntimeManager,
 ): Promise<AgentTool> {
+  const contract = await runtime.inputContract(plugin, contribution);
   if (contribution.lifecycle.transport !== "http") {
-    contribution = { ...contribution, command: await assertPluginContributionPath(plugin, contribution.command) };
+    const { inputSchemaPath: _path, ...prepared } = contribution;
+    // Resolving a command creates a new contribution object. Carry the already pinned schema,
+    // so eager preflight and the model catalog cannot reread different file contracts.
+    contribution = { ...prepared, inputSchema: structuredClone(contract.schema), command: await assertPluginContributionPath(plugin, contribution.command) };
   }
-  const inputSchema = contribution.inputSchema ?? (
-    contribution.inputSchemaPath
-      ? parseInputSchema(
-          await readFile(await assertPluginContributionPath(plugin, contribution.inputSchemaPath), "utf8"),
-          contribution.inputSchemaPath,
-        )
-      : { type: "object", additionalProperties: true }
-  );
   return defineTool<Record<string, unknown>>({
     name,
     description: contribution.description,
-    inputSchema,
+    inputSchema: contract.schema,
     validate(input) {
-      if (typeof input !== "object" || input === null || Array.isArray(input)) {
-        throw new Error(`${name} input must be an object`);
-      }
-      return input as Record<string, unknown>;
+      return contract.validate(input, DEFAULT_PLUGIN_TOOL_LIMITS.maxInputBytes);
     },
     execute: (input, signal) => runtime.call(plugin, contribution, input, signal),
     access: contribution.security.access,
@@ -339,17 +353,23 @@ function randomRequestId(): string {
   return `${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
-function parseInputSchema(content: string, path: string): Record<string, unknown> {
-  let parsed: unknown;
+async function loadInputContract(plugin: LoadedPlugin, contribution: ExternalPluginToolContribution): Promise<PluginToolInputContract> {
+  if (contribution.inputSchemaPath && contribution.inputSchema !== undefined) throw new PluginToolInputError("PLUGIN_TOOL_SCHEMA_INVALID", "Declare one input schema source");
+  if (!contribution.inputSchemaPath) return compilePluginToolInputSchema(contribution.inputSchema);
+  let file: Awaited<ReturnType<typeof open>> | undefined;
   try {
-    parsed = JSON.parse(content);
-  } catch (error) {
-    throw new Error(`Invalid plugin tool input schema: ${path}`, { cause: error });
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    throw new Error(`Plugin tool input schema must be an object: ${path}`);
-  }
-  return parsed as Record<string, unknown>;
+    const path = await assertPluginContributionPath(plugin, contribution.inputSchemaPath);
+    // A special file substituted between path validation and open must not block startup.
+    file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    const info = await file.stat();
+    if (!info.isFile() || info.size > 64 * 1024) throw new Error("schema size");
+    // Read at most one extra byte, even if the file grows after stat.
+    const bytes = Buffer.alloc(64 * 1024 + 1); let size = 0;
+    while (size < bytes.length) { const result = await file.read(bytes, size, bytes.length - size, null); if (!result.bytesRead) break; size += result.bytesRead; }
+    if (size > 64 * 1024) throw new Error("schema size");
+    return compilePluginToolInputSchema(JSON.parse(bytes.subarray(0, size).toString("utf8")));
+  } catch { throw new PluginToolInputError("PLUGIN_TOOL_SCHEMA_INVALID", "Tool input schema file must contain the supported bounded object dialect"); }
+  finally { await file?.close(); }
 }
 
 function normalizeToolOutput(output: string): string {

@@ -48,8 +48,20 @@ HTTP 调用取消时销毁自己的连接；oneshot 取消时关闭输入、终�
 
 期限到达和取消只证明宿主已停止等待或关闭本地传输，不能证明远端写入已回滚。任务的重放与不确定效果继续由原 operation/journal 协议处理，外部工具运行时不根据退出码、限额或取消自动重派。
 
+## 参数 Schema 与实际执行
+
+`inputSchema` 可以内联或指向包内 JSON 文件，根必须为 `object`。内联 Schema 在发现时检查，文件 Schema 在激活/构造工具目录时检查，最多 64 KiB；文件不存在、越出包目录、非普通文件、无效 JSON 或不支持的断言都拒绝，不远程加载引用。
+
+支持的断言与[配置 Schema](plugin-data-contracts.md)一致：`type`、标量 `enum`、`properties`、`required`、布尔 `additionalProperties`、`items`、数组/字符串长度及数字上下界。工具额外允许字符串 `title` 和 `description`，只用于模型目录。`$ref`、`anyOf`、`pattern`、`default` 等不受支持，不会被静默忽略。未声明 Schema 时使用开放对象合同；不自动补默认值、转换类型或删除未知字段。
+
+工具 `validate` 和最终实际调用均检查同一合同。模型参数、Hook 改写及审批修改在执行器中重新校验；直接调用 `execute` 或 `runtime.call` 也不能绕过。非法参数不发送 HTTP、不启动子进程、不向 stdio 写请求。Schema 快照在当前运行时固定，改源文件或模型可见的目录对象不会削弱已有校验器；更新按原插件刷新和代际规则重新发现。
+
+工具输入保留默认 1 MiB 字节预算，宿主可以收紧；最多 8192 个 JSON 节点、深度 16。Schema 最多 256 个节点、每对象 64 个属性，Schema 及其 JSON 表示都有深度限制。非 JSON 值、循环、`undefined`、`NaN`、自定义 `toJSON` 和超限输入拒绝，不能通过序列化丢值改变调用。错误代码为 `PLUGIN_TOOL_SCHEMA_INVALID` 或 `PLUGIN_TOOL_INPUT_INVALID`，不回显参数值或原 Schema 文件内容。
+
+此前仅用于模型目录的 Schema 现在会约束实际执行。依赖不支持断言、缺少 `type` 或根不是 object 的旧 Schema 需要调整。具体实现与验收见[参数合同审阅](../superpowers/reviews/2026-11-05-plugin-tool-input.md)。参数格式通过仍须满足业务权限，也不表示结果已经正确。
+
 ## 隔离和后续规范
 
 本轮管理直接子进程，不构成后代进程树、文件、网络或系统调用的 OS 沙箱。`workspace`、子进程 `network` 和 `shell` 字段仍是声明信息；启动时不加 shell 包装，也不能阻止可执行程序自行创建 shell。子进程环境沿用宿主传入值，最小环境和凭据引用尚未统一落地。
 
-现有输入 Schema 保持目录格式合同，完整的有界 Schema 方言及逐参数验证仍需后续实施。类型化宿主服务、配置/状态迁移、分端 UI SDK 和任意进程内扩展的强撤销也不属于本合同。整个插件规范的目标与当前已交付范围见[规范草案](../superpowers/specs/2026-11-05-plugin-specification.md)。
+参数校验使用上述明确支持的有界方言，不宣称支持完整 JSON Schema 或输出结果验证。分端 UI SDK、最小环境、统一 MCP/Channel 预算和任意进程内扩展的强撤销仍需后续完善。整个插件规范的目标与当前已交付范围见[规范草案](../superpowers/specs/2026-11-05-plugin-specification.md)。

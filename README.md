@@ -636,6 +636,8 @@ self-update manifest alongside the binary and `SHA256SUMS`.
 
 运行时备份 v2 包含历史插件包和私有文件。可运行 `tnb runtime backup-check /path/to/backup` 或对话中的 `/runtime backup-check /path/to/backup` 进行只读检查，范围与恢复流程见[备份指南](docs/guides/plugin-backup.md)。
 
+外部插件工具的参数 Schema 同时约束模型目录和实际执行，Hook/审批改写及直接调用都会校验。支持的方言、限额和旧 Schema 调整方式见[工具运行合同](docs/guides/plugin-tool-runtime.md#参数-schema-与实际执行)。
+
 持久任务可通过 `--skill NAME`、`--mcp-tool NAME` 显式选择额外能力，详见 [长任务 skills 与 MCP](docs/guides/durable-capabilities.md)。
 
 网页工作台：`tnb web` 在当前目录打开同一持久任务的网页入口，支持实时问题提醒、任务控制和结果查看，见 [使用说明](docs/guides/web-workbench.md)。

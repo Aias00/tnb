@@ -37,6 +37,10 @@ function scalarType(value: unknown, type: unknown): boolean {
 }
 /** Errors contain only a generic mismatch; configuration values never appear in diagnostics. */
 export function validatePluginConfiguration(schema: PluginJsonSchema, value: unknown): JsonValue {
+  return validatePluginJsonValue(schema, value, 128 * 1024);
+}
+/** Shared structural/schema checks; each host boundary retains its own byte budget. */
+export function validatePluginJsonValue(schema: PluginJsonSchema, value: unknown, maxBytes: number): JsonValue {
   let nodes = 0;
   const json = (item: unknown, depth: number) => {
     if (++nodes > 8192 || depth > 16) throw new Error("Plugin configuration JSON exceeds structural limits");
@@ -44,7 +48,7 @@ export function validatePluginConfiguration(schema: PluginJsonSchema, value: unk
     if (!item || typeof item !== "object" || !Array.isArray(item) && Object.getPrototypeOf(item) !== Object.prototype && Object.getPrototypeOf(item) !== null) throw new Error("Plugin configuration must contain plain JSON values");
     for (const entry of Array.isArray(item) ? item : Object.values(item)) json(entry, depth + 1);
   };
-  json(value, 0); encodeJson(value, 128 * 1024);
+  json(value, 0); encodeJson(value, maxBytes);
   const check = (schema: PluginJsonSchema, input: unknown, depth: number): void => {
     if (depth > 16) throw new Error("Plugin configuration nesting exceeds limit");
     if (schema.type === "object") {
@@ -57,12 +61,12 @@ export function validatePluginConfiguration(schema: PluginJsonSchema, value: unk
       for (const item of input) check(schema.items!, item, depth + 1);
     } else {
       if (!scalarType(input, schema.type)) throw new Error("Plugin configuration does not match schema");
-      if (typeof input === "string" && ([...input].length < (schema.minLength ?? 0) || [...input].length > (schema.maxLength ?? 128 * 1024))
+      if (typeof input === "string" && ([...input].length < (schema.minLength ?? 0) || [...input].length > (schema.maxLength ?? maxBytes))
         || typeof input === "number" && (input < (schema.minimum ?? -Infinity) || input > (schema.maximum ?? Infinity))) throw new Error("Plugin configuration does not match schema");
     }
     if (schema.enum && !schema.enum.includes(input as never)) throw new Error("Plugin configuration does not match schema");
   };
   // Check before normalization, so undefined required fields cannot disappear silently.
   check(schema, value, 0);
-  return JSON.parse(encodeJson(value, 128 * 1024)) as JsonValue;
+  return JSON.parse(encodeJson(value, maxBytes)) as JsonValue;
 }

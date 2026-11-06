@@ -12,6 +12,7 @@ import { computePluginTreeSha256, pluginTrustState, type PluginTrustState } from
 import { isPluginActive, resolvePluginPolicy, type PluginPolicy } from "./policy";
 import { pluginHttpTarget } from "./network";
 import { parsePluginDataDeclaration } from "../../agent/plugin-data";
+import { compilePluginToolInputSchema } from "./tool-input";
 
 const BUILT_IN_PLUGIN_TOOLS = new Map<string, {
   toolName: string;
@@ -458,6 +459,7 @@ function externalToolContribution(
     : contributionPath(root, commandValue, `tools[${index}].command`);
   const args = optionalStringArray(value.args, `tools[${index}].args`, path) ?? [];
   const inputSchema = optionalSchema(value.inputSchema, `tools[${index}].inputSchema`, path);
+  if (inputSchema && typeof inputSchema !== "string") compilePluginToolInputSchema(inputSchema);
   const security = optionalExternalToolSecurity(value.security, path, index) ?? DEFAULT_EXTERNAL_TOOL_SECURITY;
   if (lifecycle.transport === "http") {
     pluginHttpTarget(command, security.network);
