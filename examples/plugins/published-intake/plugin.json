@@ -1,0 +1,9 @@
+{
+  "name": "published-intake", "version": "0.1.0", "manifestVersion": 2,
+  "apiVersion": "tnb.host-plugin/v1",
+  "contributes": { "applications": [{
+    "id": "published-intake", "version": "1", "entry": "intake.mjs",
+    "execution": { "mode": "process", "protocol": "tnb.process-plugin/v1", "timeoutMs": 5000 },
+    "services": ["tnb.executions/v1"]
+  }] }
+}

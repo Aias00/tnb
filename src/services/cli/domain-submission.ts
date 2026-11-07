@@ -1,5 +1,4 @@
-import { constants } from "node:fs";
-import { open } from "node:fs/promises";
+import { readJsonDocument } from "./json-document";
 import { resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { validateAgentTaskInput, type AgentTaskInput } from "../../agent/execution";
@@ -20,17 +19,7 @@ export async function readDomainSubmission(args: string[], cwd: string, originSe
   }
   if (!flags.has("--adapter") || !flags.has("--namespace")) throw new Error("Domain submission requires --adapter descriptor.json and --namespace NAME");
   const path = resolve(cwd, flags.get("--adapter")!);
-  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  let adapter: unknown;
-  try {
-    const stat = await file.stat();
-    if (!stat.isFile() || stat.size > 65536) throw new Error("Adapter descriptor must be a regular JSON file of at most 64 KiB");
-    const buffer = Buffer.alloc(65537); let size = 0;
-    while (size < buffer.length) { const { bytesRead } = await file.read(buffer, size, buffer.length - size, size); if (!bytesRead) break; size += bytesRead; }
-    if (size > 65536) throw new Error("Adapter descriptor exceeds 64 KiB");
-    try { adapter = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(buffer.subarray(0, size))); }
-    catch { throw new Error("Adapter descriptor must contain valid UTF-8 JSON"); }
-  } finally { await file.close(); }
+  const adapter = await readJsonDocument(path, "Adapter descriptor");
   const number = (flag: string) => flags.has(flag) ? Number(flags.get(flag)) : undefined;
   return validateAgentTaskInput({ commandId: flags.get("--command-id") ?? randomUUID(), objective: args[1], namespace: flags.get("--namespace"), adapter,
     mode: flags.get("--mode") ?? "auto", provider: flags.get("--provider"), model: flags.get("--model"), maxTurns: number("--max-turns"), maxRetries: number("--max-retries"),

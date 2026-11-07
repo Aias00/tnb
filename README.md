@@ -641,6 +641,8 @@ TypeScript 作者可用 `--language typescript` 创建项目，通过 `bun run c
 
 宿主服务支持类型化引用、工厂依赖和按贡献管理的生命周期，默认 Web/协作/渠道已使用同一协议，见[服务接入指南](docs/guides/plugin-services.md)。运行 `bun examples/typed-plugin-service.ts` 可验证一个无需模型的完整服务样例。
 
+业务能力可以先发布固定的目标、输入合同、Adapter 指纹、资源和预算，再通过 `tnb.executions/v1` 按精确贡献授权给插件。用 `tnb runtime capabilities` 管理发布/授权，`tnb runtime execute request.json` 验证接纳，见[发布能力指南](docs/guides/published-capabilities.md)及[进程接入示例](examples/plugins/published-intake/README.md)。
+
 贡献可声明版本化配置和私有记录迁移，宿主在启动前校验，失败不会自动读取不兼容状态。见[数据合同](docs/guides/plugin-data-contracts.md)，本地示例：`bun examples/plugin-data-contract.ts`。
 
 运行时备份 v2 包含历史插件包和私有文件。可运行 `tnb runtime backup-check /path/to/backup` 或对话中的 `/runtime backup-check /path/to/backup` 进行只读检查，范围与恢复流程见[备份指南](docs/guides/plugin-backup.md)。

@@ -24,6 +24,7 @@ import { DurableTranscript } from "./transcript";
 import { digestJson, text } from "./json";
 import type { DurableRun, DurableTask, ExecutionPolicy, WorkerIdentity, RunLimits } from "./types";
 import { agentNamespace, validateAgentTaskInput, type ExecutionConfiguration, type AgentTaskInput, type WorkerResources } from "../../agent/execution";
+import type { CapabilityConsumer } from "../../agent/execution-service";
 export type { WorkerResources } from "../../agent/execution";
 import { runtimeStorageUsage } from "./maintenance";
 import { DurableWaits, refreshWaits, validateWaitProposal, type WaitProposal, type DurableWait } from "./waits";
@@ -42,8 +43,13 @@ export type RuntimeConfiguration = ExecutionConfiguration & {
   mcpTools?: string[];
   capabilityPins?: Record<string, string>;
   domain?: DomainDescriptor;
+  /** Trusted host admission evidence, committed atomically with the Run. Not a public task input. */
+  executionBinding?: { actor: string; consumer?: CapabilityConsumer; requestHash: string; capability: { id: string; version: string }; publicationDigest: string };
 };
 export type RuntimeWorkerFactory = (context: { run: DurableRun; task: DurableTask; configuration: RuntimeConfiguration; signal: AbortSignal }) => Promise<WorkerResources>;
+export type DomainSubmissionOptions = { domainOnly?: boolean; executionBinding?: RuntimeConfiguration["executionBinding"];
+  /** Recheck trusted admission after async preparation, immediately before the synchronous commit. */
+  beforeCreate?(configuration: RuntimeConfiguration): void };
 
 /** One owner advances durable work. Models propose work; only these commands mutate business state. */
 export class DurableRuntime {
@@ -93,7 +99,7 @@ export class DurableRuntime {
       await this.tick();
     } catch (error) { await this.close(); throw error; }
   }
-  async submit(input: { commandId: string; objective: string; configuration: RuntimeConfiguration; mode?: ExecutionPolicy["mode"]; tasks?: TaskDefinition[]; deadline?: number; source?: RoutingInput; successorOf?: string }, options?: { domainOnly?: boolean }): Promise<{ run: DurableRun; tasks: DurableTask[] }> {
+  async submit(input: { commandId: string; objective: string; configuration: RuntimeConfiguration; mode?: ExecutionPolicy["mode"]; tasks?: TaskDefinition[]; deadline?: number; source?: RoutingInput; successorOf?: string }, options?: DomainSubmissionOptions): Promise<{ run: DurableRun; tasks: DurableTask[] }> {
     if (this.#closed) throw new Error("Runtime is closed");
     if (this.lastError) throw new Error(`Runtime dispatch stopped: ${this.lastError}; stop and restart the owner before submitting`);
     const requestDigest = digestJson(input, 256 * 1024);
@@ -156,6 +162,7 @@ export class DurableRuntime {
       const receipt = this.commands.replayCreateRun(legacy);
       if (receipt) return receipt;
     }
+    options?.beforeCreate?.(configuration);
     return this.commands.createRun(command, requestDigest);
   }
   configuration(runId: string, taskId?: string, originalLimits = false): RuntimeConfiguration {
@@ -166,13 +173,14 @@ export class DurableRuntime {
     const original = originalLimits ? this.store.record<RunLimits>("binding-limits", runId) : undefined;
     return { ...config, ...(original ? { maxCostUsd: original.value.maxCostUsd } : {}), ...(override || {}), ...(limits || {}) };
   }
-  async submitDomain(input: AgentTaskInput, options?: { domainOnly?: boolean }) {
+  async submitDomain(input: AgentTaskInput, options?: DomainSubmissionOptions) {
     input = validateAgentTaskInput(input);
     const workspace = agentNamespace(input.namespace);
     return this.submit({ commandId: input.commandId, objective: input.objective, mode: input.mode, deadline: input.deadline,
       configuration: { domain: input.adapter, workspace, allowedWorkspaces: [workspace], allowWrite: false, allowShell: false, checks: [],
         maxTurns: input.maxTurns ?? 50, maxRetries: input.maxRetries ?? 1, maxModelRequests: input.maxModelRequests ?? 256,
-        compactThreshold: input.compactThreshold ?? 10000, maxCostUsd: input.maxCostUsd, provider: input.provider, model: input.model, originSessionId: input.originSessionId },
+        compactThreshold: input.compactThreshold ?? 10000, maxCostUsd: input.maxCostUsd, provider: input.provider, model: input.model, originSessionId: input.originSessionId,
+        ...(options?.executionBinding ? { executionBinding: structuredClone(options.executionBinding) } : {}) },
       ...(input.originSessionId ? { source: { inputId: input.commandId, rawText: input.objective, workspace, source: "conversation" as const, sessionId: input.originSessionId } } : {}) }, options);
   }
   #domainContext(task: DurableTask, signal: AbortSignal): DomainContext {

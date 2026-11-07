@@ -64,6 +64,7 @@ export default definePlugin(setup);
 | `defineAgent`、`AgentDefinition`、`AgentContext` | Schema 校验的通用 Agent；上下文只有领域输入、执行限制、任务身份和取消信号 |
 | `ExecutionConfiguration`、`AgentTaskInput` | 通用预算、回合、上下文限制与命名空间提交；不要求文件目录或 Shell |
 | `defineProcessPlugin`、`ProcessContext` | 进程应用/界面/渠道及异步 JSON 宿主能力，见[进程插件](process-plugins.md) |
+| `EXECUTION_SERVICE_REF`、`ExecutionService` | 调用已发布业务能力；按插件指纹和贡献授权，提交、状态与结果分页，见[发布能力](published-capabilities.md) |
 | `createServiceRef`、`ServiceRef` | 定义和消费类型化服务引用；不会替宿主提供或授予服务 |
 | Adapter、Domain、Worker、Model 类型 | 自定义领域、模型传输、工具与验收 |
 | Application、Interface、Channel、ExtensionContext 类型 | 应用处理器、渠道、私有状态与清理 |

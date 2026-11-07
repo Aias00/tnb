@@ -1,5 +1,6 @@
 import { buildInfo } from "../update/build-info";
 import { validateAgentTaskInput } from "../../agent/execution";
+import { PublishedCapabilities } from "./capabilities";
 import { canonicalTaskScope } from "./scope";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { chmod, mkdir, readFile, writeFile, unlink, lstat } from "node:fs/promises";
@@ -27,7 +28,7 @@ export async function runtimePaths(configDir: string): Promise<{ root: string; s
 
 type ServerOptions = { configDir: string; env: Record<string, string | undefined>; signal: AbortSignal; runtime?: DurableRuntime; ready?(socket: string): void };
 export const RUNTIME_CAPABILITIES = Object.freeze({ protocol: 2, defaultMode: "auto", maxDelegationDepth: 2, maxParallelBranches: 4,
-  domainSubmission: true, domainCatalog: true,
+  domainSubmission: true, domainCatalog: true, publishedCapabilities: true,
   readOnlyDelegation: true, parallelWrites: false, skills: true, mcp: true, durableCapabilityPolicy: "explicit-selection-host-allowlist-v1", remoteFederation: false, offlineBackup: true, conversationHandoff: true,
   durableWaits: true, durableDelegation: true, deadlineScheduling: true, questionNotifications: true, lifecycleNotifications: true, adjustableLimits: true,
   taskRouting: true, safeFollowups: true, delegationStrategyVersion: 2, defaultDelegationDepth: 1, autoParallelBranches: 2,
@@ -86,6 +87,14 @@ async function serveLockedRuntime(options: ServerOptions): Promise<void> {
           if (url.pathname === "/plugins") return Response.json(plugins?.list() ?? []);
           if (request.method === "GET" && url.pathname === "/plugins/references") return Response.json(profile.references(store));
           if (request.method === "GET" && url.pathname === "/plugins/recovery") return Response.json(await profile.checkRecovery(store));
+          if (request.method === "POST" && url.pathname === "/capabilities/command") {
+            const input = await request.json();
+            return await serialCommand(async () => Response.json(new PublishedCapabilities(runtime).command(input)));
+          }
+          if (request.method === "POST" && url.pathname === "/capabilities/execute") {
+            const input = await request.json();
+            return await serialCommand(async () => Response.json(await new PublishedCapabilities(runtime).submit(input)));
+          }
           if (request.method === "POST" && url.pathname === "/agent-tasks") {
             const input = validateAgentTaskInput(await request.json());
             return await serialCommand(async () => Response.json(await runtime.submitDomain(input, { domainOnly: true })));

@@ -18,6 +18,8 @@ export type { ConversationMessage, ToolUseBlock, ToolResultBlock, MediaBlock } f
 export type { WorkerResources, ExecutionConfiguration, AgentTaskInput } from "../agent/execution";
 export { validateAgentTaskInput } from "../agent/execution";
 export type { AdapterCatalogEntry } from "../agent/domain";
+export { EXECUTION_SERVICE, EXECUTION_SERVICE_REF } from "../agent/execution-service";
+export type { CapabilityRef, CapabilityDefinition, CapabilityPublication, CapabilityConsumer, CapabilityAuthorization, CapabilityRequest, ExecutionService, ExecutionReceipt, ExecutionStatus, ExecutionResult } from "../agent/execution-service";
 /** @deprecated Host compatibility shape; new authors use AgentContext.execution. */
 export type { RuntimeConfiguration } from "../services/runtime/engine-core";
 export { defineAgent } from "./agent";

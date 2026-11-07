@@ -1,0 +1,17 @@
+{
+  "action": "publish",
+  "definition": {
+    "protocol": "tnb.capability/v1",
+    "id": "support.reply", "version": "1",
+    "namespace": "support",
+    "objective": "Read and report the authorized message",
+    "adapter": { "id": "reply-agent", "version": "1" },
+    "inputSchema": {
+      "type": "object", "properties": { "message": { "type": "string", "minLength": 1 } },
+      "required": ["message"], "additionalProperties": false
+    },
+    "resources": [{ "id": "support:message", "mode": "read" }],
+    "grants": [{ "name": "read", "resources": ["support:message"], "mode": "read" }],
+    "execution": { "mode": "single", "maxDurationMs": 3600000 }
+  }
+}

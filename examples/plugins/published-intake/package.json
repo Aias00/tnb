@@ -1,0 +1,5 @@
+{
+  "name": "tnb-published-intake-example", "private": true, "type": "module",
+  "scripts": { "typecheck": "tsc --noEmit", "build": "bun build.ts" },
+  "devDependencies": { "@tnb/plugin-sdk": "file:../../../dist/tnb-plugin-sdk-0.1.0.tgz", "typescript": "7.0.2" }
+}

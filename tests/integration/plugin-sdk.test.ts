@@ -96,3 +96,16 @@ test("independent ticket business integrates the public SDK, injected service, p
     const result = await command(args, root); expect(result.code, result.stdout + result.stderr).toBe(0);
   }
 }, 30000);
+
+test("published execution consumer builds independently against the packed SDK JSON service contract", async () => {
+  const root = await mkdtemp(join(tmpdir(), "tnb-published-sdk-")); roots.push(root);
+  await cp(join(repo, "examples/plugins/published-intake"), root, { recursive: true, filter: path => !path.includes("node_modules") && !path.includes("/package/") });
+  const pkg = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
+  pkg.devDependencies = { "@tnb/plugin-sdk": `file:${sdkTarball}` }; await writeFile(join(root, "package.json"), JSON.stringify(pkg));
+  for (const args of [[process.execPath, "install", "--ignore-scripts", "--registry", "http://127.0.0.1:1"], [process.execPath, "run", "typecheck"], [process.execPath, "run", "build"]]) {
+    const result = await command(args, root); expect(result.code, result.stdout + result.stderr).toBe(0);
+  }
+  await rm(join(root, "node_modules"), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  const validation = await validatePluginPackage(join(root, "package")); expect(validation.ok, JSON.stringify(validation)).toBe(true);
+  expect(validation.requirements.services).toContain("tnb.executions/v1");
+}, 30000);

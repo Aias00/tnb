@@ -1,6 +1,8 @@
 import { buildInfo, sameBuild } from "../services/update/build-info";
 import { agentNamespace } from "../agent/execution";
 import { readDomainSubmission } from "../services/cli/domain-submission";
+import { readJsonDocument } from "../services/cli/json-document";
+import { validateCapabilityCommand, validateCapabilityRequest } from "../services/runtime/capabilities";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -12,7 +14,7 @@ import type { DurableRun } from "../services/runtime/types";
 import { registerCleanup } from "../utils/cleanup-registry";
 import { withOfflineRuntime, backupRuntime, checkRuntimeBackup, restoreRuntime, pruneRuntime, runtimeStorageUsage } from "../services/runtime/maintenance";
 
-const HELP = `Usage: tnb runtime <submit|adapters|status|result|list|events|questions|answer|limits|pause|resume|cancel|reconcile|start|restart|serve|stop|backup|backup-check|restore|prune|storage|plugins|version> [options]
+const HELP = `Usage: tnb runtime <submit|adapters|capabilities|execute|status|result|list|events|questions|answer|limits|pause|resume|cancel|reconcile|start|restart|serve|stop|backup|backup-check|restore|prune|storage|plugins|version> [options]
 
 followup [run-id] --text "requirements" [--task ID] [--input-id ID]
   Select an unresolved input with --resolve-input ID --revision N and a run-id.
@@ -25,6 +27,8 @@ submit <objective> --adapter descriptor.json --namespace NAME [--mode single|aut
   [--max-budget-usd N] [--deadline ISO-DATE] [--provider ID] [--model ID] [--command-id ID] [--no-start]
   Explicit domain submission; does not accept Coding directory, Shell, check, Skill or MCP flags.
 adapters  List current Adapter identities/configuration schemas; never starts the owner.
+capabilities <list|grants|command.json>  Check/publish immutable capabilities and administer exact consumer grants; see docs/guides/published-capabilities.md.
+execute request.json  Execute a published capability as Owner; requires an explicitly started owner.
 list|followup|routing [--namespace NAME]  Select a domain scope instead of a file workspace.
 status|result|events|pause|resume|cancel <run-id>  (result accepts --task TASK-ID)
 questions <run-id>  Show outstanding questions and their versions.
@@ -60,6 +64,16 @@ export async function runRuntimeCommand(options: { argv: string[]; cwd: string; 
   const configDir = resolve(value("--config-dir") ?? options.env.TNB_HOME ?? join(homedir(), ".tnb"));
   try {
     if (!action || args.includes("--help") || args.includes("-h")) { options.stdout.write(HELP); return 0; }
+    if (action === "capabilities" || action === "execute") {
+      if (!args[1] || args[1].startsWith("--")) throw new Error(`Usage: runtime ${action} ${action === "execute" ? "request.json" : "list|grants|command.json"} [--config-dir PATH]`);
+      for (let i = 2; i < args.length; i += 2) if (args[i] !== "--config-dir" || !args[i + 1] || args[i + 1]!.startsWith("--") || i !== 2) throw new Error(`Unknown or duplicate ${action} option`);
+      const document = action === "capabilities" && ["list", "grants"].includes(args[1]) ? { action: args[1] } : await readJsonDocument(resolve(options.cwd, args[1]), "Capability document");
+      const input = action === "execute" ? validateCapabilityRequest(document) : validateCapabilityCommand(document);
+      const health = await runtimeRequest(configDir, "/health") as { capabilities?: { publishedCapabilities?: boolean } };
+      if (!health.capabilities?.publishedCapabilities) throw new Error("The running owner does not support published capabilities; explicitly restart after updating");
+      const result = await runtimeRequest(configDir, action === "execute" ? "/capabilities/execute" : "/capabilities/command", input);
+      options.stdout.write(JSON.stringify(result, null, 2) + "\n"); return 0;
+    }
     const domainInput = action === "submit" && args.includes("--adapter") ? await readDomainSubmission(args, options.cwd, options.originSessionId) : undefined;
     if (action === "submit" && !domainInput && ["--namespace", "--max-retries", "--max-model-requests", "--compact-threshold"].some(flag => args.includes(flag))) throw new Error("Domain execution options require --adapter descriptor.json");
     if (args.includes("--namespace") && args.includes("--cwd")) throw new Error("Choose --namespace or --cwd");

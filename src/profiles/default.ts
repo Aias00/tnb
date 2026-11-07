@@ -22,6 +22,8 @@ import { migrateCollaborationChannels, collaborationChannelReferences } from "..
 import { createDurableCapabilityHost } from "../adapters/coding/capabilities";
 import { CHAT_SERVICE, CHAT_SERVICE_REF } from "../agent/chat-service";
 import { createChatService } from "../services/workbench/chat";
+import { EXECUTION_SERVICE_REF } from "../agent/execution-service";
+import { PublishedCapabilities } from "../services/runtime/capabilities";
 
 /** Product composition only; the generic plugin host knows neither Coding nor collaboration. */
 export async function loadDefaultProfile(options: { configDir: string; root: string; env: Record<string, string | undefined>; coding: boolean; runtime?: DurableRuntime }) {
@@ -48,6 +50,7 @@ export async function loadDefaultProfile(options: { configDir: string; root: str
     checkRecovery: (store: RuntimeStore) => plugins.checkRecovery({ generationReferences: pluginGenerationReferences(store), channelReferences: collaborationChannelReferences(store, config) }),
     async start(runtime: DurableRuntime, signal?: AbortSignal) {
     await plugins.extensions.start({ store: runtime.store, signal, configuration: settings.pluginConfiguration, serviceProviders: [
+      provideService(EXECUTION_SERVICE_REF, scope => new PublishedCapabilities(runtime).service(scope)),
       provideService(CHAT_SERVICE_REF, scope => {
         const chats = createChatService({ store: runtime.store, configDir, env, signal: scope.signal, track: scope.track });
         scope.onDispose(chats.close); return chats.service;

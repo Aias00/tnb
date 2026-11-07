@@ -43,7 +43,16 @@ try {
     }
     if (!JSON.stringify(await runtime(["result", runId])).includes("Verified: Hello from my plugin")) throw new Error("Compiled domain task has no accepted message evidence");
     if ((await runtime(args)).run.runId !== runId || (await runtime(["list", "--namespace", "probe"])).length !== 1) throw new Error("Compiled domain replay created another task");
-    process.stdout.write("Compiled domain catalog, detached owner, execution, receipt replay and result passed\n");
+    const capability = { id: "compiled.reply", version: "1" };
+    const publication = { action: "publish", definition: { protocol: "tnb.capability/v1", ...capability, namespace: "published", objective: "Read the message",
+      adapter: { id: "compiled-domain", version: "1" }, inputSchema: { type: "object", properties: { message: { type: "string" } }, required: ["message"], additionalProperties: false },
+      resources: [{ id: "compiled:message", mode: "read" }], grants: [{ name: "read", mode: "read", resources: ["compiled:message"] }], execution: { mode: "single" } } };
+    const publicationFile = join(root, "publication.json"), requestFile = join(root, "request.json");
+    await Bun.write(publicationFile, JSON.stringify(publication)); await runtime(["capabilities", publicationFile]);
+    await Bun.write(requestFile, JSON.stringify({ commandId: "compiled-published", capability, input: { message: "Compiled publication" } }));
+    const published = await runtime(["execute", requestFile]);
+    if ((await runtime(["execute", requestFile])).runId !== published.runId) throw new Error("Compiled publication replay changed Run identity");
+    process.stdout.write("Compiled domain catalog, detached owner, execution, published admission and receipt replay passed\n");
   }
 } finally {
   if (started) {

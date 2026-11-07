@@ -1,0 +1,5 @@
+{
+  "commandId": "ticket-123",
+  "capability": { "id": "support.reply", "version": "1" },
+  "input": { "message": "Published reply" }
+}
